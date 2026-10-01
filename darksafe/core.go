@@ -4,7 +4,7 @@ package darksafe
 // Subject is an identity that can request access to a resource.
 type Subject struct {
 	ID       string
-	Kind     string   // "user", "service", "external"
+	Kind     string // "user", "service", "external"
 	Roles    []string
 	Disabled bool
 }

@@ -60,8 +60,9 @@ type Store struct {
 }
 
 type orgState struct {
-	current  int            // 0 means nothing published yet
+	current  int              // 0 means nothing published yet
 	versions map[int][]Policy // immutable snapshots per version
+	audit    []*AuditRecord   // gapless, append-only audit chain
 }
 
 // NewStore returns an empty Store.
@@ -109,6 +110,14 @@ func (s *Store) Publish(org string, expectedVersion int, policies []Policy) (int
 	}
 	st.current++
 	st.versions[st.current] = snapshot
+	// The change and its audit record become visible together; a failed
+	// publish never reaches this point and leaves no record.
+	st.appendAuditLocked(org, AuditPolicyChange, &PolicyChange{
+		Version:       st.current,
+		Policies:      snapshot,
+		SourceVersion: 0,
+		RolledBack:    false,
+	}, nil)
 	return st.current, nil
 }
 
@@ -129,7 +138,16 @@ func (s *Store) Rollback(org string, expectedVersion, targetVersion int) (int, e
 		return 0, fmt.Errorf("%w: expected %d, current is %d", ErrVersionConflict, expectedVersion, st.current)
 	}
 	st.current++
-	st.versions[st.current] = append([]Policy(nil), src...)
+	snapshot := append([]Policy(nil), src...)
+	st.versions[st.current] = snapshot
+	// A rollback record names the source version in addition to carrying
+	// the full content of the new version.
+	st.appendAuditLocked(org, AuditPolicyChange, &PolicyChange{
+		Version:       st.current,
+		Policies:      snapshot,
+		SourceVersion: targetVersion,
+		RolledBack:    true,
+	}, nil)
 	return st.current, nil
 }
 
@@ -152,22 +170,38 @@ func (s *Store) Policies(org string, version int) ([]Policy, error) {
 // Decide evaluates a request against the organization's current version.
 // The whole decision uses that single version's snapshot, and the version
 // actually used is reported in Decision.Version.
+//
+// Every call with a non-empty decision organization leaves a decision
+// record, including envelope rejections (disabled subject, missing fields,
+// organization mismatch) and the no-published-version denial. A call with
+// an empty organization rejects as before and creates no record, because
+// there is no organization to attribute it to. The evaluation and record
+// append are atomic: a concurrent publish can never make the recorded
+// version differ from the version that was evaluated.
 func (s *Store) Decide(org string, req OrgRequest) Decision {
+	if org == "" {
+		d, _ := checkRequest(org, req)
+		return d
+	}
 	if d, ok := checkRequest(org, req); !ok {
+		s.mu.Lock()
+		st := s.orgLocked(org)
+		st.appendAuditLocked(org, AuditDecision, nil, &DecisionRecord{Request: req, Decision: d})
+		s.mu.Unlock()
 		return d
 	}
 	s.mu.Lock()
-	version := 0
-	var policies []Policy
-	if st, ok := s.orgs[org]; ok {
-		version = st.current
-		policies = append([]Policy(nil), st.versions[version]...)
-	}
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	st := s.orgLocked(org)
+	version := st.current
+	var d Decision
 	if version == 0 {
-		return Decision{Allowed: false, Reason: "organization has no published version"}
+		d = Decision{Allowed: false, Reason: "organization has no published version"}
+	} else {
+		d = evaluate(req, st.versions[version], version)
 	}
-	return evaluate(req, policies, version)
+	st.appendAuditLocked(org, AuditDecision, nil, &DecisionRecord{Request: req, Decision: d})
+	return d
 }
 
 // Review re-evaluates a request against a specific historical version.

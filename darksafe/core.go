@@ -20,6 +20,9 @@ type Decision struct {
 	Allowed bool
 	Reason  string
 	Matched []string
+	// Version is the policy version actually used, 0 when no published
+	// version was evaluated (legacy Access and early rejections).
+	Version int
 }
 
 // Access evaluates a request and always returns an explanation.

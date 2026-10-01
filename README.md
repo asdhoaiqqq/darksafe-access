@@ -12,6 +12,16 @@ go run ./cmd/darksafe version
 go test ./...
 ```
 
+## 按组织的策略发布、回滚与复核
+
+`darksafe.NewStore()` 提供组织级策略管理（纯内存，随服务实例结束而销毁）：
+
+- `Publish(org, expectedVersion, policies)`：校验并整套发布，生成连续递增版本；版本不一致或策略非法则整次失败，不占用版本号。
+- `Rollback(org, expectedVersion, targetVersion)`：把本组织历史版本的完整内容发布为新版本，历史不可改写。
+- `Policies(org, version)` / `CurrentVersion(org)`：查询历史版本完整策略（返回副本）与当前版本。
+- `Decide(org, OrgRequest)`：用当前版本决策，要求主体组织与资源组织均等于决策组织；默认拒绝，拒绝策略优先，结果注明实际版本。
+- `Review(org, version, OrgRequest)`：按指定历史版本复核，结论不受后续发布/回滚影响；版本不存在则拒绝并说明原因。
+
 ## 技术方向
 
 identity, authorization, rbac, audit-log, account-abstraction, zk-identity, wallet-security

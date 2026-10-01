@@ -60,8 +60,9 @@ type Store struct {
 }
 
 type orgState struct {
-	current  int            // 0 means nothing published yet
+	current  int              // 0 means nothing published yet
 	versions map[int][]Policy // immutable snapshots per version
+	audit    []*AuditRecord   // organization-local, 1-based consecutive chain
 }
 
 // NewStore returns an empty Store.
@@ -109,6 +110,10 @@ func (s *Store) Publish(org string, expectedVersion int, policies []Policy) (int
 	}
 	st.current++
 	st.versions[st.current] = snapshot
+	s.appendRecordLocked(st, &AuditRecord{
+		Org: org, Category: AuditPolicyChange,
+		Version: st.current, Policies: clonePolicies(snapshot),
+	})
 	return st.current, nil
 }
 
@@ -130,6 +135,11 @@ func (s *Store) Rollback(org string, expectedVersion, targetVersion int) (int, e
 	}
 	st.current++
 	st.versions[st.current] = append([]Policy(nil), src...)
+	s.appendRecordLocked(st, &AuditRecord{
+		Org: org, Category: AuditPolicyChange,
+		Version: st.current, SourceVersion: targetVersion,
+		Policies: clonePolicies(src),
+	})
 	return st.current, nil
 }
 
@@ -151,23 +161,52 @@ func (s *Store) Policies(org string, version int) ([]Policy, error) {
 
 // Decide evaluates a request against the organization's current version.
 // The whole decision uses that single version's snapshot, and the version
-// actually used is reported in Decision.Version.
+// actually used is reported in Decision.Version. Every decision that
+// names a decision organization is appended to the audit chain,
+// including denials; a missing decision org is rejected as before and
+// leaves no record.
 func (s *Store) Decide(org string, req OrgRequest) Decision {
 	if d, ok := checkRequest(org, req); !ok {
+		if org != "" {
+			s.appendDecisionRecord(org, req, d)
+		}
 		return d
 	}
 	s.mu.Lock()
-	version := 0
+	defer s.mu.Unlock()
+	st := s.orgLocked(org)
+	version := st.current
 	var policies []Policy
-	if st, ok := s.orgs[org]; ok {
-		version = st.current
+	if version > 0 {
 		policies = append([]Policy(nil), st.versions[version]...)
 	}
-	s.mu.Unlock()
+	var d Decision
 	if version == 0 {
-		return Decision{Allowed: false, Reason: "organization has no published version"}
+		d = Decision{Allowed: false, Reason: "organization has no published version"}
+	} else {
+		d = evaluate(req, policies, version)
 	}
-	return evaluate(req, policies, version)
+	s.appendRecordLocked(st, &AuditRecord{
+		Org: org, Category: AuditDecision,
+		Version:  version,
+		Request:  cloneRequest(req),
+		Decision: cloneDecision(d),
+	})
+	return d
+}
+
+// appendDecisionRecord appends an early-rejection decision (version 0)
+// to the organization's audit chain.
+func (s *Store) appendDecisionRecord(org string, req OrgRequest, d Decision) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.orgLocked(org)
+	s.appendRecordLocked(st, &AuditRecord{
+		Org: org, Category: AuditDecision,
+		Version:  0,
+		Request:  cloneRequest(req),
+		Decision: cloneDecision(d),
+	})
 }
 
 // Review re-evaluates a request against a specific historical version.

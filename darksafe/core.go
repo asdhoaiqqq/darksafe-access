@@ -4,15 +4,17 @@ package darksafe
 // Subject is an identity that can request access to a resource.
 type Subject struct {
 	ID       string
-	Kind     string   // "user", "service", "external"
+	Kind     string // "user", "service", "external"
 	Roles    []string
 	Disabled bool
+	Org      string // organization the subject belongs to; required for Store decisions
 }
 
 // Resource is a protected object with a scope path.
 type Resource struct {
 	ID    string
 	Scope string // e.g. "org/payments/ledger"
+	Org   string // organization the resource belongs to; required for Store decisions
 }
 
 // Decision explains one access evaluation.
@@ -20,6 +22,7 @@ type Decision struct {
 	Allowed bool
 	Reason  string
 	Matched []string
+	Version int // policy version actually used for the decision; 0 when not applicable
 }
 
 // Access evaluates a request and always returns an explanation.

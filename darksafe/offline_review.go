@@ -46,7 +46,19 @@ type OfflineDecisionReview struct {
 // target is a policy change record. When the saved decision names a
 // policy version whose full content has no change record before the
 // target, ErrVersionNotFound is returned; a newer version is never
-// substituted.
+// substituted, and a request the envelope would reject never masks the
+// missing version.
+//
+// The fingerprint only proves the material matches its checkpoint; it
+// cannot stand in for evaluating the request itself. So even when the
+// declared version exists and carries an otherwise matching allow policy,
+// the recomputation enforces the same request rules as the online
+// decision: a disabled subject, an organization mismatch, a missing
+// subject or resource organization or identifier, an empty action, and an
+// illegal resource scope all deny, with the same reasons and precedence as
+// Decide. Such a rejection uses no policies, so the recomputed decision
+// reports version 0 with no matched policies; it is then compared field by
+// field with the preserved original and may come back inconsistent.
 func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, seq int) (OfflineDecisionReview, error) {
 	if org == "" {
 		return OfflineDecisionReview{}, ErrMissingOrganization
@@ -86,7 +98,9 @@ func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, se
 		}
 	} else {
 		// The version's full content must travel in a same-organization
-		// policy change record positioned before the decision.
+		// policy change record positioned before the decision. That check
+		// comes first: a request the envelope rejects must not mask a
+		// missing version with an ordinary denial result.
 		policies, found := policiesBefore(records, seq-1, version)
 		if !found {
 			if _, later := policiesBefore(records, len(records), version); later {
@@ -98,7 +112,16 @@ func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, se
 				"%w: decision at sequence %d used version %d, which has no policy change record in the export",
 				ErrVersionNotFound, seq, version)
 		}
-		recomputed = evaluate(req, policies, version)
+		// The version exists as claimed, but chain integrity does not imply
+		// the request was admissible: re-run the same envelope checks the
+		// online decision runs before any policy is consulted. A rejection
+		// here evaluates no policies, hence version 0 and no matches, even
+		// when the version holds a fully matching allow policy.
+		if d, ok := checkRequest(org, req); !ok {
+			recomputed = d
+		} else {
+			recomputed = evaluate(req, policies, version)
+		}
 	}
 
 	return OfflineDecisionReview{

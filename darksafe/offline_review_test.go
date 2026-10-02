@@ -500,3 +500,344 @@ func TestOfflineReviewAcrossOrganizationsIndependent(t *testing.T) {
 		t.Fatalf("cross-org review err = %v", err)
 	}
 }
+
+// invalidScopeReviews enumerate resource scopes the envelope must reject
+// even when a non-zero version exists.
+func invalidScopeReviews() map[string]string {
+	return map[string]string{
+		"empty path":          "",
+		"leading slash":       "/org/a",
+		"trailing slash":      "org/a/",
+		"consecutive slashes": "org//a",
+		"dot segment":         "org/./a",
+		"dotdot segment":      "org/../a",
+	}
+}
+
+// offlineBadRequest returns a request that fails exactly one envelope
+// condition when reviewed for org, together with the online reason.
+func offlineBadRequestCases(org string) map[string]struct {
+	modify func(OrgRequest) OrgRequest
+	reason string
+} {
+	return map[string]struct {
+		modify func(OrgRequest) OrgRequest
+		reason string
+	}{
+		"disabled subject": {
+			modify: func(r OrgRequest) OrgRequest { r.Subject.Disabled = true; return r },
+			reason: "subject is disabled",
+		},
+		"missing subject organization": {
+			modify: func(r OrgRequest) OrgRequest { r.SubjectOrg = ""; return r },
+			reason: "missing subject organization",
+		},
+		"missing resource organization": {
+			modify: func(r OrgRequest) OrgRequest { r.ResourceOrg = ""; return r },
+			reason: "missing resource organization",
+		},
+		"subject organization mismatch": {
+			modify: func(r OrgRequest) OrgRequest { r.SubjectOrg = "globex"; return r },
+			reason: "organization mismatch",
+		},
+		"resource organization mismatch": {
+			modify: func(r OrgRequest) OrgRequest { r.ResourceOrg = "globex"; return r },
+			reason: "organization mismatch",
+		},
+		"missing subject id": {
+			modify: func(r OrgRequest) OrgRequest { r.Subject.ID = ""; return r },
+			reason: "missing subject id",
+		},
+		"missing resource id": {
+			modify: func(r OrgRequest) OrgRequest { r.Resource.ID = ""; return r },
+			reason: "missing resource id",
+		},
+		"missing action": {
+			modify: func(r OrgRequest) OrgRequest { r.Action = ""; return r },
+			reason: "missing action",
+		},
+	}
+}
+
+// offlineForgedAllowChain builds a chain-valid export: version 1 carries a
+// fully matching allow policy (optionally resource-restricted), and the
+// target decision names version 1 and claims to be allowed by it.
+func offlineForgedAllowChain(t *testing.T, org string, req OrgRequest, resourceID string) ([]AuditRecord, Checkpoint) {
+	t.Helper()
+	p := Policy{ID: "p1", Subject: req.Subject.ID, Action: req.Action, Scope: "org/a", Effect: EffectAllow, ResourceID: resourceID}
+	return syntheticChain(org, []func(int) (string, *PolicyChange, *DecisionRecord){
+		func(seq int) (string, *PolicyChange, *DecisionRecord) {
+			return AuditPolicyChange, &PolicyChange{Version: 1, Policies: []Policy{p}}, nil
+		},
+		func(seq int) (string, *PolicyChange, *DecisionRecord) {
+			return AuditDecision, nil, &DecisionRecord{
+				Request:  req,
+				Decision: Decision{Allowed: true, Reason: "matched allow policy", Matched: []string{"p1"}, Version: 1},
+			}
+		},
+	})
+}
+
+// TestOfflineReviewEnforcesRequestRulesAtNonZeroVersion proves the audit
+// fingerprint cannot substitute for evaluating the request: a record that
+// names an existing non-zero version with a matching allow policy must
+// still recompute to the same envelope denial the online decision gives.
+func TestOfflineReviewEnforcesRequestRulesAtNonZeroVersion(t *testing.T) {
+	const org = "acme"
+	for name, tc := range offlineBadRequestCases(org) {
+		t.Run(name, func(t *testing.T) {
+			req := tc.modify(request(org, "u1", "r1", "org/a", "read"))
+			recs, cp := offlineForgedAllowChain(t, org, req, "")
+			got, err := RecheckDecisionOffline(org, recs, cp, 2)
+			if err != nil {
+				t.Fatalf("request denial is a result, not an error: %v", err)
+			}
+			if got.Consistent {
+				t.Fatalf("original allow must not match the recomputed denial: %+v", got)
+			}
+			if !got.Original.Allowed || got.Original.Version != 1 {
+				t.Fatalf("original claim not preserved: %+v", got.Original)
+			}
+			if got.Recomputed.Allowed || got.Recomputed.Reason != tc.reason {
+				t.Fatalf("recomputed = %+v, want denial %q", got.Recomputed, tc.reason)
+			}
+			if got.Recomputed.Version != 0 {
+				t.Fatalf("envelope rejection used no version, got %d", got.Recomputed.Version)
+			}
+			if len(got.Recomputed.Matched) != 0 {
+				t.Fatalf("envelope rejection matched no policies, got %v", got.Recomputed.Matched)
+			}
+		})
+	}
+
+	t.Run("invalid scope forms", func(t *testing.T) {
+		for name, scope := range invalidScopeReviews() {
+			t.Run(name, func(t *testing.T) {
+				req := request(org, "u1", "r1", scope, "read")
+				recs, cp := offlineForgedAllowChain(t, org, req, "")
+				got, err := RecheckDecisionOffline(org, recs, cp, 2)
+				if err != nil {
+					t.Fatalf("invalid scope is a result, not an error: %v", err)
+				}
+				if got.Consistent || got.Recomputed.Allowed ||
+					got.Recomputed.Version != 0 || len(got.Recomputed.Matched) != 0 {
+					t.Fatalf("invalid scope %q review = %+v", scope, got)
+				}
+				if want := "invalid scope: "; got.Recomputed.Reason == want ||
+					len(got.Recomputed.Reason) <= len(want) ||
+					got.Recomputed.Reason[:len(want)] != want {
+					t.Fatalf("reason = %q, want an invalid-scope denial", got.Recomputed.Reason)
+				}
+			})
+		}
+	})
+
+	t.Run("resource restricted matching policy", func(t *testing.T) {
+		// Even a policy matching subject, action, scope and the exact
+		// resource must not bypass the envelope conditions.
+		req := request(org, "u1", "r1", "org/a", "read")
+		req.Subject.Disabled = true
+		recs, cp := offlineForgedAllowChain(t, org, req, "r1")
+		got, err := RecheckDecisionOffline(org, recs, cp, 2)
+		if err != nil {
+			t.Fatalf("review: %v", err)
+		}
+		if got.Consistent || got.Recomputed.Allowed ||
+			got.Recomputed.Reason != "subject is disabled" ||
+			got.Recomputed.Version != 0 || len(got.Recomputed.Matched) != 0 {
+			t.Fatalf("resource-restricted policy bypassed envelope: %+v", got)
+		}
+	})
+}
+
+// TestOfflineReviewRecomputedReasonPrecedenceMatchesOnline checks that when
+// several envelope conditions fail at once, the recomputed reason and order
+// match checkRequest exactly.
+func TestOfflineReviewRecomputedReasonPrecedenceMatchesOnline(t *testing.T) {
+	const org = "acme"
+	// Empty subject org precedes empty resource org precedes missing ids
+	// precedes missing action; mismatches follow the missing-field block;
+	// invalid scope precedes the disabled check.
+	type precedenceCase struct {
+		modify func(OrgRequest) OrgRequest
+		reason string
+	}
+	cases := []precedenceCase{
+		{func(r OrgRequest) OrgRequest {
+			r.SubjectOrg = ""
+			r.ResourceOrg = ""
+			r.Subject.ID = ""
+			r.Resource.ID = ""
+			r.Action = ""
+			r.Subject.Disabled = true
+			return r
+		}, "missing subject organization"},
+		{func(r OrgRequest) OrgRequest {
+			r.SubjectOrg = "globex"
+			r.ResourceOrg = "other"
+			r.Action = ""
+			return r
+		}, "missing action"},
+		{func(r OrgRequest) OrgRequest {
+			r.SubjectOrg = "globex"
+			r.ResourceOrg = "other"
+			r.Resource.Scope = "org/../a"
+			r.Subject.Disabled = true
+			return r
+		}, "organization mismatch"},
+		{func(r OrgRequest) OrgRequest {
+			r.Resource.Scope = "/bad"
+			r.Subject.Disabled = true
+			return r
+		}, "invalid scope: scope \"/bad\" has a leading or trailing slash"},
+	}
+	for i, tc := range cases {
+		req := tc.modify(request(org, "u1", "r1", "org/a", "read"))
+		// What the online path would have returned for the same request.
+		online, ok := checkRequest(org, req)
+		if ok {
+			t.Fatalf("case %d request unexpectedly valid", i)
+		}
+		recs, cp := syntheticChain(org, []func(int) (string, *PolicyChange, *DecisionRecord){
+			func(seq int) (string, *PolicyChange, *DecisionRecord) {
+				return AuditPolicyChange, &PolicyChange{
+					Version: 1,
+					Policies: []Policy{{ID: "p1", Subject: req.Subject.ID, Action: req.Action,
+						Scope: "org/a", Effect: EffectAllow}},
+				}, nil
+			},
+			func(seq int) (string, *PolicyChange, *DecisionRecord) {
+				return AuditDecision, nil, &DecisionRecord{
+					Request:  req,
+					Decision: Decision{Allowed: true, Reason: "matched allow policy", Matched: []string{"p1"}, Version: 1},
+				}
+			},
+		})
+		got, err := RecheckDecisionOffline(org, recs, cp, 2)
+		if err != nil {
+			t.Fatalf("case %d: %v", i, err)
+		}
+		if got.Consistent {
+			t.Fatalf("case %d unexpectedly consistent: %+v", i, got)
+		}
+		if !reflect.DeepEqual(got.Recomputed, online) {
+			t.Fatalf("case %d recomputed = %+v, want online envelope decision %+v", i, got.Recomputed, online)
+		}
+		if got.Recomputed.Reason != tc.reason {
+			t.Fatalf("case %d reason = %q, want %q", i, got.Recomputed.Reason, tc.reason)
+		}
+	}
+}
+
+// TestOfflineReviewOriginalDenyStillInconsistent covers a record that does
+// deny, but records the wrong version, reason or matched list relative to
+// the recomputed envelope denial.
+func TestOfflineReviewOriginalDenyStillInconsistent(t *testing.T) {
+	const org = "acme"
+	req := request(org, "u1", "r1", "org/a", "read")
+	req.Subject.Disabled = true
+
+	variants := map[string]Decision{
+		"wrong version": {Allowed: false, Reason: "subject is disabled", Matched: nil, Version: 1},
+		"wrong reason":  {Allowed: false, Reason: "matched deny policy", Matched: []string{"p1"}, Version: 1},
+		"wrong matched": {Allowed: false, Reason: "subject is disabled", Matched: []string{"p1"}, Version: 1},
+		"allowed claim": {Allowed: true, Reason: "matched allow policy", Matched: []string{"p1"}, Version: 1},
+	}
+	for name, claim := range variants {
+		t.Run(name, func(t *testing.T) {
+			recs, cp := syntheticChain(org, []func(int) (string, *PolicyChange, *DecisionRecord){
+				func(seq int) (string, *PolicyChange, *DecisionRecord) {
+					return AuditPolicyChange, &PolicyChange{Version: 1, Policies: []Policy{
+						{ID: "p1", Subject: "u1", Action: "read", Scope: "org/a", Effect: EffectAllow},
+					}}, nil
+				},
+				func(seq int) (string, *PolicyChange, *DecisionRecord) {
+					return AuditDecision, nil, &DecisionRecord{Request: req, Decision: claim}
+				},
+			})
+			got, err := RecheckDecisionOffline(org, recs, cp, 2)
+			if err != nil {
+				t.Fatalf("review: %v", err)
+			}
+			if got.Consistent {
+				t.Fatalf("%s must be inconsistent: %+v", name, got)
+			}
+			if !decisionsEqual(got.Original, claim) {
+				t.Fatalf("original altered: %+v want %+v", got.Original, claim)
+			}
+			want := Decision{Allowed: false, Reason: "subject is disabled"}
+			if !decisionsEqual(got.Recomputed, want) {
+				t.Fatalf("recomputed = %+v, want %+v", got.Recomputed, want)
+			}
+		})
+	}
+
+	// The same envelope denial, correctly recorded with version 0 and no
+	// matches, is consistent even though the record names no version.
+	t.Run("correctly recorded denial", func(t *testing.T) {
+		recs, cp := syntheticChain(org, []func(int) (string, *PolicyChange, *DecisionRecord){
+			func(seq int) (string, *PolicyChange, *DecisionRecord) {
+				return AuditPolicyChange, &PolicyChange{Version: 1, Policies: []Policy{
+					{ID: "p1", Subject: "u1", Action: "read", Scope: "org/a", Effect: EffectAllow},
+				}}, nil
+			},
+			func(seq int) (string, *PolicyChange, *DecisionRecord) {
+				return AuditDecision, nil, &DecisionRecord{
+					Request:  req,
+					Decision: Decision{Allowed: false, Reason: "subject is disabled"},
+				}
+			},
+		})
+		got, err := RecheckDecisionOffline(org, recs, cp, 2)
+		if err != nil {
+			t.Fatalf("review: %v", err)
+		}
+		if !got.Consistent {
+			t.Fatalf("correctly recorded envelope denial must be consistent: %+v", got)
+		}
+	})
+}
+
+// TestOfflineReviewBadRequestDoesNotMaskMissingVersion ensures the version
+// lookup still wins when the declared version is absent (or only after the
+// target), even if the request itself would be rejected by the envelope.
+func TestOfflineReviewBadRequestDoesNotMaskMissingVersion(t *testing.T) {
+	const org = "acme"
+	legal := request(org, "u1", "r1", "org/a", "read")
+	bad := request(org, "u1", "r1", "org/a", "read")
+	bad.Subject.Disabled = true
+	bad.SubjectOrg = "globex"
+
+	// Version named by the decision appears nowhere in the export.
+	missingRecs, missingCP := syntheticChain(org, []func(int) (string, *PolicyChange, *DecisionRecord){
+		func(seq int) (string, *PolicyChange, *DecisionRecord) {
+			return AuditDecision, nil, &DecisionRecord{
+				Request:  bad,
+				Decision: Decision{Allowed: true, Reason: "matched allow policy", Matched: []string{"p1"}, Version: 5},
+			}
+		},
+	})
+	if _, err := RecheckDecisionOffline(org, missingRecs, missingCP, 1); !errors.Is(err, ErrVersionNotFound) {
+		t.Fatalf("missing version masked by bad request: %v", err)
+	}
+
+	// Version present only after the target: still ErrVersionNotFound.
+	laterRecs, laterCP := syntheticChain(org, []func(int) (string, *PolicyChange, *DecisionRecord){
+		func(seq int) (string, *PolicyChange, *DecisionRecord) {
+			return AuditDecision, nil, &DecisionRecord{
+				Request:  bad,
+				Decision: Decision{Allowed: true, Reason: "matched allow policy", Matched: []string{"p1"}, Version: 2},
+			}
+		},
+		func(seq int) (string, *PolicyChange, *DecisionRecord) {
+			return AuditPolicyChange, &PolicyChange{
+				Version: 2,
+				Policies: []Policy{{ID: "p1", Subject: legal.Subject.ID, Action: legal.Action,
+					Scope: "org/a", Effect: EffectAllow}},
+			}, nil
+		},
+	})
+	if _, err := RecheckDecisionOffline(org, laterRecs, laterCP, 1); !errors.Is(err, ErrVersionNotFound) {
+		t.Fatalf("later-only version masked by bad request: %v", err)
+	}
+}

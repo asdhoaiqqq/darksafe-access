@@ -11,10 +11,12 @@ package darksafe
 
 import (
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 )
 
 // Audit record categories.
@@ -87,6 +89,227 @@ type hashEnvelope struct {
 	PrevFingerprint string          `json:"prev"`
 }
 
+// envelopeUsesRawBytes reports whether any string protected by the
+// fingerprint carries bytes that are not valid UTF-8. Such envelopes are
+// hashed through encodeCanonical instead of encoding/json, because JSON
+// string encoding replaces invalid bytes with U+FFFD and would let two
+// different raw contents share a fingerprint.
+func envelopeUsesRawBytes(env *hashEnvelope) bool {
+	if !utf8.ValidString(env.Org) || !utf8.ValidString(env.Kind) ||
+		!utf8.ValidString(env.PrevFingerprint) {
+		return true
+	}
+	if env.Change != nil {
+		for _, p := range env.Change.Policies {
+			if !utf8.ValidString(p.ID) || !utf8.ValidString(p.Subject) ||
+				!utf8.ValidString(p.Action) || !utf8.ValidString(p.Scope) ||
+				!utf8.ValidString(string(p.Effect)) {
+				return true
+			}
+		}
+	}
+	if env.Decision != nil {
+		req := env.Decision.Request
+		d := env.Decision.Decision
+		for _, s := range []string{
+			req.SubjectOrg, req.ResourceOrg,
+			req.Subject.ID, req.Subject.Kind, req.Resource.ID, req.Resource.Scope,
+			req.Action, d.Reason,
+		} {
+			if !utf8.ValidString(s) {
+				return true
+			}
+		}
+		for _, s := range req.Subject.Roles {
+			if !utf8.ValidString(s) {
+				return true
+			}
+		}
+		for _, s := range d.Matched {
+			if !utf8.ValidString(s) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// rawEnvelopePrefix opens every raw-byte canonical encoding. It never
+// coincides with the start of a JSON envelope (always '{'), so
+// fingerprints from the two encodings live in collision-free spaces.
+const rawEnvelopePrefix = "darksafe-audit-raw-v1\x00"
+
+// fingerprintTag delimits one field or nested value within the canonical
+// binary encoding. Distinct tags keep two payloads that merely share
+// adjacent bytes apart (e.g. ["ab",""] vs ["a","b"]).
+type fingerprintTag byte
+
+const (
+	tagEnvelope fingerprintTag = iota + 1
+	tagSeq
+	tagString
+	tagStringList
+	tagBool
+	tagPolicy
+	tagPolicyList
+	tagChange
+	tagSubject
+	tagResource
+	tagDecision
+	tagDecisionRecord
+)
+
+// fingerprintEncoder builds the canonical byte representation of an
+// envelope. Unlike encoding/json it writes string contents byte-for-byte
+// with an explicit length prefix, so strings carrying invalid UTF-8 stay
+// distinguishable: encoding/json renders both a raw 0xFF byte and a raw
+// 0xFE byte as the U+FFFD replacement rune, collapsing genuinely
+// different content onto identical fingerprints.
+type fingerprintEncoder struct {
+	buf []byte
+}
+
+func (e *fingerprintEncoder) tag(t fingerprintTag) {
+	e.buf = append(e.buf, byte(t))
+}
+
+func (e *fingerprintEncoder) int64Tag(t fingerprintTag, v int64) {
+	e.tag(t)
+	var b [8]byte
+	binary.BigEndian.PutUint64(b[:], uint64(v))
+	e.buf = append(e.buf, b[:]...)
+}
+
+func (e *fingerprintEncoder) boolTag(t fingerprintTag, v bool) {
+	e.tag(t)
+	if v {
+		e.buf = append(e.buf, 1)
+	} else {
+		e.buf = append(e.buf, 0)
+	}
+}
+
+// rawString tags and writes a string from its exact memory bytes. No
+// validation, replacement or normalization is ever performed: an invalid
+// UTF-8 byte reaches the hash unchanged.
+func (e *fingerprintEncoder) rawString(s string) {
+	e.tag(tagString)
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(len(s)))
+	e.buf = append(e.buf, b[:]...)
+	e.buf = append(e.buf, s...)
+}
+
+// stringList preserves nil-vs-empty explicitly: in the JSON envelope a
+// nil slice is "null" and a non-nil empty slice is "[]", so the raw
+// encoding must keep the two shapes apart as well.
+func (e *fingerprintEncoder) stringList(items []string) {
+	e.tag(tagStringList)
+	if items == nil {
+		e.buf = append(e.buf, 0)
+		return
+	}
+	e.buf = append(e.buf, 1)
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(len(items)))
+	e.buf = append(e.buf, b[:]...)
+	for _, s := range items {
+		e.rawString(s)
+	}
+}
+
+func (e *fingerprintEncoder) policy(p Policy) {
+	e.tag(tagPolicy)
+	e.rawString(p.ID)
+	e.rawString(p.Subject)
+	e.rawString(p.Action)
+	e.rawString(p.Scope)
+	e.rawString(string(p.Effect))
+	e.boolTag(tagBool, p.Recursive)
+}
+
+func (e *fingerprintEncoder) policyList(policies []Policy) {
+	e.tag(tagPolicyList)
+	if policies == nil {
+		e.buf = append(e.buf, 0)
+		return
+	}
+	e.buf = append(e.buf, 1)
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(len(policies)))
+	e.buf = append(e.buf, b[:]...)
+	for _, p := range policies {
+		e.policy(p)
+	}
+}
+
+func (e *fingerprintEncoder) change(c *PolicyChange) {
+	e.tag(tagChange)
+	// A nil pointer is encoded as tagChange alone; a present value's
+	// fields follow immediately.
+	if c == nil {
+		return
+	}
+	e.int64Tag(tagSeq, int64(c.Version))
+	e.policyList(c.Policies)
+	e.int64Tag(tagSeq, int64(c.SourceVersion))
+	e.boolTag(tagBool, c.RolledBack)
+}
+
+func (e *fingerprintEncoder) subject(su Subject) {
+	e.tag(tagSubject)
+	e.rawString(su.ID)
+	e.rawString(su.Kind)
+	e.stringList(su.Roles)
+	e.boolTag(tagBool, su.Disabled)
+}
+
+func (e *fingerprintEncoder) resource(r Resource) {
+	e.tag(tagResource)
+	e.rawString(r.ID)
+	e.rawString(r.Scope)
+}
+
+func (e *fingerprintEncoder) decision(d Decision) {
+	e.tag(tagDecision)
+	e.boolTag(tagBool, d.Allowed)
+	e.rawString(d.Reason)
+	e.stringList(d.Matched)
+	e.int64Tag(tagSeq, int64(d.Version))
+}
+
+func (e *fingerprintEncoder) decisionRecord(d *DecisionRecord) {
+	e.tag(tagDecisionRecord)
+	if d == nil {
+		return
+	}
+	// OrgRequest fields are written inline at the same nesting depth the
+	// request occupies in the envelope; no field is skipped.
+	e.rawString(d.Request.SubjectOrg)
+	e.rawString(d.Request.ResourceOrg)
+	e.subject(d.Request.Subject)
+	e.resource(d.Request.Resource)
+	e.rawString(d.Request.Action)
+	e.decision(d.Decision)
+}
+
+// encodeCanonical returns the raw bytes fingerprinted for an envelope
+// whose strings include invalid UTF-8. Every string the record carries
+// reaches the output byte-for-byte, at whatever nesting depth or list
+// position it occupies. The prefix separates this encoding space from
+// JSON fingerprints.
+func encodeCanonical(env *hashEnvelope) []byte {
+	e := &fingerprintEncoder{buf: []byte(rawEnvelopePrefix)}
+	e.tag(tagEnvelope)
+	e.rawString(env.Org)
+	e.int64Tag(tagSeq, int64(env.Seq))
+	e.rawString(env.Kind)
+	e.change(env.Change)
+	e.decisionRecord(env.Decision)
+	e.rawString(env.PrevFingerprint)
+	return e.buf
+}
+
 // genesisFingerprint derives the chain root from the organization name,
 // keeping equal identifiers in different organizations independent.
 func genesisFingerprint(org string) string {
@@ -94,9 +317,16 @@ func genesisFingerprint(org string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// computeFingerprint returns the fingerprint for an envelope.
-func computeFingerprint(e *hashEnvelope) string {
-	b, err := json.Marshal(e)
+// computeFingerprint returns the fingerprint for an envelope. Records made
+// exclusively of valid UTF-8 keep the historical JSON fingerprint, so old
+// exports and checkpoints remain valid; records containing invalid bytes
+// use the length-prefixed raw encoding that protects their exact bytes.
+func computeFingerprint(env *hashEnvelope) string {
+	if envelopeUsesRawBytes(env) {
+		sum := sha256.Sum256(encodeCanonical(env))
+		return hex.EncodeToString(sum[:])
+	}
+	b, err := json.Marshal(env)
 	if err != nil {
 		// All envelope fields are plain, JSON-encodable values; a failure
 		// here indicates a programming error, not user input.

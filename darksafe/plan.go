@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strings"
 )
@@ -64,7 +65,14 @@ type ReleasePlan struct {
 }
 
 // ParseReleaseInput reads a release plan document and validates its fields.
+// Every JSON object in the document — including unknown fields and their
+// nested objects — must have distinct member names; a name appearing twice
+// (even with the same value, or via equivalent Unicode escapes) is rejected
+// before any business validation runs.
 func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
+	if err := checkDuplicateMembers(data); err != nil {
+		return ReleasePlanInput{}, err
+	}
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
 	var doc map[string]any
@@ -75,6 +83,123 @@ func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 		return ReleasePlanInput{}, errors.New("JSON 格式错误: 文档包含多余内容")
 	}
 	return buildReleaseInput(doc)
+}
+
+// duplicateMemberError reports a JSON object whose member name appears more
+// than once. Path is a JSONPath-style location: "$" for the document root,
+// "$.clusters[1]" for a cluster, "$.clusters[0].tags" for a tag object,
+// "$.include[2]" / "$.exclude[1]" for a condition, and "$.foo.bar[0]" for
+// objects nested inside unknown fields.
+type duplicateMemberError struct {
+	field string
+	path  string
+}
+
+func (e *duplicateMemberError) Error() string {
+	return fmt.Sprintf("JSON 对象存在重复成员: 字段 %q 重复出现于 %s", e.field, e.path)
+}
+
+// checkDuplicateMembers walks every JSON object in data and rejects objects
+// with duplicate member names. Names are compared after JSON decoding, so
+// "env" and "env" are the same name while "env" and "ENV", or
+// " env" and "env", are different. The first duplicate encountered in file
+// order is reported: the walk is depth-first in document order, so the
+// second occurrence that appears earliest wins, regardless of value type.
+func checkDuplicateMembers(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := walkJSONValue(dec, "$"); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return errors.New("JSON 格式错误: 文档包含多余内容")
+		}
+		return fmt.Errorf("JSON 格式错误: %w", err)
+	}
+	return nil
+}
+
+// walkJSONValue reads one complete JSON value whose first token has not been
+// consumed yet.
+func walkJSONValue(dec *json.Decoder, path string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		if err == io.EOF {
+			return errors.New("JSON 格式错误: 文档为空")
+		}
+		return fmt.Errorf("JSON 格式错误: %w", err)
+	}
+	return walkJSONValueToken(dec, path, tok)
+}
+
+// walkJSONValueToken reads the remainder of a value given its first token.
+func walkJSONValueToken(dec *json.Decoder, path string, tok json.Token) error {
+	if d, ok := tok.(json.Delim); ok {
+		switch d {
+		case '{':
+			return walkJSONObject(dec, path)
+		case '[':
+			return walkJSONArray(dec, path)
+		default:
+			return fmt.Errorf("JSON 格式错误: 意外的分隔符 %q", d)
+		}
+	}
+	return nil // scalar value (string, number, bool, null)
+}
+
+func walkJSONObject(dec *json.Decoder, path string) error {
+	seen := make(map[string]struct{})
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				return errors.New("JSON 格式错误: 对象未闭合")
+			}
+			return fmt.Errorf("JSON 格式错误: %w", err)
+		}
+		if d, ok := tok.(json.Delim); ok {
+			if d == '}' {
+				return nil
+			}
+			return fmt.Errorf("JSON 格式错误: 意外的分隔符 %q", d)
+		}
+		key, ok := tok.(string)
+		if !ok {
+			return errors.New("JSON 格式错误: 对象成员名必须是字符串")
+		}
+		if _, dup := seen[key]; dup {
+			return &duplicateMemberError{field: key, path: path}
+		}
+		seen[key] = struct{}{}
+		vtok, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				return errors.New("JSON 格式错误: 缺少成员值")
+			}
+			return fmt.Errorf("JSON 格式错误: %w", err)
+		}
+		if err := walkJSONValueToken(dec, path+"."+key, vtok); err != nil {
+			return err
+		}
+	}
+}
+
+func walkJSONArray(dec *json.Decoder, path string) error {
+	for i := 0; ; i++ {
+		tok, err := dec.Token()
+		if err != nil {
+			if err == io.EOF {
+				return errors.New("JSON 格式错误: 数组未闭合")
+			}
+			return fmt.Errorf("JSON 格式错误: %w", err)
+		}
+		if d, ok := tok.(json.Delim); ok && d == ']' {
+			return nil
+		}
+		if err := walkJSONValueToken(dec, fmt.Sprintf("%s[%d]", path, i), tok); err != nil {
+			return err
+		}
+	}
 }
 
 func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {

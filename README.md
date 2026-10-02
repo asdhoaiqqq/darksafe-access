@@ -9,8 +9,11 @@
 ```bash
 go run ./cmd/darksafe demo
 go run ./cmd/darksafe version
+printf '%s\n' '[{"name":"cpu","timestamp":1000,"value":0.5,"labels":{"host":"a"}}]' | go run ./cmd/darksafe ingest
 go test ./...
 ```
+
+`ingest` 从标准输入按行读取 JSON 数组（每行一批采样点），逐行输出 JSON 结果，数据仅保存在本次进程内存中；详见 `go run ./cmd/darksafe help`。
 
 ## 技术方向
 

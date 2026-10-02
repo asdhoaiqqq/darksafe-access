@@ -473,3 +473,140 @@ func (s *Store) RecheckDecision(org string, seq int) (Decision, error) {
 	}
 	return evaluate(req, append([]Policy(nil), src...), version), nil
 }
+
+// OfflineRecheckResult is the outcome of rechecking one decision record
+// entirely from exported audit material. It carries the decision recorded
+// at the time, the decision recomputed from the export, and whether every
+// field of the two decisions agrees.
+type OfflineRecheckResult struct {
+	// Seq is the rechecked record's organization-local sequence.
+	Seq int
+	// Original is the decision stored in the target audit record.
+	Original Decision
+	// Recomputed is the decision rebuilt from the verified export.
+	Recomputed Decision
+	// Match reports whether Original and Recomputed agree on every field.
+	Match bool
+}
+
+// RecheckDecisionOffline re-evaluates the decision at seq using only the
+// organization name, a complete export (records starting at sequence 1)
+// and the checkpoint saved alongside it. No Store is created or restored;
+// the exported material is never modified and no audit record is appended.
+//
+// The whole export is chain-verified first, including records after the
+// target: any rewritten field, deleted middle or tail record, swapped
+// order, foreign-organization record, or checkpoint mismatch fails the
+// recheck without producing a result. A legal prefix export with its
+// matching checkpoint is accepted; subject-filtered pages and fragments
+// missing the beginning are not, because VerifyAudit requires a gapless
+// chain starting at sequence 1. An empty export with its genesis
+// checkpoint verifies but contains no decision to recheck.
+//
+// The recomputation uses the request saved in the target record and the
+// policy version that decision actually used. That version's full policy
+// set must be carried by a policy-change record preceding the target in
+// the export; a version missing from the export, or appearing only after
+// the target, is an error — a newer version is never substituted. Later
+// publishes, rollbacks, or export-scope expansion cannot change the
+// result. Rollback-produced versions use the full content carried by
+// their change record and the result notes the new version number.
+//
+// Version 0 restores the original envelope rejections (missing fields,
+// organization mismatch, invalid scope, disabled subject); an otherwise
+// valid request restores the no-published-version denial, still at
+// version 0. Policy judgment keeps default denial and deny-overrides.
+//
+// A chain that verifies but whose recomputed decision differs returns
+// both complete decisions with Match=false; the original conclusion is
+// never reported as the recomputed one. Returned data is detached from
+// the input records.
+func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, seq int) (*OfflineRecheckResult, error) {
+	if org == "" {
+		return nil, ErrMissingOrganization
+	}
+	if seq < 1 {
+		return nil, fmt.Errorf("%w: sequence %d", ErrAuditNotFound, seq)
+	}
+	// Verify the entire export before touching the target; corruption
+	// past the target is not ignored.
+	if err := VerifyAudit(org, records, cp); err != nil {
+		return nil, err
+	}
+	if seq > len(records) {
+		return nil, fmt.Errorf("%w: organization %q has no audit sequence %d", ErrAuditNotFound, org, seq)
+	}
+	rec := records[seq-1]
+	if rec.Kind != AuditDecision || rec.Decision == nil {
+		return nil, fmt.Errorf("%w: sequence %d is %s", ErrAuditNotADecision, seq, rec.Kind)
+	}
+
+	original := rec.Decision.Decision
+	req := rec.Decision.Request
+	var recomputed Decision
+	if original.Version == 0 {
+		// No published version was evaluated: restore the envelope
+		// rejection when one applies, otherwise the unpublished denial.
+		if d, ok := checkRequest(org, req); !ok {
+			recomputed = d
+		} else {
+			recomputed = Decision{Allowed: false, Reason: "organization has no published version"}
+		}
+	} else {
+		// The version's full policy set must be recorded before the
+		// target; a change record appearing only after it cannot be the
+		// basis of the original decision.
+		policies, ok := policiesForVersionBefore(records, seq-1, original.Version)
+		if !ok {
+			return nil, fmt.Errorf("%w: decision at sequence %d used version %d, whose full policy set is not recorded before it in the export",
+				ErrVersionNotFound, seq, original.Version)
+		}
+		recomputed = evaluate(req, policies, original.Version)
+	}
+
+	return &OfflineRecheckResult{
+		Seq:        seq,
+		Original:   cloneDecisionValue(original),
+		Recomputed: cloneDecisionValue(recomputed),
+		Match:      decisionsEqual(original, recomputed),
+	}, nil
+}
+
+// policiesForVersionBefore scans records[0:before] for a policy-change
+// record establishing version and returns a detached copy of its full
+// policy set. The version must precede the decision that used it.
+func policiesForVersionBefore(records []AuditRecord, before, version int) ([]Policy, bool) {
+	for i := 0; i < before; i++ {
+		r := records[i]
+		if r.Kind == AuditPolicyChange && r.Change != nil && r.Change.Version == version {
+			return clonePolicies(r.Change.Policies), true
+		}
+	}
+	return nil, false
+}
+
+// decisionsEqual compares every decision field. Matched lists are
+// compared element by element in their deterministic order; a nil list
+// and an empty list are the same empty result.
+func decisionsEqual(a, b Decision) bool {
+	if a.Allowed != b.Allowed || a.Reason != b.Reason || a.Version != b.Version {
+		return false
+	}
+	if len(a.Matched) != len(b.Matched) {
+		return false
+	}
+	for i := range a.Matched {
+		if a.Matched[i] != b.Matched[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// cloneDecisionValue returns a detached copy of a decision value.
+func cloneDecisionValue(d Decision) Decision {
+	if len(d.Matched) > 0 {
+		d.Matched = append([]string(nil), d.Matched...)
+	}
+	return d
+}

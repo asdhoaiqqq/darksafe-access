@@ -2,6 +2,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -18,6 +19,8 @@ func main() {
 		runDemo()
 	case "version":
 		fmt.Println("darksafe 0.1.0")
+	case "plan":
+		runPlan(os.Args[2:])
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -28,7 +31,43 @@ func main() {
 }
 
 func usage() {
-	fmt.Println("usage: darksafe [demo|version|help]")
+	fmt.Println("usage: darksafe [demo|version|plan <JSON文件路径>|help]")
+	fmt.Println()
+	fmt.Println("  demo             运行内置演示")
+	fmt.Println("  version          显示版本号")
+	fmt.Println("  plan <JSON路径>  离线读取发布配置并输出发布计划（JSON），不连接集群、不执行发布")
+	fmt.Println("  help             显示本帮助")
+	fmt.Println()
+	fmt.Println("plan 输入字段：app, revision, image, batchSize, clusters[], include[], exclude[]")
+	fmt.Println("plan 成功时向标准输出写入完整发布计划；失败时以非零状态退出，并在标准错误说明具体问题。")
+}
+
+func runPlan(args []string) {
+	if len(args) != 1 {
+		fmt.Fprintln(os.Stderr, "用法: darksafe plan <JSON文件路径>")
+		os.Exit(2)
+	}
+	data, err := os.ReadFile(args[0])
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "无法读取文件: %v\n", err)
+		os.Exit(1)
+	}
+	in, err := darksafe.ParseReleaseInput(data)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	plan, err := darksafe.MakeReleasePlan(in)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	out, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "序列化发布计划失败: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(out))
 }
 
 func runDemo() {

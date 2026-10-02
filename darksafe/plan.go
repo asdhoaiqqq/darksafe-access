@@ -36,6 +36,9 @@ type ReleasePlanInput struct {
 	Clusters  []Cluster
 	Include   []LabelCondition
 	Exclude   []LabelCondition
+	// SpreadBy, when non-empty, names a cluster tag whose value identifies a
+	// fault domain; each batch then contains at most one cluster per domain.
+	SpreadBy string
 }
 
 // AppInfo identifies the application being released.
@@ -219,6 +222,10 @@ func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {
 	if err != nil {
 		return ReleasePlanInput{}, err
 	}
+	spreadBy, err := optionalSpreadBy(doc)
+	if err != nil {
+		return ReleasePlanInput{}, err
+	}
 	clusters, err := parseClusters(doc["clusters"])
 	if err != nil {
 		return ReleasePlanInput{}, err
@@ -240,11 +247,40 @@ func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {
 		Clusters:  clusters,
 		Include:   include,
 		Exclude:   exclude,
+		SpreadBy:  spreadBy,
 	}, nil
 }
 
+// optionalSpreadBy reads the optional "spreadBy" field: absent or an empty
+// string disables fault-domain spreading; a non-string value or a string of
+// only whitespace is rejected. The tag key is used exactly as written.
+func optionalSpreadBy(doc map[string]any) (string, error) {
+	v, ok := doc["spreadBy"]
+	if !ok {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("字段 %q 必须是字符串", "spreadBy")
+	}
+	if err := checkSpreadBy(s); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+// checkSpreadBy rejects a spreadBy value that is neither empty nor a usable
+// tag key: a string of only whitespace can never match a valid tag key.
+func checkSpreadBy(s string) error {
+	if s != "" && strings.TrimSpace(s) == "" {
+		return fmt.Errorf("字段 %q 不能只含空白", "spreadBy")
+	}
+	return nil
+}
+
 // ValidateReleaseInput checks that a release configuration is well-formed:
-// app/revision/image are non-empty, batchSize is a positive integer, cluster
+// app/revision/image are non-empty, batchSize is a positive integer, spreadBy
+// is empty or a usable tag key (not whitespace-only), cluster
 // IDs are unique across every candidate (including disabled and filtered-out
 // clusters), and tag/condition keys are non-empty. Errors name the field and
 // the position in its list; within a cluster the ID is checked before its
@@ -263,6 +299,9 @@ func ValidateReleaseInput(in ReleasePlanInput) error {
 	}
 	if in.BatchSize <= 0 {
 		return errors.New(`字段 "batchSize" 必须是正整数`)
+	}
+	if err := checkSpreadBy(in.SpreadBy); err != nil {
+		return err
 	}
 	seen := make(map[string]struct{}, len(in.Clusters))
 	for i, c := range in.Clusters {
@@ -454,7 +493,9 @@ func parseConditions(v any, field string) ([]LabelCondition, error) {
 }
 
 // MakeReleasePlan selects available clusters, orders them by ID, and splits
-// them into batches. It validates the input first and never mutates it.
+// them into batches. When SpreadBy names a tag, each batch holds at most one
+// cluster per value of that tag (its fault domain) and every selected cluster
+// must carry the tag. It validates the input first and never mutates it.
 func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 	if err := ValidateReleaseInput(in); err != nil {
 		return ReleasePlan{}, err
@@ -493,13 +534,15 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 		return ReleasePlan{}, errors.New(b.String())
 	}
 
-	batches := []Batch{}
-	for i := 0; i < len(selected); i += in.BatchSize {
-		end := i + in.BatchSize
-		if end > len(selected) {
-			end = len(selected)
+	var batches []Batch
+	if in.SpreadBy == "" {
+		batches = chunkBatches(selected, in.BatchSize)
+	} else {
+		domains, err := faultDomains(in.Clusters, selected, in.SpreadBy)
+		if err != nil {
+			return ReleasePlan{}, err
 		}
-		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: selected[i:end]})
+		batches = spreadBatches(selected, domains, in.BatchSize)
 	}
 
 	return ReleasePlan{
@@ -507,6 +550,67 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 		Batches:  batches,
 		Excluded: excluded,
 	}, nil
+}
+
+// chunkBatches splits the ascending IDs into batches of at most batchSize.
+func chunkBatches(selected []string, batchSize int) []Batch {
+	batches := []Batch{}
+	for i := 0; i < len(selected); i += batchSize {
+		end := i + batchSize
+		if end > len(selected) {
+			end = len(selected)
+		}
+		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: selected[i:end]})
+	}
+	return batches
+}
+
+// faultDomains maps every selected cluster ID to the exact value of its
+// spreadBy tag. A selected cluster missing the tag fails the whole plan;
+// selected is ascending, so the smallest such ID is reported. An empty
+// string tag value is a valid fault domain, distinct from a missing tag.
+func faultDomains(clusters []Cluster, selected []string, spreadBy string) (map[string]string, error) {
+	tagsByID := make(map[string]map[string]string, len(clusters))
+	for _, c := range clusters {
+		tagsByID[c.ID] = c.Tags
+	}
+	domains := make(map[string]string, len(selected))
+	for _, id := range selected {
+		v, ok := tagsByID[id][spreadBy]
+		if !ok {
+			return nil, fmt.Errorf("集群 %q 缺少故障域标签 %q", id, spreadBy)
+		}
+		domains[id] = v
+	}
+	return domains, nil
+}
+
+// spreadBatches packs the ascending IDs into batches of at most batchSize
+// with at most one cluster per fault domain in each batch. Each batch takes
+// the smallest still-unscheduled IDs whose domains do not conflict with the
+// batch; conflicting clusters are deferred to later batches, so a batch may
+// be short only when no non-conflicting cluster remains. Every ID appears in
+// exactly one batch and IDs stay ascending within a batch.
+func spreadBatches(selected []string, domains map[string]string, batchSize int) []Batch {
+	remaining := append([]string(nil), selected...)
+	batches := []Batch{}
+	for len(remaining) > 0 {
+		used := make(map[string]struct{}, batchSize)
+		batch := []string{}
+		deferred := []string{}
+		for _, id := range remaining {
+			d := domains[id]
+			if _, conflict := used[d]; len(batch) < batchSize && !conflict {
+				used[d] = struct{}{}
+				batch = append(batch, id)
+			} else {
+				deferred = append(deferred, id)
+			}
+		}
+		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: batch})
+		remaining = deferred
+	}
+	return batches
 }
 
 func matchesAny(tags map[string]string, conditions []LabelCondition) bool {

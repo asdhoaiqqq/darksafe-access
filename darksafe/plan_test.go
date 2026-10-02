@@ -561,3 +561,258 @@ func TestValidate_BatchNegativeDoesNotPanic(t *testing.T) {
 		t.Fatal("expected error for negative batchSize")
 	}
 }
+
+func batchIDs(plan ReleasePlan) []string {
+	var out []string
+	for _, b := range plan.Batches {
+		out = append(out, strings.Join(b.Clusters, ","))
+	}
+	return out
+}
+
+func TestPlan_SpreadByFaultDomain(t *testing.T) {
+	in := parsePlan(t, `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 2,
+		"spreadBy": "zone",
+		"clusters": [
+			{"id": "a", "tags": {"zone": "east"}},
+			{"id": "b", "tags": {"zone": "east"}},
+			{"id": "c", "tags": {"zone": "west"}},
+			{"id": "d", "tags": {"zone": "west"}},
+			{"id": "e", "tags": {"zone": "east"}}
+		]
+	}`)
+	plan, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a,c", "b,d", "e"}
+	got := batchIDs(plan)
+	if strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("batches = %v, want %v", got, want)
+	}
+	for i, b := range plan.Batches {
+		if b.Index != i+1 {
+			t.Fatalf("batch %d index = %d", i, b.Index)
+		}
+	}
+}
+
+func TestPlan_SpreadBySingleDomain(t *testing.T) {
+	in := parsePlan(t, `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 3,
+		"spreadBy": "zone",
+		"clusters": [
+			{"id": "a", "tags": {"zone": "east"}},
+			{"id": "b", "tags": {"zone": "east"}},
+			{"id": "c", "tags": {"zone": "east"}}
+		]
+	}`)
+	plan, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a", "b", "c"}
+	if got := batchIDs(plan); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("batches = %v, want %v", got, want)
+	}
+}
+
+func TestPlan_SpreadByEmptyStringDisables(t *testing.T) {
+	for _, raw := range []string{
+		`{"app":"a","revision":"r","image":"i","batchSize":2,"clusters":[{"id":"c2","tags":{"zone":"e"}},{"id":"c1","tags":{"zone":"e"}},{"id":"c3"}]}`,
+		`{"app":"a","revision":"r","image":"i","batchSize":2,"spreadBy":"","clusters":[{"id":"c2","tags":{"zone":"e"}},{"id":"c1","tags":{"zone":"e"}},{"id":"c3"}]}`,
+	} {
+		plan, err := MakeReleasePlan(parsePlan(t, raw))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"c1,c2", "c3"}
+		if got := batchIDs(plan); strings.Join(got, "|") != strings.Join(want, "|") {
+			t.Fatalf("batches = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestPlan_SpreadByInvalidConfig(t *testing.T) {
+	cases := map[string]string{
+		"non-string":      `{"app":"a","revision":"r","image":"i","batchSize":1,"spreadBy":3,"clusters":[{"id":"x"}]}`,
+		"whitespace only": `{"app":"a","revision":"r","image":"i","batchSize":1,"spreadBy":"  ","clusters":[{"id":"x"}]}`,
+		"tab only":        `{"app":"a","revision":"r","image":"i","batchSize":1,"spreadBy":"\t","clusters":[{"id":"x"}]}`,
+		"boolean":         `{"app":"a","revision":"r","image":"i","batchSize":1,"spreadBy":true,"clusters":[{"id":"x"}]}`,
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseReleaseInput([]byte(raw))
+			if err == nil || !strings.Contains(err.Error(), "spreadBy") {
+				t.Fatalf("expected spreadBy error, got %v", err)
+			}
+		})
+	}
+	// Struct path: whitespace-only spreadBy is rejected by validation.
+	in := validInput()
+	in.SpreadBy = " \t "
+	if err := ValidateReleaseInput(in); err == nil || !strings.Contains(err.Error(), "spreadBy") {
+		t.Fatalf("expected spreadBy validation error, got %v", err)
+	}
+	if _, err := MakeReleasePlan(in); err == nil {
+		t.Fatal("MakeReleasePlan: expected error for whitespace spreadBy")
+	}
+}
+
+func TestPlan_SpreadByMissingTagFails(t *testing.T) {
+	in := parsePlan(t, `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 2,
+		"spreadBy": "zone",
+		"clusters": [
+			{"id": "b", "tags": {"zone": "east"}},
+			{"id": "a"},
+			{"id": "c", "tags": {"region": "us"}}
+		]
+	}`)
+	_, err := MakeReleasePlan(in)
+	if err == nil {
+		t.Fatal("expected error for missing spread tag")
+	}
+	if !strings.Contains(err.Error(), `"a"`) || !strings.Contains(err.Error(), `"zone"`) {
+		t.Fatalf("error should name smallest missing cluster and the tag, got %v", err)
+	}
+}
+
+func TestPlan_SpreadByExcludedClustersNeedNoTag(t *testing.T) {
+	in := parsePlan(t, `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 2,
+		"spreadBy": "zone",
+		"clusters": [
+			{"id": "a", "tags": {"zone": "east"}},
+			{"id": "b", "tags": {"zone": "west"}},
+			{"id": "c", "disabled": true},
+			{"id": "d", "tags": {"env": "dev"}}
+		],
+		"include": [{"env": "prod"}, {"zone": "east"}, {"zone": "west"}]
+	}`)
+	plan, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a,b"}
+	if got := batchIDs(plan); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("batches = %v, want %v", got, want)
+	}
+	reasons := map[string]string{}
+	for _, e := range plan.Excluded {
+		reasons[e.ID] = e.Reason
+	}
+	if reasons["c"] != ReasonDisabled || reasons["d"] != ReasonIncludeNotMatched {
+		t.Fatalf("excluded reasons wrong: %v", plan.Excluded)
+	}
+}
+
+func TestPlan_SpreadByEmptyTagValueIsDomain(t *testing.T) {
+	in := parsePlan(t, `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 2,
+		"spreadBy": "zone",
+		"clusters": [
+			{"id": "a", "tags": {"zone": ""}},
+			{"id": "b", "tags": {"zone": ""}},
+			{"id": "c", "tags": {"zone": "east"}}
+		]
+	}`)
+	plan, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a,c", "b"}
+	if got := batchIDs(plan); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("batches = %v, want %v", got, want)
+	}
+}
+
+func TestPlan_SpreadByExactKeyAndValueMatch(t *testing.T) {
+	// Keys/values are matched exactly: "Zone" is not "zone", " east" is not "east".
+	in := parsePlan(t, `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 2,
+		"spreadBy": "zone",
+		"clusters": [
+			{"id": "a", "tags": {"zone": "east"}},
+			{"id": "b", "tags": {"zone": " east"}},
+			{"id": "c", "tags": {"zone": "East"}}
+		]
+	}`)
+	plan, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"a,b", "c"}
+	if got := batchIDs(plan); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("batches = %v, want %v", got, want)
+	}
+
+	missing := parsePlan(t, `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 2,
+		"spreadBy": "zone",
+		"clusters": [{"id": "a", "tags": {"Zone": "east"}}]
+	}`)
+	if _, err := MakeReleasePlan(missing); err == nil {
+		t.Fatal("tag key lookup must be case-sensitive")
+	}
+}
+
+func TestPlan_SpreadByDeterministicAndConsistent(t *testing.T) {
+	raw := `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 2,
+		"spreadBy": "zone",
+		"clusters": [
+			{"id": "a", "tags": {"zone": "east"}},
+			{"id": "b", "tags": {"zone": "east"}},
+			{"id": "c", "tags": {"zone": "west"}},
+			{"id": "d", "tags": {"zone": "west"}},
+			{"id": "e", "tags": {"zone": "east"}}
+		]
+	}`
+	shuffled := `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 2,
+		"spreadBy": "zone",
+		"clusters": [
+			{"id": "e", "tags": {"zone": "east"}},
+			{"id": "d", "tags": {"zone": "west"}},
+			{"id": "c", "tags": {"zone": "west"}},
+			{"id": "b", "tags": {"zone": "east"}},
+			{"id": "a", "tags": {"zone": "east"}}
+		]
+	}`
+	p1, err := MakeReleasePlan(parsePlan(t, raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2, err := MakeReleasePlan(parsePlan(t, shuffled))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprintf("%+v", p1) != fmt.Sprintf("%+v", p2) {
+		t.Fatalf("order changed plan: %+v vs %+v", p1, p2)
+	}
+
+	// Struct path agrees with JSON path.
+	in := ReleasePlanInput{
+		App: "app", Revision: "r1", Image: "img", BatchSize: 2, SpreadBy: "zone",
+		Clusters: []Cluster{
+			{ID: "a", Tags: map[string]string{"zone": "east"}},
+			{ID: "b", Tags: map[string]string{"zone": "east"}},
+			{ID: "c", Tags: map[string]string{"zone": "west"}},
+			{ID: "d", Tags: map[string]string{"zone": "west"}},
+			{ID: "e", Tags: map[string]string{"zone": "east"}},
+		},
+	}
+	before := fmt.Sprintf("%+v", in)
+	p3, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprintf("%+v", p1) != fmt.Sprintf("%+v", p3) {
+		t.Fatalf("struct and JSON plans differ: %+v vs %+v", p1, p3)
+	}
+	if after := fmt.Sprintf("%+v", in); after != before {
+		t.Fatal("MakeReleasePlan mutated input")
+	}
+}

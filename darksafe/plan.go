@@ -36,6 +36,11 @@ type ReleasePlanInput struct {
 	Clusters  []Cluster
 	Include   []LabelCondition
 	Exclude   []LabelCondition
+	// SpreadBy names a cluster tag whose values identify failure domains.
+	// When non-empty, no batch contains two clusters with the same tag
+	// value; the empty string disables spreading and leaves batching
+	// unchanged. The tag key and values are matched exactly.
+	SpreadBy string
 }
 
 // AppInfo identifies the application being released.
@@ -231,6 +236,10 @@ func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {
 	if err != nil {
 		return ReleasePlanInput{}, err
 	}
+	spreadBy, err := optionalString(doc, "spreadBy")
+	if err != nil {
+		return ReleasePlanInput{}, err
+	}
 
 	return ReleasePlanInput{
 		App:       app,
@@ -240,6 +249,7 @@ func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {
 		Clusters:  clusters,
 		Include:   include,
 		Exclude:   exclude,
+		SpreadBy:  spreadBy,
 	}, nil
 }
 
@@ -263,6 +273,9 @@ func ValidateReleaseInput(in ReleasePlanInput) error {
 	}
 	if in.BatchSize <= 0 {
 		return errors.New(`字段 "batchSize" 必须是正整数`)
+	}
+	if in.SpreadBy != "" && strings.TrimSpace(in.SpreadBy) == "" {
+		return errors.New(`字段 "spreadBy" 不能只含空白`)
 	}
 	seen := make(map[string]struct{}, len(in.Clusters))
 	for i, c := range in.Clusters {
@@ -334,6 +347,25 @@ func requiredString(doc map[string]any, field string) (string, error) {
 	}
 	if strings.TrimSpace(s) == "" {
 		return "", fmt.Errorf("字段 %q 不能为空或只含空白", field)
+	}
+	return s, nil
+}
+
+// optionalString reads an optional string field. A missing field yields the
+// empty string (the disabled state); an explicitly empty string is also
+// accepted as disabled, but a whitespace-only value is rejected because it
+// is not a usable tag key.
+func optionalString(doc map[string]any, field string) (string, error) {
+	v, ok := doc[field]
+	if !ok {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("字段 %q 必须是字符串", field)
+	}
+	if s != "" && strings.TrimSpace(s) == "" {
+		return "", fmt.Errorf("字段 %q 不能只含空白", field)
 	}
 	return s, nil
 }
@@ -454,7 +486,9 @@ func parseConditions(v any, field string) ([]LabelCondition, error) {
 }
 
 // MakeReleasePlan selects available clusters, orders them by ID, and splits
-// them into batches. It validates the input first and never mutates it.
+// them into batches. When SpreadBy is set, batches also spread clusters across
+// failure domains identified by that tag. It validates the input first and
+// never mutates it.
 func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 	if err := ValidateReleaseInput(in); err != nil {
 		return ReleasePlan{}, err
@@ -493,13 +527,29 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 		return ReleasePlan{}, errors.New(b.String())
 	}
 
-	batches := []Batch{}
-	for i := 0; i < len(selected); i += in.BatchSize {
-		end := i + in.BatchSize
-		if end > len(selected) {
-			end = len(selected)
+	// Map selected IDs to their clusters for tag lookup.
+	clusterByID := make(map[string]Cluster, len(in.Clusters))
+	for _, c := range in.Clusters {
+		clusterByID[c.ID] = c
+	}
+
+	if in.SpreadBy != "" {
+		// Only selected clusters must carry the failure-domain tag; excluded
+		// clusters are not checked and keep their original exclusion reason.
+		// selected is sorted ascending, so the first missing ID is the
+		// smallest one.
+		for _, id := range selected {
+			if _, ok := clusterByID[id].Tags[in.SpreadBy]; !ok {
+				return ReleasePlan{}, fmt.Errorf("集群 %q 缺少 spreadBy 指定的标签 %q", id, in.SpreadBy)
+			}
 		}
-		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: selected[i:end]})
+	}
+
+	var batches []Batch
+	if in.SpreadBy != "" {
+		batches = spreadBatches(selected, clusterByID, in.BatchSize, in.SpreadBy)
+	} else {
+		batches = plainBatches(selected, in.BatchSize)
 	}
 
 	return ReleasePlan{
@@ -507,6 +557,58 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 		Batches:  batches,
 		Excluded: excluded,
 	}, nil
+}
+
+// plainBatches splits ascending IDs into fixed-size contiguous batches.
+func plainBatches(selected []string, batchSize int) []Batch {
+	batches := []Batch{}
+	for i := 0; i < len(selected); i += batchSize {
+		end := i + batchSize
+		if end > len(selected) {
+			end = len(selected)
+		}
+		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: selected[i:end]})
+	}
+	return batches
+}
+
+// spreadBatches schedules ascending IDs into batches of at most batchSize,
+// with no batch containing two clusters from the same failure domain (the
+// exact tags[spreadBy] value; an empty string is a real domain distinct from
+// a missing tag, and missing tags are rejected before this runs). Each batch
+// is filled by scanning the remaining IDs in ascending order and taking the
+// first cluster whose domain does not conflict with domains already used in
+// this batch; a conflict only defers that cluster, so later IDs from other
+// domains still fill the batch. A batch closes when it is full or no
+// non-conflicting cluster remains, and deferred clusters carry into later
+// batches until every ID appears exactly once.
+func spreadBatches(selected []string, clusterByID map[string]Cluster, batchSize int, spreadBy string) []Batch {
+	remaining := make(map[string]struct{}, len(selected))
+	for _, id := range selected {
+		remaining[id] = struct{}{}
+	}
+	batches := []Batch{}
+	for len(remaining) > 0 {
+		batch := []string{}
+		usedDomains := make(map[string]struct{})
+		for _, id := range selected {
+			if _, ok := remaining[id]; !ok {
+				continue
+			}
+			if len(batch) >= batchSize {
+				break
+			}
+			domain := clusterByID[id].Tags[spreadBy]
+			if _, conflict := usedDomains[domain]; conflict {
+				continue
+			}
+			usedDomains[domain] = struct{}{}
+			batch = append(batch, id)
+			delete(remaining, id)
+		}
+		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: batch})
+	}
+	return batches
 }
 
 func matchesAny(tags map[string]string, conditions []LabelCondition) bool {

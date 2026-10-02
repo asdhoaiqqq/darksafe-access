@@ -2,6 +2,7 @@ package darksafe
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -262,13 +263,12 @@ func TestNonFiniteAndLargeValues(t *testing.T) {
 }
 
 func TestNonArrayAndMalformedLines(t *testing.T) {
+	// 非标量 JSON 值与残缺输入：整行失败，不带 index，且原因属于 JSON 语法层面。
 	for _, line := range []string{
-		`{}`,           // 对象不是数组
 		`null`,         // null
 		`"hello"`,      // 字符串
 		`123`,          // 数字
 		`[`,            // 残缺数组
-		`{"name":"m"}`, // 对象
 		`[] []`,        // 两个 JSON 值
 		`[{"name":"m"}] extra`,
 	} {
@@ -279,6 +279,20 @@ func TestNonArrayAndMalformedLines(t *testing.T) {
 		}
 		if !strings.Contains(lerr.Error, "invalid JSON") {
 			t.Errorf("line %q: error = %q, want invalid JSON reason", line, lerr.Error)
+		}
+	}
+	// 对象行现在是查询语法：缺字段的查询对象仍失败（查询校验错误），但同样不带 index。
+	for _, line := range []string{
+		`{}`,             // 空对象
+		`{"name":"m"}`,   // 缺 op/start/end
+	} {
+		store := NewMetricStore()
+		lerr := mustFail(t, store, line)
+		if lerr.Index != 0 {
+			t.Errorf("line %q: query validation failure must not carry index, got %d", line, lerr.Index)
+		}
+		if lerr.Error == "" || strings.Contains(lerr.Error, "invalid JSON") {
+			t.Errorf("line %q: error = %q, want a query validation reason", line, lerr.Error)
 		}
 	}
 }
@@ -322,5 +336,269 @@ func TestInt64BoundaryTimestampDistinct(t *testing.T) {
 	lerr := mustFail(t, store, `[{"name":"m","timestamp":9223372036854775807,"value":2}]`)
 	if lerr.Conflict == nil {
 		t.Fatalf("boundary timestamp should be addressable for conflict detection, got %+v", lerr)
+	}
+}
+
+// mustQuery 执行一行查询并返回结果；失败时直接令测试失败。
+func mustQuery(t *testing.T, store *MetricStore, line string) *QueryResult {
+	t.Helper()
+	res, lerr := store.ProcessLine(line)
+	if lerr != nil {
+		t.Fatalf("expected query success for %s, got error: %+v", line, lerr)
+	}
+	qr, ok := res.(*QueryResult)
+	if !ok {
+		t.Fatalf("line %s: result type %T, want *QueryResult", line, res)
+	}
+	return qr
+}
+
+func TestQueryBasicAverageAndOrder(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"cpu","timestamp":1000,"value":1,"labels":{"host":"a"}},
+		{"name":"cpu","timestamp":2000,"value":3,"labels":{"host":"a"}},
+		{"name":"cpu","timestamp":1000,"value":10,"labels":{"host":"b"}},
+		{"name":"mem","timestamp":1000,"value":100}
+	]`)
+
+	qr := mustQuery(t, store, `{"op":"query","name":"cpu","start":1000,"end":2000}`)
+	if qr.Status != "ok" || qr.Op != "query" {
+		t.Fatalf("query envelope = %+v, want ok/query", qr)
+	}
+	if len(qr.Series) != 2 {
+		t.Fatalf("series count = %d, want 2: %+v", len(qr.Series), qr.Series)
+	}
+	// 沿用现有排序：同指标名按标签字典序 host=a 在 host=b 前。
+	a := qr.Series[0]
+	if a.Name != "cpu" || a.Labels["host"] != "a" || a.Count != 2 || a.Average != 2 {
+		t.Fatalf("series[0] = %+v, want cpu host=a count=2 avg=2", a)
+	}
+	b := qr.Series[1]
+	if b.Name != "cpu" || b.Labels["host"] != "b" || b.Count != 1 || b.Average != 10 {
+		t.Fatalf("series[1] = %+v, want cpu host=b count=1 avg=10", b)
+	}
+}
+
+func TestQueryInclusiveBoundariesAndSingleTimestamp(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1000,"value":1},
+		{"name":"m","timestamp":2000,"value":2},
+		{"name":"m","timestamp":3000,"value":3}
+	]`)
+
+	// 两端点都包含：三个点。
+	qr := mustQuery(t, store, `{"op":"query","name":"m","start":1000,"end":3000}`)
+	if len(qr.Series) != 1 || qr.Series[0].Count != 3 || qr.Series[0].Average != 2 {
+		t.Fatalf("full range = %+v, want count 3 avg 2", qr.Series)
+	}
+	// start==end 只查该时间戳。
+	qr = mustQuery(t, store, `{"op":"query","name":"m","start":2000,"end":2000}`)
+	if len(qr.Series) != 1 || qr.Series[0].Count != 1 || qr.Series[0].Average != 2 {
+		t.Fatalf("single timestamp = %+v, want count 1 avg 2", qr.Series)
+	}
+	// 区间内无点：空数组。
+	qr = mustQuery(t, store, `{"op":"query","name":"m","start":1500,"end":1999}`)
+	if len(qr.Series) != 0 {
+		t.Fatalf("empty range = %+v, want empty series", qr.Series)
+	}
+}
+
+func TestQueryLabelsMatchSemantics(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1,"labels":{"host":"a","zone":"x"}},
+		{"name":"m","timestamp":1,"value":2,"labels":{"host":"a"}},
+		{"name":"m","timestamp":1,"value":3,"labels":{"host":"b"}},
+		{"name":"m","timestamp":1,"value":4,"labels":{"zone":""}},
+		{"name":"m","timestamp":1,"value":5}
+	]`)
+
+	// 只给 host=a：命中前两条（额外标签不影响）。
+	qr := mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":1,"labels":{"host":"a"}}`)
+	if len(qr.Series) != 2 {
+		t.Fatalf("host=a matches %d series, want 2: %+v", len(qr.Series), qr.Series)
+	}
+	// 标签顺序不影响匹配：同一标签集合换序后命中相同序列。
+	qr2a := mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":1,"labels":{"host":"a","zone":"x"}}`)
+	qr2b := mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":1,"labels":{"zone":"x","host":"a"}}`)
+	if len(qr2a.Series) != 1 || len(qr2b.Series) != 1 {
+		t.Fatalf("reordered labels matches %d/%d series, want 1/1", len(qr2a.Series), len(qr2b.Series))
+	}
+	// 空字符串只匹配实际存在的空值标签，不匹配缺少该标签的序列。
+	qr = mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":1,"labels":{"zone":""}}`)
+	if len(qr.Series) != 1 || qr.Series[0].Labels["zone"] != "" {
+		t.Fatalf("zone= empty matches %+v, want only the actual empty-label series", qr.Series)
+	}
+	// 省略 labels 与空对象都匹配该指标全部序列。
+	qr = mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":1}`)
+	if len(qr.Series) != 5 {
+		t.Fatalf("omitted labels matches %d series, want 5", len(qr.Series))
+	}
+	qr = mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":1,"labels":{}}`)
+	if len(qr.Series) != 5 {
+		t.Fatalf("empty labels matches %d series, want 5", len(qr.Series))
+	}
+	// 无标签序列输出空对象（在排序中位于最前）。
+	var noLabel *QuerySeries
+	for i := range qr.Series {
+		if len(qr.Series[i].Labels) == 0 {
+			noLabel = &qr.Series[i]
+			break
+		}
+	}
+	if noLabel == nil {
+		t.Fatalf("no-label series not found in %+v", qr.Series)
+	}
+}
+
+func TestQueryNoMatchReturnsEmptyArray(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"m","timestamp":1,"value":1}]`)
+
+	qr := mustQuery(t, store, `{"op":"query","name":"other","start":1,"end":1}`)
+	if qr.Series == nil || len(qr.Series) != 0 {
+		t.Fatalf("no-match result = %+v, want empty non-nil series", qr.Series)
+	}
+}
+
+func TestQueryLargeValuesFiniteMean(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1.7976931348623157e308},
+		{"name":"m","timestamp":2,"value":1.7976931348623157e308}
+	]`)
+	qr := mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":2}`)
+	if len(qr.Series) != 1 {
+		t.Fatalf("series = %+v", qr.Series)
+	}
+	avg := qr.Series[0].Average
+	if math.IsInf(avg, 0) || math.IsNaN(avg) {
+		t.Fatalf("mean of two 1e308 values = %v, must be finite", avg)
+	}
+	if avg != 1.7976931348623157e308 {
+		t.Fatalf("mean = %v, want 1.7976931348623157e308", avg)
+	}
+
+	// 异号大值：均值为 0，不得因中间求和溢出。
+	mustOK(t, store, `[
+		{"name":"n","timestamp":1,"value":-1.7976931348623157e308},
+		{"name":"n","timestamp":2,"value":1.7976931348623157e308}
+	]`)
+	qr = mustQuery(t, store, `{"op":"query","name":"n","start":1,"end":2}`)
+	avg = qr.Series[0].Average
+	if math.IsInf(avg, 0) || math.IsNaN(avg) || avg != 0 {
+		t.Fatalf("mean of opposite max values = %v, want 0", avg)
+	}
+}
+
+func TestQueryDoesNotMutateStore(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"m","timestamp":1,"value":1}]`)
+	before := mustOK(t, store, `[]`)
+	mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":1}`)
+	after := mustOK(t, store, `[]`)
+	if len(after.Series) != len(before.Series) {
+		t.Fatalf("query mutated series count: %d -> %d", len(before.Series), len(after.Series))
+	}
+	if after.Series[0].Points[0].Value != 1 {
+		t.Fatalf("query mutated stored value: %+v", after.Series[0].Points)
+	}
+}
+
+func TestQueryDeterministicRegardlessOfWriteOrder(t *testing.T) {
+	values := []float64{1, 3, 5, 7, 9}
+	build := func(order []int) *MetricStore {
+		store := NewMetricStore()
+		for _, i := range order {
+			line := fmt.Sprintf(`[{"name":"m","timestamp":%d,"value":%v}]`, i+1, values[i])
+			mustOK(t, store, line)
+		}
+		return store
+	}
+	q := `{"op":"query","name":"m","start":1,"end":5}`
+	qr1 := mustQuery(t, build([]int{0, 1, 2, 3, 4}), q)
+	qr2 := mustQuery(t, build([]int{4, 3, 2, 1, 0}), q)
+	qr3 := mustQuery(t, build([]int{2, 0, 4, 1, 3}), q)
+	if qr1.Series[0].Average != qr2.Series[0].Average || qr1.Series[0].Average != qr3.Series[0].Average {
+		t.Fatalf("averages differ by write order: %v %v %v",
+			qr1.Series[0].Average, qr2.Series[0].Average, qr3.Series[0].Average)
+	}
+	if qr1.Series[0].Count != 5 || qr1.Series[0].Average != 5 {
+		t.Fatalf("avg = %v, want 5", qr1.Series[0].Average)
+	}
+}
+
+func TestQueryFailedBatchNotVisible(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"m","timestamp":1,"value":1}]`)
+	// 整批失败：本批点不得参与查询。
+	mustFail(t, store, `[{"name":"m","timestamp":2,"value":2},{"name":"m","timestamp":1,"value":999}]`)
+	qr := mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":2}`)
+	if len(qr.Series) != 1 || qr.Series[0].Count != 1 || qr.Series[0].Average != 1 {
+		t.Fatalf("failed batch must not be visible: %+v", qr.Series)
+	}
+}
+
+func TestQueryRejectsInvalidObjects(t *testing.T) {
+	cases := []struct {
+		line string
+		want string
+	}{
+		{`{"name":"m","start":1,"end":2}`, `missing required field "op"`},
+		{`{"op":"query","start":1,"end":2}`, `missing required field "name"`},
+		{`{"op":"query","name":"m","end":2}`, `missing required field "start"`},
+		{`{"op":"query","name":"m","start":1}`, `missing required field "end"`},
+		{`{"op":"query","name":"","start":1,"end":2}`, `non-empty string`},
+		{`{"op":"ingest","name":"m","start":1,"end":2}`, `unknown op`},
+		{`{"op":"query","name":"m","start":2,"end":1}`, `invalid range`},
+		{`{"op":"query","name":"m","start":1,"end":2,"extra":1}`, `unknown field`},
+		{`{"op":"query","op":"query","name":"m","start":1,"end":2}`, `duplicate field`},
+		{`{"op":1,"name":"m","start":1,"end":2}`, `field "op" must be a string`},
+		{`{"op":"query","name":7,"start":1,"end":2}`, `field "name" must be a string`},
+		{`{"op":"query","name":"m","start":"1","end":2}`, `field "start"`},
+		{`{"op":"query","name":"m","start":1.5,"end":2}`, `field "start"`},
+		{`{"op":"query","name":"m","start":1,"end":true}`, `field "end"`},
+		{`{"op":"query","name":"m","start":1,"end":2,"labels":[]}`, `field "labels"`},
+		{`{"op":"query","name":"m","start":1,"end":2,"labels":null}`, `field "labels"`},
+		{`{"op":"query","name":"m","start":1,"end":2,"labels":{"": "x"}}`, `label keys must be non-empty`},
+		{`{"op":"query","name":"m","start":1,"end":2,"labels":{"k": 2}}`, `must be a string`},
+		{`{"op":"query","name":"m","start":1,"end":2,"labels":{"k":"1","k":"2"}}`, `duplicate label key`},
+		{`{"op":"query","name":"m","start":9223372036854775808,"end":2}`, `field "start"`},
+	}
+	for _, tc := range cases {
+		store := NewMetricStore()
+		lerr := mustFail(t, store, tc.line)
+		if lerr.Index != 0 {
+			t.Errorf("line %s: query error must not carry index, got %d", tc.line, lerr.Index)
+		}
+		if !strings.Contains(lerr.Error, tc.want) {
+			t.Errorf("line %s: error = %q, want substring %q", tc.line, lerr.Error, tc.want)
+		}
+	}
+}
+
+func TestQueryResultShape(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"m","timestamp":1,"value":1}]`)
+	qr := mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":1}`)
+	b, err := json.Marshal(qr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]interface{}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["status"] != "ok" || got["op"] != "query" {
+		t.Fatalf("envelope = %v", got)
+	}
+	s0 := got["series"].([]interface{})[0].(map[string]interface{})
+	if s0["labels"].(map[string]interface{}) == nil {
+		t.Fatal("labels should serialize as {} not null")
+	}
+	if s0["count"].(float64) != 1 || s0["average"].(float64) != 1 {
+		t.Fatalf("count/average = %v/%v", s0["count"], s0["average"])
 	}
 }

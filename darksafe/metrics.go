@@ -59,6 +59,33 @@ type LineError struct {
 	Conflict *Conflict `json:"conflict,omitempty"`
 }
 
+// queryOp 是唯一支持的查询操作名。
+const queryOp = "query"
+
+// QuerySeries 是区间均值查询命中的一条序列视图。
+// Labels 为该序列的完整标签集合（无标签时为空对象），不与其他序列合并。
+type QuerySeries struct {
+	Name    string            `json:"name"`
+	Labels  map[string]string `json:"labels"`
+	Count   int               `json:"count"`
+	Average float64           `json:"average"`
+}
+
+// QueryResult 是区间均值查询成功后的结果。
+type QueryResult struct {
+	Status string        `json:"status"`
+	Op     string        `json:"op"`
+	Series []QuerySeries `json:"series"`
+}
+
+// parsedQuery 是严格校验后的查询对象。
+type parsedQuery struct {
+	name   string
+	start  int64
+	end    int64
+	labels map[string]string
+}
+
 // MetricStore 保存一次命令运行期间已写入的指标数据，仅存在于内存中，进程结束即丢弃。
 type MetricStore struct {
 	series map[seriesID]*storedSeries
@@ -140,9 +167,10 @@ var (
 	jsonNumberRE  = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
 )
 
-// IngestLine 解析并写入一行（一批）采样点。成功返回 BatchResult；
-// 失败返回 *LineError，此时此前各批数据保留、本批不写入任何数据。
-func (s *MetricStore) IngestLine(line string) (*BatchResult, *LineError) {
+// ProcessLine 解析并处理一行输入：数组行为写入批次，对象行为区间均值查询。
+// 成功返回 *BatchResult 或 *QueryResult；失败返回 *LineError，此时此前各批数据保留、
+// 本批不写入任何数据，查询本身不改变存储。
+func (s *MetricStore) ProcessLine(line string) (any, *LineError) {
 	dec := json.NewDecoder(strings.NewReader(line))
 	var top json.RawMessage
 	if err := dec.Decode(&top); err != nil {
@@ -156,14 +184,40 @@ func (s *MetricStore) IngestLine(line string) (*BatchResult, *LineError) {
 		return nil, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
 	}
 	trimmed := strings.TrimSpace(string(top))
-	if len(trimmed) == 0 || trimmed[0] != '[' {
+	if len(trimmed) == 0 {
+		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a JSON array of samples or a JSON query object"}
+	}
+	switch trimmed[0] {
+	case '[':
+		var items []json.RawMessage
+		if err := json.Unmarshal(top, &items); err != nil {
+			return nil, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
+		}
+		return s.ingestItems(items)
+	case '{':
+		q, err := parseQuery(top)
+		if err != nil {
+			return nil, &LineError{Status: "error", Error: err.Error()}
+		}
+		return s.executeQuery(q), nil
+	default:
+		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a JSON array of samples or a JSON query object"}
+	}
+}
+
+// IngestLine 解析并写入一行（一批）采样点。成功返回 BatchResult；
+// 失败返回 *LineError，此时此前各批数据保留、本批不写入任何数据。
+// 仅接受 JSON 数组；查询对象行请改用 ProcessLine。
+func (s *MetricStore) IngestLine(line string) (*BatchResult, *LineError) {
+	res, err := s.ProcessLine(line)
+	if err != nil {
+		return nil, err
+	}
+	br, ok := res.(*BatchResult)
+	if !ok {
 		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a JSON array of samples"}
 	}
-	var items []json.RawMessage
-	if err := json.Unmarshal(top, &items); err != nil {
-		return nil, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
-	}
-	return s.ingestItems(items)
+	return br, nil
 }
 
 type parsedSample struct {
@@ -332,6 +386,139 @@ func parseFiniteFloat(n json.Number) (float64, error) {
 	return v, nil
 }
 
+// parseQuery 严格解析区间查询对象：仅允许 op/name/start/end/labels 五个字段，
+// 拒绝重复键与未知字段；op 必须为 "query"，name 非空，start/end 为 int64 整数毫秒，
+// labels 为非空键到字符串值的对象。start 大于 end 也在此拒绝。
+func parseQuery(raw json.RawMessage) (parsedQuery, error) {
+	var q parsedQuery
+	q.labels = map[string]string{}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+
+	tok, err := dec.Token()
+	if err != nil {
+		return q, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return q, fmt.Errorf("query must be a JSON object")
+	}
+
+	present := make(map[string]bool)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return q, err
+		}
+		key := keyTok.(string)
+		switch key {
+		case "op", "name", "start", "end", "labels":
+		default:
+			return q, fmt.Errorf("unknown field %q", key)
+		}
+		if present[key] {
+			return q, fmt.Errorf("duplicate field %q", key)
+		}
+		present[key] = true
+
+		switch key {
+		case "op":
+			t, err := dec.Token()
+			if err != nil {
+				return q, err
+			}
+			s, ok := t.(string)
+			if !ok {
+				return q, fmt.Errorf(`field "op" must be a string`)
+			}
+			if s != queryOp {
+				return q, fmt.Errorf(`unknown op %q: only "query" is supported`, s)
+			}
+		case "name":
+			t, err := dec.Token()
+			if err != nil {
+				return q, err
+			}
+			s, ok := t.(string)
+			if !ok {
+				return q, fmt.Errorf(`field "name" must be a string`)
+			}
+			if s == "" {
+				return q, fmt.Errorf(`field "name" must be a non-empty string`)
+			}
+			q.name = s
+		case "start", "end":
+			n, err := nextJSONNumber(dec, key)
+			if err != nil {
+				return q, err
+			}
+			v, err := parseJSONInt(n)
+			if err != nil {
+				return q, fmt.Errorf(`field %q: %s`, key, err)
+			}
+			if key == "start" {
+				q.start = v
+			} else {
+				q.end = v
+			}
+		case "labels":
+			t, err := dec.Token()
+			if err != nil {
+				return q, err
+			}
+			d, ok := t.(json.Delim)
+			if !ok || d != '{' {
+				return q, fmt.Errorf(`field "labels" must be an object of string keys to string values`)
+			}
+			labels := map[string]string{}
+			for dec.More() {
+				labelKeyTok, err := dec.Token()
+				if err != nil {
+					return q, err
+				}
+				labelKey := labelKeyTok.(string)
+				if labelKey == "" {
+					return q, fmt.Errorf(`field "labels": label keys must be non-empty strings`)
+				}
+				valTok, err := dec.Token()
+				if err != nil {
+					return q, err
+				}
+				labelVal, ok := valTok.(string)
+				if !ok {
+					return q, fmt.Errorf(`field "labels": value of label %q must be a string`, labelKey)
+				}
+				if _, dup := labels[labelKey]; dup {
+					return q, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
+				}
+				labels[labelKey] = labelVal
+			}
+			if _, err := dec.Token(); err != nil { // 消耗 '}'
+				return q, err
+			}
+			q.labels = labels
+		}
+	}
+	if _, err := dec.Token(); err != nil { // 消耗 '}'
+		return q, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return q, fmt.Errorf("unexpected content after the query object")
+		}
+		return q, err
+	}
+
+	for _, field := range []string{"op", "name", "start", "end"} {
+		if !present[field] {
+			return q, fmt.Errorf("missing required field %q", field)
+		}
+	}
+	if q.start > q.end {
+		return q, fmt.Errorf("invalid range: start %d is greater than end %d", q.start, q.end)
+	}
+	return q, nil
+}
+
 // ingestItems 完成全部采样点校验与冲突检测后再统一提交，保证整批原子性。
 func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineError) {
 	type pending struct {
@@ -466,4 +653,110 @@ func (s *MetricStore) snapshot(added, duplicates int) *BatchResult {
 		return compareLabelPairs(sortedPairs(views[i].Labels), sortedPairs(views[j].Labels)) < 0
 	})
 	return &BatchResult{Status: "ok", Added: added, Duplicates: duplicates, Series: views}
+}
+
+// queryLabelsMatch 判断序列标签是否满足查询标签：查询给出的每个键都必须存在且值相等，
+// 序列可以有额外标签。缺少标签与标签值为空字符串不等价，因此必须用 comma-ok 区分。
+func queryLabelsMatch(seriesLabels, queryLabels map[string]string) bool {
+	for k, v := range queryLabels {
+		sv, ok := seriesLabels[k]
+		if !ok || sv != v {
+			return false
+		}
+	}
+	return true
+}
+
+// executeQuery 返回指标名精确匹配、标签匹配且闭区间 [start,end] 内存在采样点的序列，
+// 按名称与标签字典序（沿用现有序列排序）排列；不修改存储。
+func (s *MetricStore) executeQuery(q parsedQuery) *QueryResult {
+	out := &QueryResult{Status: "ok", Op: queryOp, Series: []QuerySeries{}}
+	for _, sr := range s.series {
+		if sr.ref.Name != q.name {
+			continue
+		}
+		if !queryLabelsMatch(sr.ref.Labels, q.labels) {
+			continue
+		}
+		hit := make([]int64, 0, len(sr.points))
+		for ts := range sr.points {
+			if ts >= q.start && ts <= q.end {
+				hit = append(hit, ts)
+			}
+		}
+		if len(hit) == 0 {
+			continue
+		}
+		sort.Slice(hit, func(i, j int) bool { return hit[i] < hit[j] })
+		vals := make([]float64, len(hit))
+		for i, ts := range hit {
+			vals[i] = sr.points[ts]
+		}
+		labels := make(map[string]string, len(sr.ref.Labels))
+		for k, v := range sr.ref.Labels {
+			labels[k] = v
+		}
+		out.Series = append(out.Series, QuerySeries{
+			Name:    sr.ref.Name,
+			Labels:  labels,
+			Count:   len(vals),
+			Average: meanOf(vals),
+		})
+	}
+	sort.Slice(out.Series, func(i, j int) bool {
+		if out.Series[i].Name != out.Series[j].Name {
+			return out.Series[i].Name < out.Series[j].Name
+		}
+		return compareLabelPairs(sortedPairs(out.Series[i].Labels), sortedPairs(out.Series[j].Labels)) < 0
+	})
+	return out
+}
+
+// meanOf 计算算术平均值。优先使用 Welford 在线递推（对普通数值结果最精确）；
+// 当异号大值导致中间差值溢出 float64 时回退到按最大绝对值缩放的两遍算法，
+// 保证合法有限值的均值始终为有限数，且不随求和先后次序改变。
+func meanOf(values []float64) float64 {
+	if len(values) == 0 {
+		return 0
+	}
+	mean := values[0]
+	for i := 1; i < len(values); i++ {
+		x := values[i]
+		delta := x - mean
+		if math.IsInf(delta, 0) {
+			return scaledMean(values)
+		}
+		mean += delta / float64(i+1)
+		if math.IsInf(mean, 0) || math.IsNaN(mean) {
+			return scaledMean(values)
+		}
+	}
+	if math.IsInf(mean, 0) || math.IsNaN(mean) {
+		return scaledMean(values)
+	}
+	return mean
+}
+
+// scaledMean 先将各值除以绝对值最大值再求和，最后乘回，避免异号大值直接相减时溢出。
+// 输入均为有限值时：|v/maxAbs| ≤ 1，项数为 int 级别，和与均值都必然有限。
+func scaledMean(values []float64) float64 {
+	var maxAbs float64
+	for _, v := range values {
+		if a := math.Abs(v); a > maxAbs {
+			maxAbs = a
+		}
+	}
+	if maxAbs == 0 {
+		return 0
+	}
+	var sum float64
+	for _, v := range values {
+		sum += v / maxAbs
+	}
+	m := maxAbs * (sum / float64(len(values)))
+	if math.IsInf(m, 0) || math.IsNaN(m) {
+		// 理论不可达的保守兜底：合法有限值的均值绝不输出无穷或 NaN。
+		return maxAbs
+	}
+	return m
 }

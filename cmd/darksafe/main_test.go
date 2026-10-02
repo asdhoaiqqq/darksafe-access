@@ -111,9 +111,135 @@ func TestUsageMentionsIngest(t *testing.T) {
 	var b bytes.Buffer
 	usage(&b)
 	text := b.String()
-	for _, want := range []string{"ingest", "standard input", "json array", "added", "duplicates", "non-zero"} {
+	for _, want := range []string{"ingest", "standard input", "json array", "added", "duplicates", "non-zero", "query", "op", "start", "end", "average"} {
 		if !strings.Contains(strings.ToLower(text), want) {
 			t.Errorf("help text missing %q", want)
 		}
+	}
+}
+
+func TestRunIngestInterleavesWritesAndQueries(t *testing.T) {
+	input := strings.Join([]string{
+		`[{"name":"cpu","timestamp":1000,"value":1,"labels":{"host":"a"}}]`, // 行 1：写入
+		`{"op":"query","name":"cpu","start":1000,"end":1000}`,               // 行 2：查询
+		``,                                                                    // 行 3：空白
+		`{"op":"query","name":"cpu","start":1000,"end":1000}`,               // 行 4：连续查询一致
+		`[{"name":"cpu","timestamp":2000,"value":3,"labels":{"host":"a"}}]`, // 行 5：再写入
+		`{"op":"query","name":"cpu","start":1000,"end":2000}`,               // 行 6：区间均值
+	}, "\n")
+
+	var out bytes.Buffer
+	if code := runIngest(strings.NewReader(input), &out); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("got %d output lines, want 5: %v", len(lines), lines)
+	}
+
+	var q2 map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[1]), &q2); err != nil {
+		t.Fatal(err)
+	}
+	if q2["status"] != "ok" || q2["op"] != "query" {
+		t.Fatalf("line 2 = %v, want query ok", q2)
+	}
+	s2 := q2["series"].([]interface{})
+	if len(s2) != 1 {
+		t.Fatalf("line 2 series = %v, want 1", s2)
+	}
+	avg2 := s2[0].(map[string]interface{})["average"].(float64)
+	if avg2 != 1 {
+		t.Fatalf("line 2 average = %v, want 1", avg2)
+	}
+
+	// 连续查询结果一致。
+	var q4 map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[2]), &q4); err != nil {
+		t.Fatal(err)
+	}
+	avg4 := q4["series"].([]interface{})[0].(map[string]interface{})["average"].(float64)
+	if avg4 != avg2 {
+		t.Fatalf("consecutive query averages differ: %v vs %v", avg4, avg2)
+	}
+
+	var q6 map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[4]), &q6); err != nil {
+		t.Fatal(err)
+	}
+	s6 := q6["series"].([]interface{})[0].(map[string]interface{})
+	if s6["count"].(float64) != 2 || s6["average"].(float64) != 2 {
+		t.Fatalf("line 6 = %v, want count 2 average 2", s6)
+	}
+}
+
+func TestRunIngestQueryErrorsCarryLineAndNoIndex(t *testing.T) {
+	input := strings.Join([]string{
+		`[{"name":"m","timestamp":1,"value":1}]`, // 行 1
+		`{"op":"query","name":"m","start":2,"end":1}`, // 行 2：非法区间
+		`{"op":"query","name":"m","start":1,"end":1}`, // 行 3：正常
+		`{"op":"bogus","name":"m","start":1,"end":1}`, // 行 4：未知 op
+		`{"op":"query","name":"m","start":1,"end":1,"bad":1}`, // 行 5：未知字段
+	}, "\n")
+
+	var out bytes.Buffer
+	code := runIngest(strings.NewReader(input), &out)
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero because query lines failed")
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("got %d output lines, want 5: %v", len(lines), lines)
+	}
+
+	checkErr := func(idx, wantLine int, wantSub string) {
+		t.Helper()
+		var m map[string]interface{}
+		if err := json.Unmarshal([]byte(lines[idx]), &m); err != nil {
+			t.Fatal(err)
+		}
+		if m["status"] != "error" {
+			t.Fatalf("line %d: status = %v, want error", wantLine, m["status"])
+		}
+		if int(m["line"].(float64)) != wantLine {
+			t.Fatalf("line %d: line number = %v", wantLine, m["line"])
+		}
+		if _, hasIndex := m["index"]; hasIndex {
+			t.Fatalf("line %d: query error must not carry index: %v", wantLine, m)
+		}
+		if !strings.Contains(m["error"].(string), wantSub) {
+			t.Fatalf("line %d: error = %q, want substring %q", wantLine, m["error"], wantSub)
+		}
+	}
+	checkErr(1, 2, "invalid range")
+	checkErr(3, 4, "unknown op")
+	checkErr(4, 5, "unknown field")
+
+	// 行 3 是夹在失败之间的成功查询，证明失败后继续处理。
+	var q3 map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[2]), &q3); err != nil {
+		t.Fatal(err)
+	}
+	if q3["status"] != "ok" || q3["op"] != "query" {
+		t.Fatalf("line 3 = %v, want query ok", q3)
+	}
+}
+
+func TestRunIngestQueryNoMatchAndEmptyLabels(t *testing.T) {
+	input := `{"op":"query","name":"ghost","start":1,"end":1}` + "\n"
+	var out bytes.Buffer
+	if code := runIngest(strings.NewReader(input), &out); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	var qr map[string]interface{}
+	if err := json.Unmarshal(out.Bytes(), &qr); err != nil {
+		t.Fatal(err)
+	}
+	if qr["status"] != "ok" || qr["op"] != "query" {
+		t.Fatalf("envelope = %v", qr)
+	}
+	series := qr["series"].([]interface{})
+	if len(series) != 0 {
+		t.Fatalf("series = %v, want empty array", series)
 	}
 }

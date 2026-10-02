@@ -46,7 +46,14 @@ type OfflineDecisionReview struct {
 // target is a policy change record. When the saved decision names a
 // policy version whose full content has no change record before the
 // target, ErrVersionNotFound is returned; a newer version is never
-// substituted.
+// substituted. A non-zero version whose content precedes the target is
+// re-evaluated under the same request envelope rules an online Decide
+// applies before any policy: a disabled subject, an organization
+// mismatch, a missing organization or identifier, an empty action or an
+// invalid scope is rejected regardless of the version's policies, and the
+// rejection then carries version 0 with an empty hit list. A version
+// lookup failure is never masked by a request rejection. The version-0
+// path is unchanged.
 func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, seq int) (OfflineDecisionReview, error) {
 	if org == "" {
 		return OfflineDecisionReview{}, ErrMissingOrganization
@@ -86,7 +93,10 @@ func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, se
 		}
 	} else {
 		// The version's full content must travel in a same-organization
-		// policy change record positioned before the decision.
+		// policy change record positioned before the decision. This lookup
+		// runs before any request check: a missing version is reported as
+		// ErrVersionNotFound even when the request would also be rejected,
+		// so an envelope fault can never mask a missing version.
 		policies, found := policiesBefore(records, seq-1, version)
 		if !found {
 			if _, later := policiesBefore(records, len(records), version); later {
@@ -98,7 +108,20 @@ func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, se
 				"%w: decision at sequence %d used version %d, which has no policy change record in the export",
 				ErrVersionNotFound, seq, version)
 		}
-		recomputed = evaluate(req, policies, version)
+		// A complete, valid chain only proves the material matches its
+		// checkpoint; it does not make the request eligible. The same
+		// envelope rules an online Decide applies before touching any
+		// policy gate the re-evaluation too: a disabled subject, an
+		// organization mismatch, a missing organization or identifier, an
+		// empty action or an invalid scope is rejected here even when the
+		// version contains an allow policy matching the subject, action,
+		// scope and resource. Such a request uses no policy, so the
+		// rejection carries version 0 and an empty hit list.
+		if d, ok := checkRequest(org, req); !ok {
+			recomputed = d
+		} else {
+			recomputed = evaluate(req, policies, version)
+		}
 	}
 
 	return OfflineDecisionReview{

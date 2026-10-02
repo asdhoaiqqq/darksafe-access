@@ -21,13 +21,18 @@ const (
 )
 
 // Policy binds one subject and one action to a scope with an effect.
+// ResourceID optionally narrows the policy to a single resource: when
+// empty the policy matches every resource in scope; when set it matches
+// only requests whose resource ID is exactly equal (byte-for-byte,
+// case-sensitive, no wildcard, not interpreted as a scope path).
 type Policy struct {
-	ID        string
-	Subject   string
-	Action    string
-	Scope     string
-	Effect    Effect
-	Recursive bool // false: only the exact scope; true: the scope and its descendants
+	ID         string
+	Subject    string
+	Action     string
+	Scope      string
+	Effect     Effect
+	Recursive  bool // false: only the exact scope; true: the scope and its descendants
+	ResourceID string `json:"ResourceID,omitempty"`
 }
 
 // Sentinel errors so callers can distinguish failure causes with errors.Is.
@@ -268,6 +273,12 @@ func evaluate(req OrgRequest, policies []Policy, version int) Decision {
 			continue
 		}
 		if !scopeMatches(p, req.Resource.Scope) {
+			continue
+		}
+		// ResourceID is an additional condition, not a replacement for
+		// subject/action/scope: an empty field matches every resource in
+		// scope; a set field matches only the exact same resource ID.
+		if p.ResourceID != "" && p.ResourceID != req.Resource.ID {
 			continue
 		}
 		seen[p.ID] = struct{}{}

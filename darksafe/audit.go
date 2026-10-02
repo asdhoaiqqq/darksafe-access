@@ -103,6 +103,7 @@ func envelopeUsesRawBytes(env *hashEnvelope) bool {
 		for _, p := range env.Change.Policies {
 			if !utf8.ValidString(p.ID) || !utf8.ValidString(p.Subject) ||
 				!utf8.ValidString(p.Action) || !utf8.ValidString(p.Scope) ||
+				!utf8.ValidString(p.ResourceID) ||
 				!utf8.ValidString(string(p.Effect)) {
 				return true
 			}
@@ -226,6 +227,11 @@ func (e *fingerprintEncoder) policy(p Policy) {
 	e.rawString(p.Scope)
 	e.rawString(string(p.Effect))
 	e.boolTag(tagBool, p.Recursive)
+	// ResourceID is omitted when empty so records published before
+	// resource scoping existed keep byte-identical fingerprints.
+	if p.ResourceID != "" {
+		e.rawString(p.ResourceID)
+	}
 }
 
 func (e *fingerprintEncoder) policyList(policies []Policy) {

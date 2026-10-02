@@ -551,6 +551,129 @@ func TestQueryFiniteMeanOverflow(t *testing.T) {
 	}
 }
 
+func TestQueryAverageExactAfterCancellation(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1e16},
+		{"name":"m","timestamp":2,"value":1},
+		{"name":"m","timestamp":3,"value":-1e16}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":3}`)
+	if len(res.Series) != 1 {
+		t.Fatalf("series = %+v, want exactly one", res.Series)
+	}
+	s0 := res.Series[0]
+	if s0.Count != 3 {
+		t.Fatalf("count = %d, want 3", s0.Count)
+	}
+	// 精确总和为 1，平均值为 1/3 舍入后的最近 float64。
+	if s0.Average != 1.0/3.0 {
+		t.Fatalf("average = %v, want %v", s0.Average, 1.0/3.0)
+	}
+	b, _ := json.Marshal(s0.Average)
+	if string(b) != "0.3333333333333333" {
+		t.Fatalf("average JSON = %s, want 0.3333333333333333", b)
+	}
+}
+
+func TestQueryAverageOrderAndBatchIndependent(t *testing.T) {
+	// 同一组数值：不同批次划分、不同提交顺序、区间内时间戳顺序不同，均值必须一致。
+	setups := [][]string{
+		{`[{"name":"m","timestamp":1,"value":1e16},{"name":"m","timestamp":2,"value":1},{"name":"m","timestamp":3,"value":-1e16}]`},
+		{`[{"name":"m","timestamp":3,"value":-1e16}]`, `[{"name":"m","timestamp":1,"value":1e16},{"name":"m","timestamp":2,"value":1}]`},
+		{`[{"name":"m","timestamp":2,"value":1}]`, `[{"name":"m","timestamp":3,"value":-1e16}]`, `[{"name":"m","timestamp":1,"value":1e16}]`},
+		{`[{"name":"m","timestamp":1,"value":-1e16},{"name":"m","timestamp":2,"value":1},{"name":"m","timestamp":3,"value":1e16}]`},
+	}
+	want := 1.0 / 3.0
+	for i, batches := range setups {
+		store := NewMetricStore()
+		for _, line := range batches {
+			mustOK(t, store, line)
+		}
+		res := mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":3}`)
+		if len(res.Series) != 1 || res.Series[0].Count != 3 || res.Series[0].Average != want {
+			t.Fatalf("setup %d: got %+v, want count=3 average=%v", i, res.Series, want)
+		}
+	}
+}
+
+func TestQueryAverageSumOverflowStaysFinite(t *testing.T) {
+	store := NewMetricStore()
+	// 总和 3e308 超出 float64 范围，但平均值必须有限且精确。
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1e308},
+		{"name":"m","timestamp":2,"value":1e308},
+		{"name":"m","timestamp":3,"value":1e308}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":10}`)
+	avg := res.Series[0].Average
+	if math.IsInf(avg, 0) || math.IsNaN(avg) || avg != 1e308 {
+		t.Fatalf("average = %v, want 1e308", avg)
+	}
+
+	// 最大有限值自身重复：平均仍为 MaxFloat64，不溢出为 +Inf。
+	store2 := NewMetricStore()
+	mustOK(t, store2, `[
+		{"name":"m","timestamp":1,"value":1.7976931348623157e308},
+		{"name":"m","timestamp":2,"value":1.7976931348623157e308}
+	]`)
+	res = mustQuery(t, store2, `{"op":"query","name":"m","start":0,"end":10}`)
+	if avg = res.Series[0].Average; avg != math.MaxFloat64 {
+		t.Fatalf("average = %v, want MaxFloat64", avg)
+	}
+}
+
+func TestQueryAverageExactZeroIsPositiveZero(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1e308},
+		{"name":"m","timestamp":2,"value":-1e308},
+		{"name":"m","timestamp":3,"value":5},
+		{"name":"m","timestamp":4,"value":-5}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":10}`)
+	avg := res.Series[0].Average
+	if avg != 0 || math.Signbit(avg) {
+		t.Fatalf("exact zero average = %v (signbit=%v), want +0", avg, math.Signbit(avg))
+	}
+	b, _ := json.Marshal(avg)
+	if string(b) != "0" {
+		t.Fatalf("zero average JSON = %s, want 0", b)
+	}
+}
+
+func TestQueryAverageSubnormalAndRounding(t *testing.T) {
+	// 最小次正规值参与平均不得被提前冲刷为零。
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":5e-324},
+		{"name":"m","timestamp":2,"value":5e-324}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":10}`)
+	if avg := res.Series[0].Average; avg != 5e-324 {
+		t.Fatalf("average = %v, want 5e-324", avg)
+	}
+
+	// 精确平均恰为 2^-1075（0 与最小次正规值正中）：按最近偶数舍入为 0。
+	store2 := NewMetricStore()
+	mustOK(t, store2, `[
+		{"name":"m","timestamp":1,"value":5e-324},
+		{"name":"m","timestamp":2,"value":0}
+	]`)
+	res = mustQuery(t, store2, `{"op":"query","name":"m","start":0,"end":10}`)
+	if avg := res.Series[0].Average; avg != 0 {
+		t.Fatalf("tie at 2^-1075 must round to even (0), got %v", avg)
+	}
+
+	// 单点序列返回该点的值本身。
+	store3 := NewMetricStore()
+	mustOK(t, store3, `[{"name":"m","timestamp":7,"value":0.1}]`)
+	res = mustQuery(t, store3, `{"op":"query","name":"m","start":0,"end":10}`)
+	if avg := res.Series[0].Average; avg != 0.1 {
+		t.Fatalf("single point average = %v, want 0.1", avg)
+	}
+}
+
 func TestQueryValidationErrors(t *testing.T) {
 	store := NewMetricStore()
 	mustOK(t, store, `[{"name":"m","timestamp":1,"value":1}]`)

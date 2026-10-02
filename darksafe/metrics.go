@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"regexp"
 	"sort"
 	"strconv"
@@ -698,22 +699,98 @@ func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
 	return &QueryResult{Status: "ok", Op: "query", Series: out}
 }
 
-// finiteMean 返回算术平均值，且对任意有限 float64 输入保证结果有限：
-// 采用增量均值（Welford），当 x 与当前均值反号相减溢出时，先分别除以 n 再合并。
+// finiteMean 返回已存储 float64 值的精确算术平均所对应的最近 float64，
+// 恰好在两个相邻可表示值中间时按最近偶数舍入。
+// 求和用有理数精确完成：与点的顺序、批次划分无关，正负大数抵消后的小余量
+// 不会丢失，总和超出 float64 范围时结果仍然有限。精确平均为零时返回 +0；
+// 只有一个点时结果就是该点的值。
 func finiteMean(values []float64) float64 {
-	mean := 0.0
-	for i, x := range values {
-		n := float64(i + 1)
-		delta := x - mean
-		if math.IsInf(delta, 0) {
-			// 溢出只可能在 n >= 2 且 x 与 mean 反号、幅值均极大时发生；
-			// 此时 |x/n|、|mean/n| 均小于 maxFloat64，差也有限，且与 mean 异号。
-			mean += x/n - mean/n
-			continue
-		}
-		mean += delta / n
+	sum := new(big.Rat)
+	r := new(big.Rat)
+	for _, v := range values {
+		// 写入侧已保证 v 有限，SetFloat64 对有限值是精确的。
+		sum.Add(sum, r.SetFloat64(v))
 	}
-	return mean
+	sum.Quo(sum, r.SetInt64(int64(len(values))))
+	return ratToFloat64NearestEven(sum)
+}
+
+// ratToFloat64NearestEven 把有理数 x 舍入到最近的 float64，半数取偶。
+// 调用方保证 |x| 不超过 MaxFloat64（有限值的均值必然满足），因此不会溢出。
+func ratToFloat64NearestEven(x *big.Rat) float64 {
+	if x.Sign() == 0 {
+		return 0
+	}
+	num := new(big.Int).Set(x.Num())
+	den := x.Denom()
+	neg := num.Sign() < 0
+	if neg {
+		num.Neg(num)
+	}
+
+	// e 满足 2^e <= num/den < 2^(e+1)。
+	e := floorLog2Rat(num, den)
+	var m *big.Int
+	scale := 0
+	if e >= -1022 {
+		// 正规数：m 为 num/den 按 2^(e-52) 缩放后的 53 位舍入整数。
+		scale = e - 52
+		m = roundScaledRatio(num, den, scale)
+		if m.BitLen() == 54 {
+			// 舍入进位（如 1.111…1 进为 10.0），指数加一。
+			m.Rsh(m, 1)
+			scale++
+		}
+	} else {
+		// 次正规数：有效位间距固定为 2^-1074；m 舍入为 0 时按 IEEE 得到带符号零。
+		scale = -1074
+		m = roundScaledRatio(num, den, scale)
+	}
+	// m < 2^53，可以精确放入 int64 与 float64。
+	f := math.Ldexp(float64(m.Int64()), scale)
+	if neg {
+		return -f
+	}
+	return f
+}
+
+// floorLog2Rat 返回正有理数 num/den 的二进制阶：最大的 e 使 2^e <= num/den。
+func floorLog2Rat(num, den *big.Int) int {
+	k := num.BitLen() - den.BitLen()
+	var t big.Int
+	if k >= 0 {
+		t.Lsh(den, uint(k))
+		if num.Cmp(&t) >= 0 {
+			return k
+		}
+		return k - 1
+	}
+	t.Lsh(num, uint(-k))
+	if t.Cmp(den) >= 0 {
+		return k
+	}
+	return k - 1
+}
+
+// roundScaledRatio 返回 round(num / (den · 2^scale))，半数取偶；num、den 均为正。
+func roundScaledRatio(num, den *big.Int, scale int) *big.Int {
+	n := new(big.Int).Set(num)
+	d := new(big.Int).Set(den)
+	if scale >= 0 {
+		d.Lsh(d, uint(scale))
+	} else {
+		n.Lsh(n, uint(-scale))
+	}
+	q, r := new(big.Int).QuoRem(n, d, new(big.Int))
+	switch r2 := new(big.Int).Lsh(r, 1); r2.Cmp(d) {
+	case 1:
+		q.Add(q, big.NewInt(1))
+	case 0:
+		if q.Bit(0) == 1 {
+			q.Add(q, big.NewInt(1))
+		}
+	}
+	return q
 }
 
 // String 让冲突原因中的序列身份可读：name{k=v,...}，标签按键排序。

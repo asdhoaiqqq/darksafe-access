@@ -28,6 +28,18 @@ type Policy struct {
 	Scope     string
 	Effect    Effect
 	Recursive bool // false: only the exact scope; true: the scope and its descendants
+	// ResourceID optionally narrows the policy to one exact resource. Empty
+	// keeps the legacy scope-only matching. A non-empty value adds a
+	// condition on top of subject, action, scope and the organization
+	// checks: it never replaces them. Comparison is against the request's
+	// raw resource ID, byte for byte: case sensitive, spaces significant,
+	// no wildcard or scope-path interpretation, and the resource needs no
+	// prior registration.
+	//
+	// The omitempty tag is load bearing for audit fingerprints: the legacy
+	// JSON fingerprint family never had this field, and an empty value must
+	// keep serializing to exactly the old bytes.
+	ResourceID string `json:",omitempty"`
 }
 
 // Sentinel errors so callers can distinguish failure causes with errors.Is.
@@ -268,6 +280,15 @@ func evaluate(req OrgRequest, policies []Policy, version int) Decision {
 			continue
 		}
 		if !scopeMatches(p, req.Resource.Scope) {
+			continue
+		}
+		// A resource restriction is an additional condition, not a
+		// replacement for the scope check: even an equal ID cannot match a
+		// resource outside the policy's scope (including outside a
+		// recursive scope's subtree). The request envelope already
+		// rejected an empty resource ID, so an empty ResourceID here means
+		// "no restriction", never a match on a missing ID.
+		if p.ResourceID != "" && p.ResourceID != req.Resource.ID {
 			continue
 		}
 		seen[p.ID] = struct{}{}

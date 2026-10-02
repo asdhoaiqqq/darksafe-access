@@ -103,7 +103,7 @@ func envelopeUsesRawBytes(env *hashEnvelope) bool {
 		for _, p := range env.Change.Policies {
 			if !utf8.ValidString(p.ID) || !utf8.ValidString(p.Subject) ||
 				!utf8.ValidString(p.Action) || !utf8.ValidString(p.Scope) ||
-				!utf8.ValidString(string(p.Effect)) {
+				!utf8.ValidString(string(p.Effect)) || !utf8.ValidString(p.ResourceID) {
 				return true
 			}
 		}
@@ -226,6 +226,13 @@ func (e *fingerprintEncoder) policy(p Policy) {
 	e.rawString(p.Scope)
 	e.rawString(string(p.Effect))
 	e.boolTag(tagBool, p.Recursive)
+	// ResourceID is appended only when set, so the canonical byte layout
+	// of every legacy (resource-unrestricted) policy is unchanged. It
+	// pairs with the omitempty JSON tag: the two fingerprint families stay
+	// in sync about whether the field participates at all.
+	if p.ResourceID != "" {
+		e.rawString(p.ResourceID)
+	}
 }
 
 func (e *fingerprintEncoder) policyList(policies []Policy) {

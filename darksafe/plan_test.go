@@ -1,6 +1,7 @@
 package darksafe
 
 import (
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -253,5 +254,316 @@ func TestParse_MalformedJSON(t *testing.T) {
 	}
 	if _, err := ParseReleaseInput([]byte(`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[]} trailing`)); err == nil {
 		t.Fatal("expected trailing content error")
+	}
+}
+
+func validInput() ReleasePlanInput {
+	return ReleasePlanInput{
+		App:       "app",
+		Revision:  "r1",
+		Image:     "img",
+		BatchSize: 2,
+		Clusters: []Cluster{
+			{ID: "c1", Tags: map[string]string{"env": "prod"}},
+			{ID: "c2"},
+		},
+	}
+}
+
+func TestMake_InvalidScalars(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*ReleasePlanInput)
+		want string
+	}{
+		{"app empty", func(in *ReleasePlanInput) { in.App = "  " }, `"app"`},
+		{"revision empty", func(in *ReleasePlanInput) { in.Revision = "\t" }, `"revision"`},
+		{"image empty", func(in *ReleasePlanInput) { in.Image = "" }, `"image"`},
+		{"batch zero", func(in *ReleasePlanInput) { in.BatchSize = 0 }, `"batchSize"`},
+		{"batch negative", func(in *ReleasePlanInput) { in.BatchSize = -3 }, `"batchSize"`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := validInput()
+			tc.mut(&in)
+			plan, err := MakeReleasePlan(in)
+			if err == nil {
+				t.Fatalf("expected error, got plan %+v", plan)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error %q does not mention %s", err.Error(), tc.want)
+			}
+			if !reflect.DeepEqual(plan, ReleasePlan{}) {
+				t.Fatalf("invalid input must not produce a partial plan, got %+v", plan)
+			}
+		})
+	}
+}
+
+func TestMake_DuplicateClusterIDRejected(t *testing.T) {
+	in := validInput()
+	in.Clusters = []Cluster{
+		{ID: "dup", Disabled: true},
+		{ID: "other"},
+		{ID: "dup"},
+	}
+	_, err := MakeReleasePlan(in)
+	if err == nil {
+		t.Fatal("expected duplicate ID error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, `"dup"`) {
+		t.Fatalf("error must name the conflicting ID, got %q", msg)
+	}
+	if !strings.Contains(msg, "clusters[2]") || !strings.Contains(msg, "clusters[0]") {
+		t.Fatalf("error must locate both list positions, got %q", msg)
+	}
+}
+
+func TestMake_DuplicateIDCheckedEvenWhenFiltered(t *testing.T) {
+	// Both copies are disabled and would never be selected; the duplicate
+	// must still be rejected before selection runs.
+	in := validInput()
+	in.Clusters = []Cluster{{ID: "x", Disabled: true}, {ID: "x", Disabled: true}}
+	if _, err := MakeReleasePlan(in); err == nil {
+		t.Fatal("duplicate disabled clusters must be rejected")
+	}
+
+	// A valid input with no selectable clusters keeps the existing failure.
+	in.Clusters = []Cluster{{ID: "x", Disabled: true}}
+	if _, err := MakeReleasePlan(in); err == nil ||
+		!strings.Contains(err.Error(), "没有符合规则的可用集群") {
+		t.Fatalf("expected no-available-cluster failure, got %v", err)
+	}
+}
+
+func TestMake_EmptyCandidatesDoNotMaskOtherErrors(t *testing.T) {
+	in := validInput()
+	in.Clusters = nil
+	in.Include = []LabelCondition{{}}
+	if _, err := MakeReleasePlan(in); err == nil ||
+		!strings.Contains(err.Error(), "include[0] 不能为空条件对象") {
+		t.Fatalf("empty cluster list must not mask the invalid condition, got %v", err)
+	}
+
+	// An empty condition list is still "no restriction" and stays valid.
+	in.Include = []LabelCondition{}
+	in.Exclude = []LabelCondition{}
+	if _, err := MakeReleasePlan(in); err == nil ||
+		!strings.Contains(err.Error(), "未提供候选集群") {
+		t.Fatalf("valid empty input should reach the no-candidates failure, got %v", err)
+	}
+}
+
+func TestMake_ClusterAndConditionValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(*ReleasePlanInput)
+		want string
+	}{
+		{"blank cluster id", func(in *ReleasePlanInput) {
+			in.Clusters[0].ID = " "
+		}, "clusters[0]"},
+		{"empty tag key", func(in *ReleasePlanInput) {
+			in.Clusters[0].Tags = map[string]string{"": "v"}
+		}, "clusters[0] 的标签键不能为空"},
+		{"empty include condition", func(in *ReleasePlanInput) {
+			in.Include = []LabelCondition{{}}
+		}, "include[0] 不能为空条件对象"},
+		{"empty include key", func(in *ReleasePlanInput) {
+			in.Include = []LabelCondition{{"": "v"}}
+		}, "include[0] 的标签键不能为空"},
+		{"empty exclude condition", func(in *ReleasePlanInput) {
+			in.Exclude = []LabelCondition{{}}
+		}, "exclude[0] 不能为空条件对象"},
+		{"empty exclude key", func(in *ReleasePlanInput) {
+			in.Exclude = []LabelCondition{{"": "v"}}
+		}, "exclude[0] 的标签键不能为空"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := validInput()
+			tc.mut(&in)
+			if _, err := MakeReleasePlan(in); err == nil ||
+				!strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("want error containing %q, got %v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestMake_FirstErrorOrdering(t *testing.T) {
+	// Everything is wrong at once: the scalar order must win over clusters,
+	// clusters over include, include over exclude.
+	in := ReleasePlanInput{
+		App:       " ",
+		Revision:  "",
+		Image:     "",
+		BatchSize: 0,
+		Clusters:  []Cluster{{ID: "x"}, {ID: "x"}},
+		Include:   []LabelCondition{{}},
+		Exclude:   []LabelCondition{{"": "v"}},
+	}
+	steps := []struct {
+		want string
+		fix  func(*ReleasePlanInput)
+	}{
+		{`"app"`, func(in *ReleasePlanInput) { in.App = "app" }},
+		{`"revision"`, func(in *ReleasePlanInput) { in.Revision = "r1" }},
+		{`"image"`, func(in *ReleasePlanInput) { in.Image = "img" }},
+		{`"batchSize"`, func(in *ReleasePlanInput) { in.BatchSize = 1 }},
+		{"重复的集群标识", func(in *ReleasePlanInput) { in.Clusters = []Cluster{{ID: "x"}} }},
+		{"include[0]", func(in *ReleasePlanInput) { in.Include = nil }},
+		{"exclude[0]", func(in *ReleasePlanInput) { in.Exclude = nil }},
+	}
+	for _, s := range steps {
+		_, err := MakeReleasePlan(in)
+		if err == nil || !strings.Contains(err.Error(), s.want) {
+			t.Fatalf("want error containing %q, got %v", s.want, err)
+		}
+		s.fix(&in)
+	}
+	if _, err := MakeReleasePlan(in); err != nil {
+		t.Fatalf("fully fixed input should be valid, got %v", err)
+	}
+}
+
+func TestMake_IDErrorBeforeTagError(t *testing.T) {
+	in := validInput()
+	in.Clusters = []Cluster{{ID: "x"}, {ID: "x", Tags: map[string]string{"": "v"}}}
+	_, err := MakeReleasePlan(in)
+	if err == nil || !strings.Contains(err.Error(), "重复的集群标识") {
+		t.Fatalf("duplicate ID must be reported before the tag-key error, got %v", err)
+	}
+}
+
+func TestMake_TagErrorKeyOrderStable(t *testing.T) {
+	// Errors must be identical across repeated calls regardless of map
+	// iteration order; distinct invalid keys are exercised on the JSON path
+	// where they can coexist.
+	in := validInput()
+	in.Clusters[0].Tags = map[string]string{"": "v", "env": "prod"}
+	_, first := MakeReleasePlan(in)
+	if first == nil {
+		t.Fatal("expected empty-tag-key error")
+	}
+	for i := 0; i < 10; i++ {
+		_, err := MakeReleasePlan(in)
+		if err == nil || err.Error() != first.Error() {
+			t.Fatalf("error message varies across calls: %v vs %v", err, first)
+		}
+	}
+
+	jsonInput := `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 1,
+		"clusters": [{"id": "x", "tags": {"zzz": 1, "aaa": 2}}]
+	}`
+	_, jerr := ParseReleaseInput([]byte(jsonInput))
+	if jerr == nil || !strings.Contains(jerr.Error(), `"aaa"`) {
+		t.Fatalf("invalid tag keys must be reported in ascending order, got %v", jerr)
+	}
+}
+
+func TestParse_LibraryAndJSONAgree(t *testing.T) {
+	// The same invalid configuration must be rejected through both entries.
+	docs := map[string]string{
+		"duplicate": `{"app":"a","revision":"r","image":"i","batchSize":2,
+			"clusters":[{"id":"x","disabled":true},{"id":"x"}]}`,
+		"cond": `{"app":"a","revision":"r","image":"i","batchSize":2,
+			"clusters":[],"include":[{}]}`,
+		"tags": `{"app":"a","revision":"r","image":"i","batchSize":2,
+			"clusters":[{"id":"x","tags":{"":"v"}}]}`,
+	}
+	structs := map[string]ReleasePlanInput{
+		"duplicate": {
+			App: "a", Revision: "r", Image: "i", BatchSize: 2,
+			Clusters: []Cluster{{ID: "x", Disabled: true}, {ID: "x"}},
+		},
+		"cond": {
+			App: "a", Revision: "r", Image: "i", BatchSize: 2,
+			Clusters: []Cluster{}, Include: []LabelCondition{{}},
+		},
+		"tags": {
+			App: "a", Revision: "r", Image: "i", BatchSize: 2,
+			Clusters: []Cluster{{ID: "x", Tags: map[string]string{"": "v"}}},
+		},
+	}
+	for name, doc := range docs {
+		if _, err := ParseReleaseInput([]byte(doc)); err == nil {
+			t.Fatalf("%s: JSON path accepted invalid input", name)
+		}
+		if _, err := MakeReleasePlan(structs[name]); err == nil {
+			t.Fatalf("%s: struct path accepted invalid input", name)
+		}
+	}
+}
+
+func TestMake_NeverMutatesInput(t *testing.T) {
+	in := ReleasePlanInput{
+		App:       "app",
+		Revision:  "r1",
+		Image:     "img",
+		BatchSize: 2,
+		Clusters: []Cluster{
+			{ID: "c3", Tags: map[string]string{"env": "prod"}},
+			{ID: "c1"},
+			{ID: "c2", Disabled: true},
+		},
+		Include: []LabelCondition{{"env": "prod"}},
+		Exclude: []LabelCondition{},
+	}
+	snapshot := in
+	tags := in.Clusters[0].Tags
+
+	plan1, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan2, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(in, snapshot) {
+		t.Fatalf("input was mutated:\nbefore %+v\nafter  %+v", snapshot, in)
+	}
+	if got := tags["env"]; got != "prod" {
+		t.Fatalf("caller-owned tag map was mutated: %q", got)
+	}
+	if !reflect.DeepEqual(plan1, plan2) {
+		t.Fatalf("repeated calls differ: %+v vs %+v", plan1, plan2)
+	}
+
+	// Values are preserved verbatim: no trimming, case folding or merging.
+	if got := in.Clusters[0].Tags["env"]; got != "prod" {
+		t.Fatalf("tag value changed: %q", got)
+	}
+	if plan1.App.Name != "app" {
+		t.Fatalf("app name changed: %q", plan1.App.Name)
+	}
+}
+
+func TestMake_NilTagsEquivalentToEmptyTags(t *testing.T) {
+	in := validInput()
+	in.Clusters = []Cluster{
+		{ID: "a"}, // nil tags
+		{ID: "b", Tags: map[string]string{}},
+	}
+	in.Include = []LabelCondition{{"env": "prod"}}
+	_, err := MakeReleasePlan(in)
+	if err == nil || !strings.Contains(err.Error(), ReasonIncludeNotMatched) {
+		t.Fatalf("nil and empty tags should both fail the include, got %v", err)
+	}
+}
+
+func TestMake_EmptyTagValueStillMatches(t *testing.T) {
+	in := validInput()
+	in.Clusters = []Cluster{{ID: "x", Tags: map[string]string{"env": ""}}}
+	in.Include = []LabelCondition{{"env": ""}}
+	plan, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatalf("empty string tag value must match: %v", err)
+	}
+	if len(plan.Batches) != 1 || plan.Batches[0].Clusters[0] != "x" {
+		t.Fatalf("expected x selected, got %+v", plan.Batches)
 	}
 }

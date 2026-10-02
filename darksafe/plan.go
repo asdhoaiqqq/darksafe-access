@@ -64,6 +64,8 @@ type ReleasePlan struct {
 }
 
 // ParseReleaseInput reads a release plan document and validates its fields.
+// A successfully parsed input passes the same validation as a ReleasePlanInput
+// handed directly to MakeReleasePlan.
 func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -104,7 +106,7 @@ func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 		return ReleasePlanInput{}, err
 	}
 
-	return ReleasePlanInput{
+	in := ReleasePlanInput{
 		App:       app,
 		Revision:  revision,
 		Image:     image,
@@ -112,7 +114,11 @@ func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 		Clusters:  clusters,
 		Include:   include,
 		Exclude:   exclude,
-	}, nil
+	}
+	if err := validateReleaseInput(in); err != nil {
+		return ReleasePlanInput{}, err
+	}
+	return in, nil
 }
 
 func requiredString(doc map[string]any, field string) (string, error) {
@@ -155,7 +161,7 @@ func parseClusters(v any) ([]Cluster, error) {
 		return nil, errors.New("字段 \"clusters\" 必须是数组")
 	}
 	clusters := make([]Cluster, 0, len(raw))
-	seen := make(map[string]bool)
+	seen := make(map[string]int, len(raw))
 	for i, item := range raw {
 		obj, ok := item.(map[string]any)
 		if !ok {
@@ -165,16 +171,16 @@ func parseClusters(v any) ([]Cluster, error) {
 		if err != nil {
 			return nil, fmt.Errorf("clusters[%d]: %w", i, err)
 		}
-		if seen[id] {
-			return nil, fmt.Errorf("重复的集群标识 %q", id)
+		if first, ok := seen[id]; ok {
+			return nil, fmt.Errorf("clusters[%d]: 重复的集群标识 %q（首次出现在 clusters[%d]）", i, id, first)
 		}
-		seen[id] = true
+		seen[id] = i
 
 		disabled := false
 		if dv, present := obj["disabled"]; present {
 			b, ok := dv.(bool)
 			if !ok {
-				return nil, fmt.Errorf("集群 %q 的 \"disabled\" 必须是布尔值", id)
+				return nil, fmt.Errorf("clusters[%d] 的 %q 必须是布尔值", i, "disabled")
 			}
 			disabled = b
 		}
@@ -183,15 +189,15 @@ func parseClusters(v any) ([]Cluster, error) {
 		if tv, present := obj["tags"]; present {
 			tm, ok := tv.(map[string]any)
 			if !ok {
-				return nil, fmt.Errorf("集群 %q 的 \"tags\" 必须是对象", id)
+				return nil, fmt.Errorf("clusters[%d] 的 %q 必须是对象", i, "tags")
 			}
-			for k, val := range tm {
+			for _, k := range sortedAnyKeys(tm) {
 				if k == "" {
-					return nil, fmt.Errorf("集群 %q 的标签键不能为空", id)
+					return nil, fmt.Errorf("clusters[%d] 的标签键不能为空", i)
 				}
-				sv, ok := val.(string)
+				sv, ok := tm[k].(string)
 				if !ok {
-					return nil, fmt.Errorf("集群 %q 的标签 %q 值必须是字符串", id, k)
+					return nil, fmt.Errorf("clusters[%d] 的标签 %q 值必须是字符串", i, k)
 				}
 				tags[k] = sv
 			}
@@ -216,15 +222,12 @@ func parseConditions(v any, field string) ([]LabelCondition, error) {
 		if !ok {
 			return nil, fmt.Errorf("%s[%d] 必须是对象", field, i)
 		}
-		if len(obj) == 0 {
-			return nil, fmt.Errorf("%s[%d] 不能为空条件对象", field, i)
-		}
 		cond := LabelCondition{}
-		for k, val := range obj {
+		for _, k := range sortedAnyKeys(obj) {
 			if k == "" {
 				return nil, fmt.Errorf("%s[%d] 的标签键不能为空", field, i)
 			}
-			sv, ok := val.(string)
+			sv, ok := obj[k].(string)
 			if !ok {
 				return nil, fmt.Errorf("%s[%d] 的标签 %q 值必须是字符串", field, i, k)
 			}
@@ -235,9 +238,95 @@ func parseConditions(v any, field string) ([]LabelCondition, error) {
 	return conds, nil
 }
 
+// sortedAnyKeys returns map keys in ascending order so that validation errors
+// do not depend on random map iteration order.
+func sortedAnyKeys(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// sortedStringKeys returns map keys in ascending order for the same reason.
+func sortedStringKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// validateReleaseInput checks every candidate cluster and condition exactly as
+// it does the scalar fields: a disabled cluster or one that selection would
+// later filter out is still validated, and an empty candidate list cannot mask
+// errors elsewhere. At most one error is returned, in the fixed order
+// app, revision, image, batchSize, clusters, include, exclude; list problems
+// are ordered by their original position. The input is never mutated.
+func validateReleaseInput(in ReleasePlanInput) error {
+	if strings.TrimSpace(in.App) == "" {
+		return errors.New("字段 \"app\" 不能为空或只含空白")
+	}
+	if strings.TrimSpace(in.Revision) == "" {
+		return errors.New("字段 \"revision\" 不能为空或只含空白")
+	}
+	if strings.TrimSpace(in.Image) == "" {
+		return errors.New("字段 \"image\" 不能为空或只含空白")
+	}
+	if in.BatchSize <= 0 {
+		return errors.New("字段 \"batchSize\" 必须是正整数")
+	}
+
+	seen := make(map[string]int, len(in.Clusters))
+	for i, c := range in.Clusters {
+		if strings.TrimSpace(c.ID) == "" {
+			return fmt.Errorf("clusters[%d]: 字段 \"id\" 不能为空或只含空白", i)
+		}
+		if first, ok := seen[c.ID]; ok {
+			return fmt.Errorf("clusters[%d]: 重复的集群标识 %q（首次出现在 clusters[%d]）", i, c.ID, first)
+		}
+		seen[c.ID] = i
+
+		for _, k := range sortedStringKeys(c.Tags) {
+			if k == "" {
+				return fmt.Errorf("clusters[%d] 的标签键不能为空", i)
+			}
+		}
+	}
+
+	if err := validateConditions(in.Include, "include"); err != nil {
+		return err
+	}
+	if err := validateConditions(in.Exclude, "exclude"); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateConditions(conds []LabelCondition, field string) error {
+	for i, cond := range conds {
+		if len(cond) == 0 {
+			return fmt.Errorf("%s[%d] 不能为空条件对象", field, i)
+		}
+		for _, k := range sortedStringKeys(cond) {
+			if k == "" {
+				return fmt.Errorf("%s[%d] 的标签键不能为空", field, i)
+			}
+		}
+	}
+	return nil
+}
+
 // MakeReleasePlan selects available clusters, orders them by ID, and splits
-// them into batches. It never mutates the input.
+// them into batches. It rejects invalid inputs before any planning step and
+// never mutates the input.
 func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
+	if err := validateReleaseInput(in); err != nil {
+		return ReleasePlan{}, err
+	}
+
 	if len(in.Clusters) == 0 {
 		return ReleasePlan{}, errors.New("没有可发布的集群：未提供候选集群")
 	}

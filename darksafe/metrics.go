@@ -25,6 +25,21 @@ type SeriesView struct {
 	Points []Point           `json:"points"`
 }
 
+// QuerySeries 是查询结果中的一条序列：完整身份与区间内点的个数及算术平均值。
+type QuerySeries struct {
+	Name    string            `json:"name"`
+	Labels  map[string]string `json:"labels"`
+	Count   int               `json:"count"`
+	Average float64           `json:"average"`
+}
+
+// QueryResult 是一次区间均值查询成功后的结果，只读，不改变存储。
+type QueryResult struct {
+	Status string        `json:"status"`
+	Op     string        `json:"op"`
+	Series []QuerySeries `json:"series"`
+}
+
 // BatchResult 是一批采样点写入成功后的结果。
 type BatchResult struct {
 	Status     string       `json:"status"`
@@ -140,23 +155,35 @@ var (
 	jsonNumberRE  = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$`)
 )
 
+// ProcessLine 处理一行非空输入：JSON 数组为写入批次，JSON 对象为查询/操作。
+// 成功时返回 BatchResult 或 *QueryResult；失败返回 *LineError（Index 始终为零）。
+func (s *MetricStore) ProcessLine(line string) (any, *LineError) {
+	top, ok, lerr := decodeTopValue(line)
+	if lerr != nil {
+		return nil, lerr
+	}
+	switch ok {
+	case '[':
+		var items []json.RawMessage
+		if err := json.Unmarshal(top, &items); err != nil {
+			return nil, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
+		}
+		return s.ingestItems(items)
+	case '{':
+		return s.queryFromObject(top)
+	default:
+		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a JSON array of samples or a query object"}
+	}
+}
+
 // IngestLine 解析并写入一行（一批）采样点。成功返回 BatchResult；
 // 失败返回 *LineError，此时此前各批数据保留、本批不写入任何数据。
 func (s *MetricStore) IngestLine(line string) (*BatchResult, *LineError) {
-	dec := json.NewDecoder(strings.NewReader(line))
-	var top json.RawMessage
-	if err := dec.Decode(&top); err != nil {
-		return nil, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
+	top, ok, lerr := decodeTopValue(line)
+	if lerr != nil {
+		return nil, lerr
 	}
-	// 第一个 JSON 值之后只允许输入结束（Decoder 自动跳过尾随空白）。
-	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
-		if err == nil {
-			err = fmt.Errorf("unexpected content after the JSON value")
-		}
-		return nil, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
-	}
-	trimmed := strings.TrimSpace(string(top))
-	if len(trimmed) == 0 || trimmed[0] != '[' {
+	if ok != '[' {
 		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a JSON array of samples"}
 	}
 	var items []json.RawMessage
@@ -164,6 +191,40 @@ func (s *MetricStore) IngestLine(line string) (*BatchResult, *LineError) {
 		return nil, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
 	}
 	return s.ingestItems(items)
+}
+
+// QueryLine 解析并执行一行查询对象。成功返回 QueryResult；查询只读，不改变存储。
+func (s *MetricStore) QueryLine(line string) (*QueryResult, *LineError) {
+	top, ok, lerr := decodeTopValue(line)
+	if lerr != nil {
+		return nil, lerr
+	}
+	if ok != '{' {
+		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a query object"}
+	}
+	return s.queryFromObject(top)
+}
+
+// decodeTopValue 解析单行中唯一的 JSON 值并返回其原始内容与首个非空白字节
+// （'[' 或 '{'）。整个值无法解析、为空或存在尾随内容时返回 *LineError。
+func decodeTopValue(line string) (json.RawMessage, byte, *LineError) {
+	dec := json.NewDecoder(strings.NewReader(line))
+	var top json.RawMessage
+	if err := dec.Decode(&top); err != nil {
+		return nil, 0, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
+	}
+	// 第一个 JSON 值之后只允许输入结束（Decoder 自动跳过尾随空白）。
+	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
+		if err == nil {
+			err = fmt.Errorf("unexpected content after the JSON value")
+		}
+		return nil, 0, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
+	}
+	trimmed := strings.TrimSpace(string(top))
+	if len(trimmed) == 0 || (trimmed[0] != '[' && trimmed[0] != '{') {
+		return nil, 0, &LineError{Status: "error", Error: "invalid JSON: input must be a JSON array of samples or a query object"}
+	}
+	return top, trimmed[0], nil
 }
 
 type parsedSample struct {
@@ -422,6 +483,237 @@ func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineE
 // formatFloat 以 JSON 数值风格格式化 float64：1 与 1.0 均显示为 1。
 func formatFloat(v float64) string {
 	return strconv.FormatFloat(v, 'g', -1, 64)
+}
+
+type parsedQuery struct {
+	name   string
+	start  int64
+	end    int64
+	labels map[string]string
+}
+
+// queryFromObject 严格解析查询对象并执行只读区间均值查询。
+func (s *MetricStore) queryFromObject(raw json.RawMessage) (*QueryResult, *LineError) {
+	q, err := parseQuery(raw)
+	if err != nil {
+		return nil, &LineError{Status: "error", Error: err.Error()}
+	}
+	if q.start > q.end {
+		return nil, &LineError{Status: "error", Error: fmt.Sprintf(
+			`invalid range: "start" must not be greater than "end" (%d > %d)`, q.start, q.end)}
+	}
+	return s.runQuery(q), nil
+}
+
+// parseQuery 对查询对象做严格校验：仅允许 op/name/start/end/labels，
+// 拒绝重复键与未知字段；标量必须是精确的 JSON 类型，start/end 为 int64 毫秒。
+func parseQuery(raw json.RawMessage) (parsedQuery, error) {
+	var q parsedQuery
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+
+	tok, err := dec.Token()
+	if err != nil {
+		return q, err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return q, fmt.Errorf("each query must be a JSON object")
+	}
+
+	present := make(map[string]bool)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return q, err
+		}
+		key := keyTok.(string)
+		switch key {
+		case "op", "name", "start", "end", "labels":
+		default:
+			return q, fmt.Errorf("unknown field %q", key)
+		}
+		if present[key] {
+			return q, fmt.Errorf("duplicate field %q", key)
+		}
+		present[key] = true
+
+		switch key {
+		case "op":
+			t, err := dec.Token()
+			if err != nil {
+				return q, err
+			}
+			op, ok := t.(string)
+			if !ok {
+				return q, fmt.Errorf(`field "op" must be a string`)
+			}
+			if op != "query" {
+				return q, fmt.Errorf(`unknown op %q (only "query" is supported)`, op)
+			}
+		case "name":
+			t, err := dec.Token()
+			if err != nil {
+				return q, err
+			}
+			name, ok := t.(string)
+			if !ok {
+				return q, fmt.Errorf(`field "name" must be a string`)
+			}
+			if name == "" {
+				return q, fmt.Errorf(`field "name" must be a non-empty string`)
+			}
+			q.name = name
+		case "start", "end":
+			n, err := nextJSONNumber(dec, key)
+			if err != nil {
+				return q, err
+			}
+			v, err := parseJSONInt(n)
+			if err != nil {
+				return q, fmt.Errorf(`field %q: %s`, key, err)
+			}
+			if key == "start" {
+				q.start = v
+			} else {
+				q.end = v
+			}
+		case "labels":
+			t, err := dec.Token()
+			if err != nil {
+				return q, err
+			}
+			d, ok := t.(json.Delim)
+			if !ok || d != '{' {
+				return q, fmt.Errorf(`field "labels" must be an object of non-empty string keys to string values`)
+			}
+			labels := map[string]string{}
+			for dec.More() {
+				labelKeyTok, err := dec.Token()
+				if err != nil {
+					return q, err
+				}
+				labelKey := labelKeyTok.(string)
+				if labelKey == "" {
+					return q, fmt.Errorf(`field "labels": label keys must be non-empty strings`)
+				}
+				valTok, err := dec.Token()
+				if err != nil {
+					return q, err
+				}
+				labelVal, ok := valTok.(string)
+				if !ok {
+					return q, fmt.Errorf(`field "labels": value of label %q must be a string`, labelKey)
+				}
+				if _, dup := labels[labelKey]; dup {
+					return q, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
+				}
+				labels[labelKey] = labelVal
+			}
+			if _, err := dec.Token(); err != nil { // 消耗 '}'
+				return q, err
+			}
+			q.labels = labels
+		}
+	}
+	if _, err := dec.Token(); err != nil { // 消耗 '}'
+		return q, err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return q, fmt.Errorf("unexpected content after the query object")
+		}
+		return q, err
+	}
+
+	for _, field := range []string{"op", "name", "start", "end"} {
+		if !present[field] {
+			return q, fmt.Errorf("missing required field %q", field)
+		}
+	}
+	return q, nil
+}
+
+// labelsMatch 实现子集匹配：want 中每个键都必须在 stored 中存在且值完全相等，
+// stored 可以含额外标签；空字符串值只匹配真实存在的空值标签。
+func labelsMatch(want, stored map[string]string) bool {
+	for k, v := range want {
+		got, ok := stored[k]
+		if !ok || got != v {
+			return false
+		}
+	}
+	return true
+}
+
+// runQuery 只读扫描已成功提交的数据：name 精确、标签子集、[start,end] 闭区间。
+// 结果沿用 snapshot 的序列排序；无区间内点的序列不列出。
+func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
+	matched := make([]*storedSeries, 0)
+	for _, sr := range s.series {
+		if sr.ref.Name != q.name || !labelsMatch(q.labels, sr.ref.Labels) {
+			continue
+		}
+		has := false
+		for ts := range sr.points {
+			if ts >= q.start && ts <= q.end {
+				has = true
+				break
+			}
+		}
+		if has {
+			matched = append(matched, sr)
+		}
+	}
+	sort.Slice(matched, func(i, j int) bool {
+		if matched[i].ref.Name != matched[j].ref.Name {
+			return matched[i].ref.Name < matched[j].ref.Name
+		}
+		return compareLabelPairs(sortedPairs(matched[i].ref.Labels), sortedPairs(matched[j].ref.Labels)) < 0
+	})
+
+	out := make([]QuerySeries, 0, len(matched))
+	for _, sr := range matched {
+		tsList := make([]int64, 0, len(sr.points))
+		for ts := range sr.points {
+			if ts >= q.start && ts <= q.end {
+				tsList = append(tsList, ts)
+			}
+		}
+		sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
+		values := make([]float64, len(tsList))
+		for i, ts := range tsList {
+			values[i] = sr.points[ts]
+		}
+		labels := make(map[string]string, len(sr.ref.Labels))
+		for k, v := range sr.ref.Labels {
+			labels[k] = v
+		}
+		out = append(out, QuerySeries{
+			Name:    sr.ref.Name,
+			Labels:  labels,
+			Count:   len(values),
+			Average: finiteMean(values),
+		})
+	}
+	return &QueryResult{Status: "ok", Op: "query", Series: out}
+}
+
+// finiteMean 返回算术平均值，且对任意有限 float64 输入保证结果有限：
+// 采用增量均值（Welford），当 x 与当前均值反号相减溢出时，先分别除以 n 再合并。
+func finiteMean(values []float64) float64 {
+	mean := 0.0
+	for i, x := range values {
+		n := float64(i + 1)
+		delta := x - mean
+		if math.IsInf(delta, 0) {
+			// 溢出只可能在 n >= 2 且 x 与 mean 反号、幅值均极大时发生；
+			// 此时 |x/n|、|mean/n| 均小于 maxFloat64，差也有限，且与 mean 异号。
+			mean += x/n - mean/n
+			continue
+		}
+		mean += delta / n
+	}
+	return mean
 }
 
 // String 让冲突原因中的序列身份可读：name{k=v,...}，标签按键排序。

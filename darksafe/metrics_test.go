@@ -3,6 +3,7 @@ package darksafe
 import (
 	"encoding/json"
 	"math"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -322,5 +323,304 @@ func TestInt64BoundaryTimestampDistinct(t *testing.T) {
 	lerr := mustFail(t, store, `[{"name":"m","timestamp":9223372036854775807,"value":2}]`)
 	if lerr.Conflict == nil {
 		t.Fatalf("boundary timestamp should be addressable for conflict detection, got %+v", lerr)
+	}
+}
+
+func mustQuery(t *testing.T, store *MetricStore, line string) *QueryResult {
+	t.Helper()
+	res, err := store.QueryLine(line)
+	if err != nil {
+		t.Fatalf("expected query success for %s, got error: %+v", line, err)
+	}
+	return res
+}
+
+func mustQueryFail(t *testing.T, store *MetricStore, line string) *LineError {
+	t.Helper()
+	res, err := store.QueryLine(line)
+	if err == nil {
+		t.Fatalf("expected query failure for %s, got result: %+v", line, res)
+	}
+	return err
+}
+
+func TestQueryRangeInclusiveAndAverage(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"cpu","timestamp":1000,"value":1,"labels":{"host":"a"}},
+		{"name":"cpu","timestamp":1500,"value":2,"labels":{"host":"a"}},
+		{"name":"cpu","timestamp":2000,"value":3,"labels":{"host":"a"}},
+		{"name":"cpu","timestamp":2500,"value":4,"labels":{"host":"a"}},
+		{"name":"cpu","timestamp":2000,"value":10,"labels":{"host":"b"}}
+	]`)
+
+	// 闭区间：包含 start=1000、end=2000 两个端点，(1+2+3)/3 = 2。
+	res := mustQuery(t, store, `{"op":"query","name":"cpu","start":1000,"end":2000,"labels":{"host":"a"}}`)
+	if len(res.Series) != 1 {
+		t.Fatalf("series = %+v, want exactly host=a", res.Series)
+	}
+	s0 := res.Series[0]
+	if s0.Name != "cpu" || s0.Labels["host"] != "a" || s0.Count != 3 || s0.Average != 2 {
+		t.Fatalf("series[0] = %+v, want cpu host=a count=3 avg=2", s0)
+	}
+
+	// start == end：只查该时间戳一个点。
+	res = mustQuery(t, store, `{"op":"query","name":"cpu","start":1500,"end":1500,"labels":{"host":"a"}}`)
+	if len(res.Series) != 1 || res.Series[0].Count != 1 || res.Series[0].Average != 2 {
+		t.Fatalf("point query = %+v", res.Series)
+	}
+
+	// 区间外不返回该序列（空数组，而不是 count=0 的条目）。
+	res = mustQuery(t, store, `{"op":"query","name":"cpu","start":3000,"end":4000}`)
+	if len(res.Series) != 0 {
+		t.Fatalf("out-of-range query = %+v, want empty series", res.Series)
+	}
+}
+
+func TestQueryLabelSelection(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1},
+		{"name":"m","timestamp":1,"value":2,"labels":{"zone":""}},
+		{"name":"m","timestamp":1,"value":3,"labels":{"zone":"x"}},
+		{"name":"m","timestamp":1,"value":4,"labels":{"zone":"x","host":"h"}},
+		{"name":"other","timestamp":1,"value":9}
+	]`)
+
+	// 省略 labels：该指标全部序列（共 4 条），不合并；顺序沿用 snapshot 排序。
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":2}`)
+	if len(res.Series) != 4 {
+		t.Fatalf("all series = %+v, want 4", res.Series)
+	}
+	wantOrder := []map[string]string{
+		{},
+		{"host": "h", "zone": "x"},
+		{"zone": ""},
+		{"zone": "x"},
+	}
+	for i, wantLabels := range wantOrder {
+		got := res.Series[i].Labels
+		if len(got) != len(wantLabels) {
+			t.Fatalf("series[%d] labels = %v, want %v", i, got, wantLabels)
+		}
+		for k, v := range wantLabels {
+			if gv, ok := got[k]; !ok || gv != v {
+				t.Fatalf("series[%d] labels = %v, want %v", i, got, wantLabels)
+			}
+		}
+	}
+
+	// 空对象等价于省略。
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":2,"labels":{}}`)
+	if len(res.Series) != 4 {
+		t.Fatalf("empty labels = %+v, want all 4 series", res.Series)
+	}
+
+	// 子集匹配：zone=x 同时匹配带 host 额外标签和无额外标签的两条序列；
+	// 排序沿用 snapshot：标签对 (host,h)<(zone,x)，故带 host 的序列在前。
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":2,"labels":{"zone":"x"}}`)
+	if len(res.Series) != 2 || res.Series[0].Average != 4 || res.Series[1].Average != 3 {
+		t.Fatalf("subset match = %+v, want averages 4 and 3", res.Series)
+	}
+
+	// 额外约束 host 后只剩一条。
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":2,"labels":{"zone":"x","host":"h"}}`)
+	if len(res.Series) != 1 || res.Series[0].Average != 4 {
+		t.Fatalf("fully specified match = %+v, want average 4", res.Series)
+	}
+
+	// 空字符串只匹配真实存在的空值标签，不匹配缺少该标签的序列。
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":2,"labels":{"zone":""}}`)
+	if len(res.Series) != 1 || res.Series[0].Average != 2 {
+		t.Fatalf("empty-value match = %+v, want single series avg 2", res.Series)
+	}
+
+	// 要求一个不存在的标签：空结果。
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":2,"labels":{"nope":"x"}}`)
+	if len(res.Series) != 0 {
+		t.Fatalf("missing label match = %+v, want empty", res.Series)
+	}
+
+	// 标签顺序不影响匹配。
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":2,"labels":{"host":"h","zone":"x"}}`)
+	if len(res.Series) != 1 {
+		t.Fatalf("label order must not matter, got %+v", res.Series)
+	}
+
+	// name 精确匹配：不同指标不返回。
+	res = mustQuery(t, store, `{"op":"query","name":"nonexistent","start":0,"end":2}`)
+	if len(res.Series) != 0 {
+		t.Fatalf("unknown metric = %+v, want empty", res.Series)
+	}
+
+	// 无标签序列输出为空对象而非 null。
+	b, _ := json.Marshal(res)
+	if string(b) != `{"status":"ok","op":"query","series":[]}` {
+		t.Fatalf("empty result shape = %s", b)
+	}
+	res = mustQuery(t, store, `{"op":"query","name":"other","start":0,"end":2}`)
+	if len(res.Series) != 1 || len(res.Series[0].Labels) != 0 {
+		t.Fatalf("unlabeled series = %+v", res.Series)
+	}
+	b, _ = json.Marshal(res.Series[0].Labels)
+	if string(b) != `{}` {
+		t.Fatalf("labels should serialize as {}, got %s", b)
+	}
+}
+
+func TestQueryInterleavedWritesReadYourWrites(t *testing.T) {
+	store := NewMetricStore()
+
+	// 查询只见到此前成功写入的数据。
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if len(res.Series) != 0 {
+		t.Fatalf("query before any write = %+v, want empty", res.Series)
+	}
+
+	mustOK(t, store, `[{"name":"m","timestamp":10,"value":2}]`)
+	mustOK(t, store, `[{"name":"m","timestamp":20,"value":4}]`)
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if len(res.Series) != 1 || res.Series[0].Count != 2 || res.Series[0].Average != 3 {
+		t.Fatalf("query after writes = %+v", res.Series)
+	}
+
+	// 失败批次整批回滚，其中任何点都不能参与后续查询。
+	mustFail(t, store, `[{"name":"m","timestamp":30,"value":8},{"name":"m","timestamp":10,"value":100}]`)
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if res.Series[0].Count != 2 || res.Series[0].Average != 3 {
+		t.Fatalf("rolled-back points must not be queryable, got %+v", res.Series)
+	}
+
+	// 重复点只计一次。
+	mustOK(t, store, `[{"name":"m","timestamp":20,"value":4.0}]`)
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if res.Series[0].Count != 2 || res.Series[0].Average != 3 {
+		t.Fatalf("duplicate must not affect query, got %+v", res.Series)
+	}
+
+	// 查询不改变存储：同一查询重复结果一致，后续写入快照也不受影响。
+	res2 := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if !reflect.DeepEqual(res, res2) {
+		t.Fatalf("repeated query differs: %+v vs %+v", res, res2)
+	}
+	snap := mustOK(t, store, `[]`)
+	if len(snap.Series) != 1 || len(snap.Series[0].Points) != 2 {
+		t.Fatalf("query mutated storage, snapshot = %+v", snap.Series)
+	}
+}
+
+func TestQueryFiniteMeanOverflow(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1e308},
+		{"name":"m","timestamp":2,"value":1e308}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if len(res.Series) != 1 {
+		t.Fatalf("series = %+v", res.Series)
+	}
+	avg := res.Series[0].Average
+	if math.IsInf(avg, 0) || math.IsNaN(avg) {
+		t.Fatalf("average must be finite, got %v", avg)
+	}
+	if avg != 1e308 {
+		t.Fatalf("average = %v, want 1e308", avg)
+	}
+
+	// 反号极值相减（朴素求和与朴素增量都会溢出）也要给出有限结果。
+	store2 := NewMetricStore()
+	mustOK(t, store2, `[
+		{"name":"m","timestamp":1,"value":1e308},
+		{"name":"m","timestamp":2,"value":-1e308}
+	]`)
+	res = mustQuery(t, store2, `{"op":"query","name":"m","start":0,"end":100}`)
+	avg = res.Series[0].Average
+	if math.IsInf(avg, 0) || math.IsNaN(avg) {
+		t.Fatalf("average of opposite extremes must be finite, got %v", avg)
+	}
+
+	// 结果与写入顺序无关：反序写入同一点集应得到相同均值。
+	store3 := NewMetricStore()
+	mustOK(t, store3, `[
+		{"name":"m","timestamp":2,"value":-1e308},
+		{"name":"m","timestamp":1,"value":1e308}
+	]`)
+	res3 := mustQuery(t, store3, `{"op":"query","name":"m","start":0,"end":100}`)
+	if res3.Series[0].Average != avg {
+		t.Fatalf("average depends on write order: %v vs %v", res3.Series[0].Average, avg)
+	}
+}
+
+func TestQueryValidationErrors(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"m","timestamp":1,"value":1}]`)
+	bad := []string{
+		`{"op":"query","name":"","start":0,"end":1}`,                                        // 空 name
+		`{"op":"query","name":7,"start":0,"end":1}`,                                         // name 类型错误
+		`{"op":"query","name":"m","start":0}`,                                               // 缺 end
+		`{"op":"query","name":"m","start":0,"end":1,"extra":1}`,                             // 未知字段
+		`{"op":"ingest","name":"m","start":0,"end":1}`,                                      // 未知 op
+		`{"op":"write","name":"m","start":0,"end":1}`,                                       // 其他 op
+		`{"op":7,"name":"m","start":0,"end":1}`,                                             // op 类型错误
+		`{"op":"query","op":"query","name":"m","start":0,"end":1}`,                          // 重复字段
+		`{"op":"query","name":"m","start":0.5,"end":1}`,                                     // start 非整数
+		`{"op":"query","name":"m","start":"0","end":1}`,                                     // start 字符串
+		`{"op":"query","name":"m","start":true,"end":1}`,                                    // start 布尔
+		`{"op":"query","name":"m","start":0,"end":9223372036854775808}`,                     // end 超 int64
+		`{"op":"query","name":"m","start":2,"end":1}`,                                       // start > end
+		`{"op":"query","name":"m","start":-9223372036854775808,"end":-9223372036854775809}`, // end 低于 int64
+		`{"op":"query","name":"m","start":0,"end":1,"labels":[]}`,                           // labels 非对象
+		`{"op":"query","name":"m","start":0,"end":1,"labels":null}`,                         // labels 为 null
+		`{"op":"query","name":"m","start":0,"end":1,"labels":{"":"v"}}`,                     // 空标签键
+		`{"op":"query","name":"m","start":0,"end":1,"labels":{"k":1}}`,                      // 标签值非字符串
+		`{"op":"query","name":"m","start":0,"end":1,"labels":{"k":"a","k":"b"}}`,            // 重复标签键
+		`{"name":"m","start":0,"end":1}`,                                                    // 缺 op
+		`{"op":"query","start":0,"end":1}`,                                                  // 缺 name
+		`{"op":"query","name":"m","start":0,"end":1} trailing`,                              // 尾随内容
+	}
+	for _, line := range bad {
+		lerr := mustQueryFail(t, store, line)
+		if lerr.Index != 0 {
+			t.Errorf("line %s: query errors must not carry index, got %d", line, lerr.Index)
+		}
+		if lerr.Conflict != nil {
+			t.Errorf("line %s: query errors must not carry conflict", line)
+		}
+	}
+	// 非法行不改变存储。
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if len(res.Series) != 1 || res.Series[0].Count != 1 {
+		t.Fatalf("failed queries must not mutate storage, got %+v", res.Series)
+	}
+}
+
+func TestProcessLineDispatchesArrayAndObject(t *testing.T) {
+	store := NewMetricStore()
+	r, lerr := store.ProcessLine(`[{"name":"m","timestamp":1,"value":2}]`)
+	if lerr != nil {
+		t.Fatalf("array line: %+v", lerr)
+	}
+	if _, ok := r.(*BatchResult); !ok {
+		t.Fatalf("array line result type = %T, want *BatchResult", r)
+	}
+	r, lerr = store.ProcessLine(`{"op":"query","name":"m","start":0,"end":10}`)
+	if lerr != nil {
+		t.Fatalf("object line: %+v", lerr)
+	}
+	qr, ok := r.(*QueryResult)
+	if !ok {
+		t.Fatalf("object line result type = %T, want *QueryResult", r)
+	}
+	if len(qr.Series) != 1 || qr.Series[0].Average != 2 {
+		t.Fatalf("query via ProcessLine = %+v", qr)
+	}
+	// 标量顶层值仍然是整行错误，且不带 index。
+	_, lerr = store.ProcessLine(`"hello"`)
+	if lerr == nil || lerr.Index != 0 {
+		t.Fatalf("scalar line = %+v, want whole-line error without index", lerr)
+	}
+	_, lerr = store.ProcessLine(`{}`)
+	if lerr == nil {
+		t.Fatal("empty object must fail validation")
 	}
 }

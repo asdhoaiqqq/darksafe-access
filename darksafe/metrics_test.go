@@ -551,6 +551,168 @@ func TestQueryFiniteMeanOverflow(t *testing.T) {
 	}
 }
 
+// TestQueryMeanKeepsResidualOfOpposingExtremes 是本次修复的核心场景：
+// 1e16 与 -1e16 抵消后留下的 1 必须参与平均，结果为精确平均 1/3 的最近 float64。
+func TestQueryMeanKeepsResidualOfOpposingExtremes(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1e16},
+		{"name":"m","timestamp":2,"value":1},
+		{"name":"m","timestamp":3,"value":-1e16}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":1,"end":3}`)
+	if len(res.Series) != 1 {
+		t.Fatalf("series = %+v", res.Series)
+	}
+	s0 := res.Series[0]
+	if s0.Count != 3 {
+		t.Fatalf("count = %d, want 3", s0.Count)
+	}
+	want := 1.0 / 3.0
+	if s0.Average != want {
+		t.Fatalf("average = %v, want %v (exact mean 1/3)", s0.Average, want)
+	}
+	// JSON 输出必须是 0.3333333333333333。
+	b, err := json.Marshal(s0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"average":0.3333333333333333`) {
+		t.Fatalf("average JSON = %s, want 0.3333333333333333", b)
+	}
+}
+
+// TestQueryMeanIndependentOfWriteOrderAndBatches 验证同一组区间内数值无论
+// 怎样分批、按什么顺序提交，也无论时间戳怎样排列，平均值都一致。
+func TestQueryMeanIndependentOfWriteOrderAndBatches(t *testing.T) {
+	const query = `{"op":"query","name":"m","start":0,"end":100}`
+	build := func(lines []string) float64 {
+		store := NewMetricStore()
+		for _, ln := range lines {
+			mustOK(t, store, ln)
+		}
+		res := mustQuery(t, store, query)
+		if len(res.Series) != 1 || res.Series[0].Count != 3 {
+			t.Fatalf("bad series: %+v", res.Series)
+		}
+		return res.Series[0].Average
+	}
+	want := 1.0 / 3.0
+	cases := map[string][]string{
+		"single batch": {
+			`[{"name":"m","timestamp":1,"value":1e16},{"name":"m","timestamp":2,"value":1},{"name":"m","timestamp":3,"value":-1e16}]`,
+		},
+		"three batches, reverse submit": {
+			`[{"name":"m","timestamp":3,"value":-1e16}]`,
+			`[{"name":"m","timestamp":1,"value":1e16}]`,
+			`[{"name":"m","timestamp":2,"value":1}]`,
+		},
+		"two batches": {
+			`[{"name":"m","timestamp":1,"value":1e16},{"name":"m","timestamp":3,"value":-1e16}]`,
+			`[{"name":"m","timestamp":2,"value":1}]`,
+		},
+		"timestamps permuted": {
+			`[{"name":"m","timestamp":30,"value":1e16},{"name":"m","timestamp":10,"value":-1e16},{"name":"m","timestamp":20,"value":1}]`,
+		},
+	}
+	for name, lines := range cases {
+		if got := build(lines); got != want {
+			t.Fatalf("case %q average = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// TestQueryMeanSumOverflowStillFinite 验证总和超出 float64 范围时均值仍有限。
+func TestQueryMeanSumOverflowStillFinite(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1e308},
+		{"name":"m","timestamp":2,"value":1e308},
+		{"name":"m","timestamp":3,"value":1e308}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	avg := res.Series[0].Average
+	if math.IsInf(avg, 0) || math.IsNaN(avg) {
+		t.Fatalf("average must be finite, got %v", avg)
+	}
+	if avg != 1e308 {
+		t.Fatalf("average = %v, want 1e308", avg)
+	}
+}
+
+// TestQueryMeanNearZeroSubnormal 验证接近零的值按同一舍入规则给出有限的
+// 次正规均值，不在计算过程中提前丢失。
+func TestQueryMeanNearZeroSubnormal(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1e308},
+		{"name":"m","timestamp":2,"value":-1e308},
+		{"name":"m","timestamp":3,"value":1e-320}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	avg := res.Series[0].Average
+	if math.IsInf(avg, 0) || math.IsNaN(avg) || avg <= 0 {
+		t.Fatalf("average = %v, want positive finite subnormal", avg)
+	}
+	if avg != 1e-320/3 {
+		t.Fatalf("average = %v, want %v", avg, 1e-320/3)
+	}
+}
+
+// TestQueryMeanExactZero 验证精确平均等于零时统一输出数值 0。
+func TestQueryMeanExactZero(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1e16},
+		{"name":"m","timestamp":2,"value":1},
+		{"name":"m","timestamp":3,"value":-1},
+		{"name":"m","timestamp":4,"value":-1e16}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if avg := res.Series[0].Average; avg != 0 {
+		t.Fatalf("average = %v, want exactly 0", avg)
+	}
+}
+
+// TestQueryMeanRoundsTiesToEven 验证均值恰好处在两个相邻可表示值正中间时
+// 按最近偶数舍入。
+func TestQueryMeanRoundsTiesToEven(t *testing.T) {
+	// 1 与 1+2^-52 的精确平均为 1+2^-53：低位有效数字分别为 2^52（偶）与
+	// 2^52+1（奇），正中间舍入取偶数，结果为 1。
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"m","timestamp":1,"value":1},
+		{"name":"m","timestamp":2,"value":1.0000000000000002}
+	]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if avg := res.Series[0].Average; avg != 1 {
+		t.Fatalf("tie round-down average = %v, want 1", avg)
+	}
+
+	// 1+2^-52 与 1+2^-51 的精确平均为 1+3*2^-53：两侧有效数字分别为
+	// 2^52+1（奇）与 2^52+2（偶），舍入取偶数，结果为 1+2^-51。
+	store2 := NewMetricStore()
+	mustOK(t, store2, `[
+		{"name":"m","timestamp":1,"value":1.0000000000000002},
+		{"name":"m","timestamp":2,"value":1.0000000000000004}
+	]`)
+	res = mustQuery(t, store2, `{"op":"query","name":"m","start":0,"end":100}`)
+	want := 1.0 + math.Ldexp(1, -51)
+	if avg := res.Series[0].Average; avg != want {
+		t.Fatalf("tie round-up average = %v, want %v", avg, want)
+	}
+}
+
+// TestQueryMeanSinglePointReturnsValue 验证区间内只有一个点时返回该点的值。
+func TestQueryMeanSinglePointReturnsValue(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"m","timestamp":1,"value":1.2345678901234567}]`)
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":100}`)
+	if avg := res.Series[0].Average; avg != 1.2345678901234567 {
+		t.Fatalf("average = %v, want the single stored value", avg)
+	}
+}
+
 func TestQueryValidationErrors(t *testing.T) {
 	store := NewMetricStore()
 	mustOK(t, store, `[{"name":"m","timestamp":1,"value":1}]`)

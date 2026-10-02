@@ -208,6 +208,40 @@ func TestRunIngestInterleavedQuery(t *testing.T) {
 	checkQuery(8, 2, 3)
 }
 
+func TestRunIngestQueryMeanKeepsResidual(t *testing.T) {
+	// 与命令行查询相同的均值规则：1e16 与 -1e16 抵消后留下的 1 必须参与平均。
+	input := strings.Join([]string{
+		`[{"name":"m","timestamp":1,"value":1e16},{"name":"m","timestamp":2,"value":1},{"name":"m","timestamp":3,"value":-1e16}]`,
+		`{"op":"query","name":"m","start":1,"end":3}`,
+	}, "\n")
+	var out bytes.Buffer
+	if code := runIngest(strings.NewReader(input), &out); code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("got %d lines: %v", len(lines), lines)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(lines[1]), &m); err != nil {
+		t.Fatal(err)
+	}
+	series := m["series"].([]interface{})
+	if len(series) != 1 {
+		t.Fatalf("series = %v, want 1", series)
+	}
+	s0 := series[0].(map[string]interface{})
+	if s0["count"].(float64) != 3 {
+		t.Fatalf("count = %v, want 3", s0["count"])
+	}
+	if s0["average"].(float64) != 1.0/3.0 {
+		t.Fatalf("average = %v, want %v", s0["average"], 1.0/3.0)
+	}
+	if !strings.Contains(lines[1], `"average":0.3333333333333333`) {
+		t.Fatalf("query line = %s, want average 0.3333333333333333", lines[1])
+	}
+}
+
 func TestRunIngestQueryErrorLineNumbers(t *testing.T) {
 	input := strings.Join([]string{
 		``,    // 行 1：空白

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"regexp"
 	"sort"
 	"strconv"
@@ -698,22 +699,77 @@ func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
 	return &QueryResult{Status: "ok", Op: "query", Series: out}
 }
 
-// finiteMean 返回算术平均值，且对任意有限 float64 输入保证结果有限：
-// 采用增量均值（Welford），当 x 与当前均值反号相减溢出时，先分别除以 n 再合并。
+// finiteMean 返回区间内已存储 float64 值的精确算术平均按 float64 最近舍入
+// （恰好处在两个相邻可表示值正中间时按最近偶数舍入）后的结果。
+//
+// 每个 float64 都是二的幂有理数，因此求和可以在 big.Int 上精确完成：
+// 正负大数抵消后留下的小值不会丢失；n 个有限值的均值绝对值不超过最大值，
+// 结果必然有限。舍入以实际存储的二进制浮点值为准，不恢复输入的十进制含义。
 func finiteMean(values []float64) float64 {
-	mean := 0.0
-	for i, x := range values {
-		n := float64(i + 1)
-		delta := x - mean
-		if math.IsInf(delta, 0) {
-			// 溢出只可能在 n >= 2 且 x 与 mean 反号、幅值均极大时发生；
-			// 此时 |x/n|、|mean/n| 均小于 maxFloat64，差也有限，且与 mean 异号。
-			mean += x/n - mean/n
-			continue
-		}
-		mean += delta / n
+	if len(values) == 0 {
+		return 0
 	}
-	return mean
+	// 所有 float64 都可写成 sig * 2^k（sig 为整数）。统一放大到 2^1126 倍
+	// （覆盖最小次正规数 2^-1074）后用 big.Int 精确求和，避免有理数约分。
+	const scaleExp = 1126
+	sum := new(big.Int)
+	term := new(big.Int)
+	for _, f := range values {
+		frac, exp := math.Frexp(f)
+		sig := int64(math.Ldexp(frac, 53)) // f == sig * 2^(exp-53)
+		// f * 2^1126 == sig * 2^(exp-53+1126) == sig * 2^(exp+1073)
+		term.SetInt64(sig)
+		term.Lsh(term, uint(exp+1073))
+		sum.Add(sum, term)
+	}
+	switch sum.Sign() {
+	case 0:
+		return 0
+	case -1:
+		sum.Neg(sum)
+		v := ratToFloat64(sum, new(big.Int).Lsh(big.NewInt(int64(len(values))), scaleExp))
+		return -v
+	}
+	den := new(big.Int).Lsh(big.NewInt(int64(len(values))), scaleExp)
+	return ratToFloat64(sum, den)
+}
+
+// ratToFloat64 将正有理数 p/q 舍入为最近的 float64；恰好处在两个相邻可表示值
+// 正中间时按最近偶数舍入。p、q 必须为正整数。
+func ratToFloat64(p, q *big.Int) float64 {
+	// 求 e 使 2^e <= p/q < 2^(e+1)。
+	e := p.BitLen() - q.BitLen()
+	var ge bool
+	if e >= 0 {
+		ge = new(big.Int).Rsh(p, uint(e)).Cmp(q) >= 0
+	} else {
+		ge = new(big.Int).Lsh(p, uint(-e)).Cmp(q) >= 0
+	}
+	if !ge {
+		e--
+	}
+	// 舍入单位的指数：正规数为 e-52；次正规区间夹到 -1074。
+	u := e - 52
+	if u < -1074 {
+		u = -1074
+	}
+	// M = roundToNearestEven(p/q / 2^u) = round(p * 2^(-u) / q)
+	var N, D big.Int
+	if u >= 0 {
+		N.Set(p)
+		D.Lsh(q, uint(u))
+	} else {
+		N.Lsh(p, uint(-u))
+		D.Set(q)
+	}
+	var M, rem big.Int
+	M.QuoRem(&N, &D, &rem)
+	twice := new(big.Int).Lsh(&rem, 1)
+	if c := twice.Cmp(&D); c > 0 || (c == 0 && M.Bit(0) == 1) {
+		M.Add(&M, big.NewInt(1))
+	}
+	mf, _ := M.Float64() // M <= 2^53，整数可精确表示为 float64
+	return math.Ldexp(mf, u)
 }
 
 // String 让冲突原因中的序列身份可读：name{k=v,...}，标签按键排序。

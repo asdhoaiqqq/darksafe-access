@@ -64,6 +64,9 @@ type ReleasePlan struct {
 }
 
 // ParseReleaseInput reads a release plan document and validates its fields.
+// A document that defines the same member name twice in any JSON object is
+// rejected before any field validation, so an ambiguous value can never be
+// silently resolved by taking the last occurrence.
 func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.UseNumber()
@@ -74,7 +77,81 @@ func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 	if dec.More() {
 		return ReleasePlanInput{}, errors.New("JSON 格式错误: 文档包含多余内容")
 	}
+	if err := checkDuplicateMembers(data); err != nil {
+		return ReleasePlanInput{}, err
+	}
 	return buildReleaseInput(doc)
+}
+
+// checkDuplicateMembers scans a syntactically valid JSON document token by
+// token and rejects any object that defines the same member name twice,
+// regardless of the values involved. The check covers every object in the
+// document: the top level, each cluster, tags, include/exclude conditions,
+// and unknown fields with their nested objects. Names are compared after
+// JSON string decoding, so equivalent Unicode escapes count as the same
+// name while case or whitespace differences remain distinct; no trimming or
+// other normalization is applied. Separate objects in an array may reuse
+// names freely. The reported duplicate is the member whose second
+// occurrence appears first in the document, named by its decoded key and
+// the position of the object containing it (array positions are zero-based).
+func checkDuplicateMembers(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	return walkJSONValue(dec, "")
+}
+
+// walkJSONValue consumes one JSON value from dec. path identifies the value
+// itself: "" for the top level, joined with "." through object members and
+// extended with "[i]" through array elements.
+func walkJSONValue(dec *json.Decoder, path string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("JSON 格式错误: %w", err)
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for dec.More() {
+			kt, err := dec.Token()
+			if err != nil {
+				return fmt.Errorf("JSON 格式错误: %w", err)
+			}
+			key := kt.(string)
+			if _, dup := seen[key]; dup {
+				where := path
+				if where == "" {
+					where = "顶层对象"
+				}
+				return fmt.Errorf("配置中存在重复的对象成员: %s 中的字段 %q 重复出现", where, key)
+			}
+			seen[key] = struct{}{}
+			child := key
+			if path != "" {
+				child = path + "." + key
+			}
+			if err := walkJSONValue(dec, child); err != nil {
+				return err
+			}
+		}
+		if _, err := dec.Token(); err != nil {
+			return fmt.Errorf("JSON 格式错误: %w", err)
+		}
+		return nil
+	case '[':
+		for i := 0; dec.More(); i++ {
+			if err := walkJSONValue(dec, fmt.Sprintf("%s[%d]", path, i)); err != nil {
+				return err
+			}
+		}
+		if _, err := dec.Token(); err != nil {
+			return fmt.Errorf("JSON 格式错误: %w", err)
+		}
+		return nil
+	}
+	return nil
 }
 
 func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {

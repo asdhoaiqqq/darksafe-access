@@ -258,6 +258,129 @@ func TestParse_MalformedJSON(t *testing.T) {
 	}
 }
 
+func TestParse_DuplicateMembersRejected(t *testing.T) {
+	cases := map[string]struct {
+		input string
+		want  []string // substrings the error must contain
+	}{
+		"top level same value": {
+			`{"app":"a","app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x"}]}`,
+			[]string{"顶层对象", `"app"`},
+		},
+		"top level different values": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x"}],"app":"b"}`,
+			[]string{"顶层对象", `"app"`},
+		},
+		"top level different types": {
+			`{"batchSize":1,"app":"a","revision":"r","image":"i","clusters":[{"id":"x"}],"batchSize":"1"}`,
+			[]string{"顶层对象", `"batchSize"`},
+		},
+		"cluster disabled flipped": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x","disabled":true,"disabled":false}]}`,
+			[]string{"clusters[0]", `"disabled"`},
+		},
+		"cluster id repeated": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x"},{"id":"y","id":"z"}]}`,
+			[]string{"clusters[1]", `"id"`},
+		},
+		"tag key repeated": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x","tags":{"env":"a","env":"b"}}]}`,
+			[]string{"clusters[0].tags", `"env"`},
+		},
+		"include condition key repeated": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x"}],"include":[{"region":"us","region":"eu"}]}`,
+			[]string{"include[0]", `"region"`},
+		},
+		"exclude condition key repeated": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x"}],"exclude":[{"env":"a"},{"env":"b","env":"c"}]}`,
+			[]string{"exclude[1]", `"env"`},
+		},
+		"unknown field repeated": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x"}],"extra":1,"extra":2}`,
+			[]string{"顶层对象", `"extra"`},
+		},
+		"unknown nested object repeated": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x"}],"meta":{"labels":{"team":"a","team":"b"}}}`,
+			[]string{"meta.labels", `"team"`},
+		},
+		"unknown nested array object repeated": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x"}],"meta":[{"k":1},{"k":1,"k":2}]}`,
+			[]string{"meta[1]", `"k"`},
+		},
+		"unicode escape equals plain name": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x","disabled":true,"dis\u0061bled":false}]}`,
+			[]string{"clusters[0]", `"disabled"`},
+		},
+		"null and object values still rejected": {
+			`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x","tags":null,"tags":{}}]}`,
+			[]string{"clusters[0]", `"tags"`},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := ParseReleaseInput([]byte(tc.input))
+			if err == nil {
+				t.Fatalf("expected duplicate member error for %s", name)
+			}
+			if !strings.Contains(err.Error(), "重复") {
+				t.Fatalf("error should mention duplication, got %q", err.Error())
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(err.Error(), w) {
+					t.Fatalf("error %q should contain %q", err.Error(), w)
+				}
+			}
+		})
+	}
+}
+
+func TestParse_DuplicateMembersNotFalsePositive(t *testing.T) {
+	// Same names in different objects, identical conditions listed twice,
+	// and case-distinct names are all legitimate.
+	in := parsePlan(t, `{
+		"app": "app", "revision": "r1", "image": "img", "batchSize": 2,
+		"clusters": [
+			{"id": "a", "tags": {"env": "prod", "region": "us"}},
+			{"id": "b", "tags": {"env": "dev", "region": "eu"}}
+		],
+		"include": [{"region": "us"}, {"region": "us"}, {"env": "dev"}],
+		"exclude": [{"region": "eu"}],
+		"App": "ignored-unknown",
+		"meta": {"env": "anything"}
+	}`)
+	plan, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Batches) != 1 || strings.Join(plan.Batches[0].Clusters, ",") != "a" {
+		t.Fatalf("expected only [a], got %+v", plan.Batches)
+	}
+}
+
+func TestParse_DuplicateMemberOrderAndPrecedence(t *testing.T) {
+	// The first member to appear a second time in file order wins, even
+	// when a later duplicate sits at an earlier nesting level.
+	_, err := ParseReleaseInput([]byte(
+		`{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x","id":"y"}],"revision":"r2"}`))
+	if err == nil || !strings.Contains(err.Error(), "clusters[0]") || !strings.Contains(err.Error(), `"id"`) {
+		t.Fatalf("expected clusters[0] id duplicate first, got %v", err)
+	}
+
+	// Duplicate members are reported before any business field error.
+	_, err = ParseReleaseInput([]byte(
+		`{"app":"","revision":"r","image":"i","batchSize":0,"clusters":[{"id":"x","id":"x"}]}`))
+	if err == nil || !strings.Contains(err.Error(), "重复") {
+		t.Fatalf("duplicate member error must precede field errors, got %v", err)
+	}
+
+	// Without duplicates the original field errors still surface.
+	_, err = ParseReleaseInput([]byte(
+		`{"app":"","revision":"r","image":"i","batchSize":0,"clusters":[{"id":"x"}]}`))
+	if err == nil || !strings.Contains(err.Error(), `"app"`) {
+		t.Fatalf("expected app field error, got %v", err)
+	}
+}
+
 // validInput returns a well-formed input for library-path tests.
 func validInput() ReleasePlanInput {
 	return ReleasePlanInput{

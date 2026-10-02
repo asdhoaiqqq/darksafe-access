@@ -12,7 +12,6 @@ package darksafe
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -94,15 +93,15 @@ func genesisFingerprint(org string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// computeFingerprint returns the fingerprint for an envelope.
+// computeFingerprint returns the fingerprint for an envelope. The envelope
+// is encoded with the byte-preserving audit encoder: strings that are valid
+// UTF-8 encode exactly as json.Marshal would, while invalid UTF-8 bytes are
+// preserved distinctly, so tampering with raw bytes can never hide behind
+// JSON's replacement-character rendering.
 func computeFingerprint(e *hashEnvelope) string {
-	b, err := json.Marshal(e)
-	if err != nil {
-		// All envelope fields are plain, JSON-encodable values; a failure
-		// here indicates a programming error, not user input.
-		panic(fmt.Errorf("darksafe: audit envelope must encode: %w", err))
-	}
-	sum := sha256.Sum256(b)
+	enc := auditHashEncoder{}
+	enc.writeEnvelope(e)
+	sum := sha256.Sum256(enc.buf.Bytes())
 	return hex.EncodeToString(sum[:])
 }
 

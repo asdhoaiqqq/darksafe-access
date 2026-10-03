@@ -568,7 +568,16 @@ func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID 
 // records: filtering happens within the pinned [start,end] window.
 func (s *Store) auditPageLocked(org string, startSeq, endSeq int, endFP string, pageSize int, kind, subjectID string) *AuditPage {
 	st := s.orgs[org]
-	out := make([]AuditRecord, 0, pageSize)
+	// Capacity is bounded by the records that actually exist in the pinned
+	// window, never by the caller's page size alone: page size caps how many
+	// matching records come back, it is not an allocation request. A huge
+	// page size (up to math.MaxInt) against a short chain must finish
+	// normally instead of trying to make room for records that are not there.
+	capHint := endSeq - startSeq + 1
+	if pageSize < capHint {
+		capHint = pageSize
+	}
+	out := make([]AuditRecord, 0, capHint)
 	i := startSeq
 	for ; i <= endSeq && len(out) < pageSize; i++ {
 		r := st.audit[i-1]

@@ -600,7 +600,10 @@ func spreadBatches(selected []string, domains map[string]string, batchSize int) 
 	remaining := append([]string(nil), selected...)
 	batches := []Batch{}
 	for len(remaining) > 0 {
-		used := make(map[string]struct{}, batchSize)
+		// The map never holds more entries than there are remaining clusters,
+		// so size it by them — never by batchSize, which is only an upper
+		// bound and may be a huge legal value (e.g. 1e9 meaning "no limit").
+		used := make(map[string]struct{}, min(batchSize, len(remaining)))
 		batch := []string{}
 		deferred := []string{}
 		for _, id := range remaining {

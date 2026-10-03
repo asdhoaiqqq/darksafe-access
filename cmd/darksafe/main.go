@@ -3,48 +3,48 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
-
-	"github.com/asdhoaiqqq/darksafe-access/darksafe"
 )
 
 func main() {
+	os.Exit(dispatch(os.Args, os.Stdout, os.Stderr))
+}
+
+// dispatch selects one subcommand from the full argument vector
+// (args[0] is the program name). With no arguments it runs the demo,
+// preserving the original no-argument behavior.
+func dispatch(args []string, stdout, stderr io.Writer) int {
 	command := "demo"
-	if len(os.Args) > 1 {
-		command = os.Args[1]
+	if len(args) > 1 {
+		command = args[1]
 	}
 	switch command {
+	case "review":
+		return runReview(args[1:], stdout, stderr)
 	case "demo":
-		runDemo()
+		runDemo(stdout)
+		return 0
 	case "version":
-		fmt.Println("darksafe 0.1.0")
+		fmt.Fprintln(stdout, "darksafe 0.1.0")
+		return 0
 	case "help", "-h", "--help":
-		usage()
+		usage(stdout)
+		return 0
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n", command)
-		usage()
-		os.Exit(2)
+		fmt.Fprintf(stderr, "unknown command %q\n", command)
+		usage(stderr)
+		return 2
 	}
 }
 
-func usage() {
-	fmt.Println("usage: darksafe [demo|version|help]")
-}
-
-func runDemo() {
-	subjects := []darksafe.Subject{
-		{ID: "u-1001", Kind: "user", Roles: []string{"org/payments/ledger:read"}},
-		{ID: "svc-batch", Kind: "service", Roles: []string{"owner"}},
-		{ID: "u-1002", Kind: "user", Disabled: true},
-	}
-	resource := darksafe.Resource{ID: "ledger-main", Scope: "org/payments/ledger"}
-	allowed := 0
-	for _, subject := range subjects {
-		decision := darksafe.Access(subject, resource, "read")
-		if decision.Allowed {
-			allowed++
-		}
-		fmt.Printf("subject=%s allowed=%v reason=%s\n", subject.ID, decision.Allowed, decision.Reason)
-	}
-	fmt.Printf("summary: %d of %d subjects allowed\n", allowed, len(subjects))
+func usage(w io.Writer) {
+	fmt.Fprintln(w, "usage: darksafe [demo|version|review|help]")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "commands:")
+	fmt.Fprintln(w, "  demo      run the built-in no-argument demonstration (default)")
+	fmt.Fprintln(w, "  version   print the version")
+	fmt.Fprintln(w, "  review    review one archived access decision offline;")
+	fmt.Fprintln(w, "            run `darksafe review --help` for its arguments and an example")
+	fmt.Fprintln(w, "  help      show this help")
 }

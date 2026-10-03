@@ -373,18 +373,30 @@ func cloneChange(c *PolicyChange) *PolicyChange {
 	return &cp
 }
 
+// cloneStrings returns a detached copy of a string slice while preserving
+// its nil-versus-empty shape: a nil slice stays nil, and every non-nil
+// slice, including a non-nil empty slice that still carries spare capacity,
+// receives its own backing array. Copying only when len > 0 is not enough:
+// a caller may submit make([]string, 0, 4), and aliasing that array into a
+// stored record would let an append to one handed-out copy overwrite the
+// first element of every other copy that shares it.
+func cloneStrings(in []string) []string {
+	if in == nil {
+		return nil
+	}
+	return append([]string{}, in...)
+}
+
 // cloneDecision returns a detached copy of a decision payload.
 func cloneDecision(d *DecisionRecord) *DecisionRecord {
 	if d == nil {
 		return nil
 	}
 	cp := *d
-	if len(d.Decision.Matched) > 0 {
-		cp.Decision.Matched = append([]string(nil), d.Decision.Matched...)
-	}
-	if len(d.Request.Subject.Roles) > 0 {
-		cp.Request.Subject.Roles = append([]string(nil), d.Request.Subject.Roles...)
-	}
+	// Detach on non-nil rather than on len > 0 so empty-but-capacious lists
+	// are independent copies too; nil lists stay nil.
+	cp.Decision.Matched = cloneStrings(d.Decision.Matched)
+	cp.Request.Subject.Roles = cloneStrings(d.Request.Subject.Roles)
 	return &cp
 }
 

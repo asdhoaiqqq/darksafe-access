@@ -354,9 +354,9 @@ func TestEmptyListShapesAndMatchlessDenialsPreserved(t *testing.T) {
 	}
 
 	nilReq := request("acme", "u1", "r1", "org/a", "read") // roles left nil
-	nilDeny := s.Decide("acme", nilReq)                     // seq 2
+	nilDeny := s.Decide("acme", nilReq)                    // seq 2
 	emptyReq := request("acme", "u2", "r1", "org/a", "read")
-	emptyReq.Subject.Roles = []string{} // explicitly empty
+	emptyReq.Subject.Roles = []string{}     // explicitly empty
 	emptyDeny := s.Decide("acme", emptyReq) // seq 3
 	disabledReq := request("acme", "u3", "r1", "org/a", "read")
 	disabledReq.Subject.Disabled = true
@@ -570,5 +570,253 @@ func TestNonEmptyListsPreserveChineseSpacesAndRawBytes(t *testing.T) {
 	// Nothing here appended records.
 	if got := len(drainAudit(t, s, "acme", "", "")); got != 3 {
 		t.Fatalf("records = %d, want 3; reads and edits must not append", got)
+	}
+}
+
+// capaciousEmptyRoles returns a NON-NIL role list with no elements but spare
+// capacity. It is the shape that exposed the isolation bug: cloning lists
+// only when len > 0 let this list's backing array be shared between the
+// stored record, every query/page/export copy and the caller's own slice, so
+// appending a role to one handed-out copy overwrote the first role slot of
+// every other copy.
+func capaciousEmptyRoles() []string {
+	return make([]string, 0, 4)
+}
+
+// requireNonNilEmptyRoles fails unless the role list is a non-nil, empty
+// slice — the shape that must stay distinct from nil.
+func requireNonNilEmptyRoles(t *testing.T, label string, roles []string) {
+	t.Helper()
+	if roles == nil || len(roles) != 0 {
+		t.Fatalf("%s roles = %v, want non-nil empty", label, roles)
+	}
+}
+
+// TestEmptyRoleListWithCapacityIsolated is the regression for capacious
+// empty role lists. A subject completes an allow, a no-match denial and a
+// disabled-subject envelope denial, each with a non-nil empty role list that
+// still has spare capacity. The caller obtains audit material two at a time
+// from the first query, a later page and a full export, and appends a
+// distinct temporary role to each copy; appending to one result must never
+// overwrite another's role, and appending to the originally submitted list
+// must reach no material. A fresh read still shows a non-nil empty list with
+// the unchanged decision (allowed, reason, matched policies, version); nil
+// roles stay nil. Checkpoints and fingerprints are unchanged by the fix, the
+// material still verifies, archives, reads back and reviews offline.
+func TestEmptyRoleListWithCapacityIsolated(t *testing.T) {
+	s := NewStore()
+	policies := []Policy{{ID: "p-allow", Subject: "u1", Action: "read", Scope: "org/a", Effect: EffectAllow}}
+	if _, err := s.Publish("acme", 0, policies); err != nil { // seq 1, v1
+		t.Fatal(err)
+	}
+
+	allowReq := request("acme", "u1", "r1", "org/a", "read")
+	allowReq.Subject.Roles = capaciousEmptyRoles()
+	denyReq := request("acme", "u9", "r1", "org/a", "read")
+	denyReq.Subject.Roles = capaciousEmptyRoles()
+	disabledReq := request("acme", "u3", "r1", "org/a", "read")
+	disabledReq.Subject.Roles = capaciousEmptyRoles()
+	disabledReq.Subject.Disabled = true
+
+	allowD := s.Decide("acme", allowReq)     // seq 2, allowed
+	denyD := s.Decide("acme", denyReq)       // seq 3, no-match denial
+	envDeny := s.Decide("acme", disabledReq) // seq 4, envelope denial
+	if !allowD.Allowed || allowD.Version != 1 || !reflect.DeepEqual(allowD.Matched, []string{"p-allow"}) {
+		t.Fatalf("setup allow = %+v", allowD)
+	}
+	if denyD.Allowed || denyD.Reason != "no matching allow policy" || denyD.Version != 1 || denyD.Matched == nil {
+		t.Fatalf("setup no-match denial = %+v, want non-nil empty matched", denyD)
+	}
+	if envDeny.Allowed || envDeny.Reason != "subject is disabled" || envDeny.Version != 0 || envDeny.Matched != nil {
+		t.Fatalf("setup envelope denial = %+v, want nil matched, version 0", envDeny)
+	}
+	want := map[int]Decision{
+		2: cloneDecisionValue(allowD),
+		3: cloneDecisionValue(denyD),
+		4: cloneDecisionValue(envDeny),
+	}
+
+	// The caller later appends to the lists it submitted; no audit material
+	// may observe that.
+	allowReq.Subject.Roles = append(allowReq.Subject.Roles, "caller-allow-role")
+	denyReq.Subject.Roles = append(denyReq.Subject.Roles, "caller-deny-role")
+	disabledReq.Subject.Roles = append(disabledReq.Subject.Roles, "caller-disabled-role")
+
+	exportA, cp, err := s.AuditExport("acme", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exportB, _, err := s.AuditExport("acme", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyAudit("acme", exportA, cp); err != nil {
+		t.Fatalf("export chain: %v", err)
+	}
+
+	// Page by decision kind: seq 1 is the publish (filtered out), so a
+	// pageSize of 1 puts only seq 2 on the first page and seq 3, 4 on the
+	// later page.
+	pageA, err := s.AuditQuery("acme", 1, 1, AuditDecision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pageB, err := s.AuditPage(pageA.Checkpoint, pageA.Next, 2, AuditDecision, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(pageA.Records) != 1 || pageA.Records[0].Seq != 2 {
+		t.Fatalf("first query page layout = %+v", pageA.Records)
+	}
+	if len(pageB.Records) != 2 || pageB.Records[0].Seq != 3 || pageB.Records[1].Seq != 4 || pageB.Next != 0 {
+		t.Fatalf("later page layout = %+v next=%d", pageB.Records, pageB.Next)
+	}
+
+	// Every read shows a non-nil empty role list.
+	for _, seq := range []int{2, 3, 4} {
+		requireNonNilEmptyRoles(t, "exportA", recordBySeq(t, exportA, seq).Decision.Request.Subject.Roles)
+		requireNonNilEmptyRoles(t, "exportB", recordBySeq(t, exportB, seq).Decision.Request.Subject.Roles)
+	}
+	requireNonNilEmptyRoles(t, "query seq2", pageA.Records[0].Decision.Request.Subject.Roles)
+	requireNonNilEmptyRoles(t, "page seq3", pageB.Records[0].Decision.Request.Subject.Roles)
+	requireNonNilEmptyRoles(t, "page seq4", pageB.Records[1].Decision.Request.Subject.Roles)
+
+	// Append a distinct temporary role to the same decision in two export
+	// copies. A shared backing array makes the second append overwrite the
+	// first — exactly the reported defect.
+	aRoles := recordBySeq(t, exportA, 2).Decision.Request.Subject.Roles
+	bRoles := recordBySeq(t, exportB, 2).Decision.Request.Subject.Roles
+	aRoles = append(aRoles, "临时角色甲")
+	bRoles = append(bRoles, "临时角色乙")
+	// Assign back: append may or may not reuse the slice header, but the
+	// record copy must be the one the caller is editing.
+	recordBySeq(t, exportA, 2).Decision.Request.Subject.Roles = aRoles
+	recordBySeq(t, exportB, 2).Decision.Request.Subject.Roles = bRoles
+	if got := recordBySeq(t, exportA, 2).Decision.Request.Subject.Roles; !reflect.DeepEqual(got, []string{"临时角色甲"}) {
+		t.Fatalf("export A seq2 roles = %q, want [临时角色甲]", got)
+	}
+	if got := recordBySeq(t, exportB, 2).Decision.Request.Subject.Roles; !reflect.DeepEqual(got, []string{"临时角色乙"}) {
+		t.Fatalf("export B seq2 roles = %q, want [临时角色乙]; read copies shared storage", got)
+	}
+
+	// Query page and later page each get their own appendable copy.
+	pageA.Records[0].Decision.Request.Subject.Roles = append(pageA.Records[0].Decision.Request.Subject.Roles, "query-role")
+	pageB.Records[0].Decision.Request.Subject.Roles = append(pageB.Records[0].Decision.Request.Subject.Roles, "page-deny-role")
+	pageB.Records[1].Decision.Request.Subject.Roles = append(pageB.Records[1].Decision.Request.Subject.Roles, "page-disabled-role")
+
+	// Cross-read isolation: an edit anywhere is invisible to every other
+	// read of the same sequence, and the caller's post-hoc appends never
+	// appear.
+	untouched := []struct {
+		label string
+		roles []string
+	}{
+		{"exportA seq3", recordBySeq(t, exportA, 3).Decision.Request.Subject.Roles},
+		{"exportA seq4", recordBySeq(t, exportA, 4).Decision.Request.Subject.Roles},
+		{"exportB seq3", recordBySeq(t, exportB, 3).Decision.Request.Subject.Roles},
+		{"exportB seq4", recordBySeq(t, exportB, 4).Decision.Request.Subject.Roles},
+		{"query seq2", pageA.Records[0].Decision.Request.Subject.Roles},
+		{"page seq3", pageB.Records[0].Decision.Request.Subject.Roles},
+		{"page seq4", pageB.Records[1].Decision.Request.Subject.Roles},
+	}
+	for i, c := range untouched {
+		var leaked bool
+		switch {
+		case i <= 3:
+			leaked = c.roles == nil || len(c.roles) != 0
+		default:
+			leaked = len(c.roles) != 1
+		}
+		if leaked {
+			t.Fatalf("%s roles = %q, other copies' edits leaked across reads", c.label, c.roles)
+		}
+	}
+	for name, recs := range map[string][]AuditRecord{"exportA": exportA, "exportB": exportB} {
+		for _, seq := range []int{2, 3, 4} {
+			for _, got := range recordBySeq(t, recs, seq).Decision.Request.Subject.Roles {
+				if strings.HasPrefix(got, "caller-") {
+					t.Fatalf("%s seq %d leaked the caller's post-hoc role %q", name, seq, got)
+				}
+			}
+		}
+	}
+
+	// A fresh read after all edits still shows non-nil empty lists, the same
+	// checkpoint and the unchanged decision content.
+	fresh, freshCP, err := s.AuditExport("acme", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freshCP != cp {
+		t.Fatalf("checkpoint changed after caller edits: %+v vs %+v", freshCP, cp)
+	}
+	if err := VerifyAudit("acme", fresh, cp); err != nil {
+		t.Fatalf("fresh export fails original checkpoint: %v", err)
+	}
+	for _, seq := range []int{2, 3, 4} {
+		r := recordBySeq(t, fresh, seq)
+		requireNonNilEmptyRoles(t, "fresh", r.Decision.Request.Subject.Roles)
+		if !decisionsEqual(r.Decision.Decision, want[seq]) {
+			t.Fatalf("fresh seq %d decision = %+v, want %+v", seq, r.Decision.Decision, want[seq])
+		}
+		if got, err := s.RecheckDecision("acme", seq); err != nil || !decisionsEqual(got, want[seq]) {
+			t.Fatalf("online recheck seq %d = %+v, %v", seq, got, err)
+		}
+		if rv, err := RecheckDecisionOffline("acme", fresh, cp, seq); err != nil || !rv.Consistent {
+			t.Fatalf("offline review seq %d = %+v, %v", seq, rv, err)
+		}
+	}
+	// Offline review on role-edited material must refuse it: roles are part
+	// of the fingerprint, so that copy is tampered material and fails the
+	// whole-material chain check with ErrInvalidRange (never silently
+	// reviewed). The store's own history is unaffected.
+	if _, err := RecheckDecisionOffline("acme", exportB, cp, 2); !errors.Is(err, ErrInvalidRange) {
+		t.Fatalf("offline review of role-edited material err = %v, want ErrInvalidRange", err)
+	}
+
+	// Archive round trip preserves the non-nil empty shape and each decode is
+	// an independent copy.
+	archive, err := EncodeAuditArchive("acme", fresh, cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d1, err := DecodeAuditArchive(archive, "acme", cp)
+	if err != nil {
+		t.Fatalf("decode 1: %v", err)
+	}
+	d2, err := DecodeAuditArchive(archive, "acme", cp)
+	if err != nil {
+		t.Fatalf("decode 2: %v", err)
+	}
+	for _, seq := range []int{2, 3, 4} {
+		requireNonNilEmptyRoles(t, "archive d1", recordBySeq(t, d1, seq).Decision.Request.Subject.Roles)
+		requireNonNilEmptyRoles(t, "archive d2", recordBySeq(t, d2, seq).Decision.Request.Subject.Roles)
+	}
+	recordBySeq(t, d1, 2).Decision.Request.Subject.Roles = append(recordBySeq(t, d1, 2).Decision.Request.Subject.Roles, "归档角色甲")
+	recordBySeq(t, d2, 2).Decision.Request.Subject.Roles = append(recordBySeq(t, d2, 2).Decision.Request.Subject.Roles, "归档角色乙")
+	if got := recordBySeq(t, d1, 2).Decision.Request.Subject.Roles; !reflect.DeepEqual(got, []string{"归档角色甲"}) {
+		t.Fatalf("archive d1 roles = %q", got)
+	}
+	if got := recordBySeq(t, d2, 2).Decision.Request.Subject.Roles; !reflect.DeepEqual(got, []string{"归档角色乙"}) {
+		t.Fatalf("archive d2 roles = %q; decodes shared storage", got)
+	}
+
+	// nil roles stay genuinely nil and never collapse to empty.
+	nilReq := request("acme", "u7", "r1", "org/a", "read") // roles left nil
+	s.Decide("acme", nilReq)                               // seq 5
+	nilExport, _, err := s.AuditExport("acme", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := recordBySeq(t, nilExport, 5).Decision.Request.Subject.Roles; got != nil {
+		t.Fatalf("nil roles read back as %v", got)
+	}
+
+	// Reads and caller edits appended nothing and changed no version.
+	if got := len(drainAudit(t, s, "acme", "", "")); got != 5 {
+		t.Fatalf("records = %d, want 5", got)
+	}
+	if v := s.CurrentVersion("acme"); v != 1 {
+		t.Fatalf("current version = %d, want 1", v)
 	}
 }

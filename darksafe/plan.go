@@ -89,10 +89,15 @@ func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 }
 
 // duplicateMemberError reports a JSON object whose member name appears more
-// than once. Path is a JSONPath-style location: "$" for the document root,
+// than once. Field is the decoded duplicate name; Path locates the containing
+// object in a JSONPath-style form rooted at "$": "$" for the document root,
 // "$.clusters[1]" for a cluster, "$.clusters[0].tags" for a tag object,
 // "$.include[2]" / "$.exclude[1]" for a condition, and "$.foo.bar[0]" for
-// objects nested inside unknown fields.
+// objects nested inside unknown fields. Member names that are not plain
+// identifiers use a bracket step holding a JSON string — $["meta.info"] for a
+// top-level member literally named "meta.info" (distinct from $.meta.info),
+// $["zone[0]"], $[""] — so the characters of a name can never be read as a
+// hierarchy step or array index.
 type duplicateMemberError struct {
 	field string
 	path  string
@@ -186,10 +191,57 @@ func walkJSONObject(dec *json.Decoder, path string) error {
 			}
 			return fmt.Errorf("JSON 格式错误: %w", err)
 		}
-		if err := walkJSONValueToken(dec, path+"."+key, vtok); err != nil {
+		if err := walkJSONValueToken(dec, appendObjectStep(path, key), vtok); err != nil {
 			return err
 		}
 	}
+}
+
+// appendObjectStep extends path with an object member step named key. A key
+// that is a plain identifier — starting with an ASCII letter or underscore
+// and containing only ASCII letters, digits and underscores — keeps dot
+// notation, so existing positions like "$.clusters[0].tags" are unchanged.
+// Any other key (dots, brackets, leading digits, spaces, quotes, backslashes,
+// control characters, empty string, …) is rendered as a bracket step holding
+// a JSON-quoted string, e.g. $["meta.info"], $["zone[0]"], $[""]. The quoted
+// form decodes back to exactly the decoded member name, so a path always
+// identifies one unambiguous location regardless of the characters it uses.
+func appendObjectStep(path, key string) string {
+	if isIdentifierName(key) {
+		return path + "." + key
+	}
+	encoded, err := json.Marshal(key)
+	if err != nil {
+		// json.Marshal of a string cannot fail; keep a deterministic fallback
+		// rather than panicking deep inside the parse walk.
+		encoded = []byte(`""`)
+	}
+	return path + "[" + string(encoded) + "]"
+}
+
+// isIdentifierName reports whether key may safely appear after a dot: an
+// ASCII letter or underscore followed by ASCII letters, digits or
+// underscores only. The check is byte-wise and deliberately ASCII-only, so
+// names such as "env" qualify while "meta.info", "a b", "0x", "café" and ""
+// fall through to bracket notation.
+func isIdentifierName(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		switch {
+		case c == '_' ||
+			(c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z'):
+			// first or later position: always allowed
+		case i > 0 && (c >= '0' && c <= '9'):
+			// digits allowed after the first character
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func walkJSONArray(dec *json.Decoder, path string) error {

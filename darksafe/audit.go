@@ -715,19 +715,17 @@ func (s *Store) RecheckDecision(org string, seq int) (Decision, error) {
 	}
 	req := rec.Decision.Request
 	version := rec.Decision.Decision.Version
-	if version == 0 {
-		// The original decision evaluated no published version: requests
-		// rejected at the envelope, or an organization with no publish yet.
-		if d, ok := checkRequest(org, req); !ok {
-			return d, nil
+	// The replayed judgment is shared with offline review; the online entry
+	// point only supplies the material, namely the live store's immutable
+	// snapshot of the version the decision actually used. Later publishes or
+	// rollbacks cannot alter the result.
+	return replayDecision(org, req, version, func(want int) ([]Policy, error) {
+		src, ok := st.versions[want]
+		if !ok {
+			// A decision's version is immutable and never deleted; its absence
+			// indicates store tampering rather than normal operation.
+			return nil, fmt.Errorf("%w: decision used version %d, which no longer exists", ErrVersionNotFound, want)
 		}
-		return Decision{Allowed: false, Reason: "organization has no published version"}, nil
-	}
-	src, ok := st.versions[version]
-	if !ok {
-		// A decision's version is immutable and never deleted; its absence
-		// indicates store tampering rather than normal operation.
-		return Decision{}, fmt.Errorf("%w: decision used version %d, which no longer exists", ErrVersionNotFound, version)
-	}
-	return evaluate(req, append([]Policy(nil), src...), version), nil
+		return append([]Policy(nil), src...), nil
+	})
 }

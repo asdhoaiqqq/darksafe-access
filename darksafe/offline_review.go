@@ -88,41 +88,28 @@ func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, se
 	req.Subject.Roles = cloneStrings(req.Subject.Roles)
 	version := original.Version
 
-	var recomputed Decision
-	if version == 0 {
-		// The original evaluation used no published version: replay the
-		// envelope rejections exactly, then the not-yet-published denial.
-		if d, ok := checkRequest(org, req); !ok {
-			recomputed = d
-		} else {
-			recomputed = Decision{Allowed: false, Reason: "organization has no published version"}
+	// The replayed judgment is shared with online recheck; the offline entry
+	// point only supplies the material: a same-organization policy change
+	// record positioned before the target, carrying the version's full
+	// content. That lookup happens inside replayDecision before any envelope
+	// check, so a request the envelope rejects cannot mask a missing version
+	// with an ordinary denial, and a newer version is never substituted.
+	recomputed, err := replayDecision(org, req, version, func(want int) ([]Policy, error) {
+		policies, found := policiesBefore(records, seq-1, want)
+		if found {
+			return policies, nil
 		}
-	} else {
-		// The version's full content must travel in a same-organization
-		// policy change record positioned before the decision. That check
-		// comes first: a request the envelope rejects must not mask a
-		// missing version with an ordinary denial result.
-		policies, found := policiesBefore(records, seq-1, version)
-		if !found {
-			if _, later := policiesBefore(records, len(records), version); later {
-				return OfflineDecisionReview{}, fmt.Errorf(
-					"%w: decision at sequence %d used version %d, whose change record appears only after it",
-					ErrVersionNotFound, seq, version)
-			}
-			return OfflineDecisionReview{}, fmt.Errorf(
-				"%w: decision at sequence %d used version %d, which has no policy change record in the export",
-				ErrVersionNotFound, seq, version)
+		if _, later := policiesBefore(records, len(records), want); later {
+			return nil, fmt.Errorf(
+				"%w: decision at sequence %d used version %d, whose change record appears only after it",
+				ErrVersionNotFound, seq, want)
 		}
-		// The version exists as claimed, but chain integrity does not imply
-		// the request was admissible: re-run the same envelope checks the
-		// online decision runs before any policy is consulted. A rejection
-		// here evaluates no policies, hence version 0 and no matches, even
-		// when the version holds a fully matching allow policy.
-		if d, ok := checkRequest(org, req); !ok {
-			recomputed = d
-		} else {
-			recomputed = evaluate(req, policies, version)
-		}
+		return nil, fmt.Errorf(
+			"%w: decision at sequence %d used version %d, which has no policy change record in the export",
+			ErrVersionNotFound, seq, want)
+	})
+	if err != nil {
+		return OfflineDecisionReview{}, err
 	}
 
 	return OfflineDecisionReview{

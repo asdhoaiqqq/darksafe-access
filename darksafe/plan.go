@@ -108,8 +108,12 @@ func (e *duplicateMemberError) Error() string {
 // " env" and "env", are different. The first duplicate encountered in file
 // order is reported: the walk is depth-first in document order, so the
 // second occurrence that appears earliest wins, regardless of value type.
+// Numbers are read as json.Number so that syntactically valid values that
+// overflow float64 (e.g. 1e400) in fields irrelevant to the walk do not
+// abort it; only the JSON grammar itself is enforced here.
 func checkDuplicateMembers(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.UseNumber()
 	if err := walkJSONValue(dec, "$"); err != nil {
 		return err
 	}

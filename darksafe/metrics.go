@@ -97,6 +97,16 @@ func NewMetricStore() *MetricStore {
 	return &MetricStore{series: make(map[seriesID]*storedSeries)}
 }
 
+// cloneLabels 返回标签集合的独立副本；空标签仍复制为非 nil 的空集合，
+// 调用方对副本的增删改不影响存储中的序列身份。
+func cloneLabels(labels map[string]string) map[string]string {
+	out := make(map[string]string, len(labels))
+	for k, v := range labels {
+		out[k] = v
+	}
+	return out
+}
+
 func sortedKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -419,7 +429,9 @@ func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineE
 			Error: fmt.Sprintf("conflict: series %s at timestamp %d already has value %s, submitted %s",
 				ref, ts, formatFloat(existing), formatFloat(submitted)),
 			Conflict: &Conflict{
-				Series:    ref,
+				// 标签必须复制：冲突结果是本次失败的独立记录，
+				// 调用方修改它不能改动已存序列的身份。
+				Series:    SeriesRef{Name: ref.Name, Labels: cloneLabels(ref.Labels)},
 				Timestamp: ts,
 				Existing:  existing,
 				Submitted: submitted,
@@ -685,10 +697,7 @@ func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
 		for i, ts := range tsList {
 			values[i] = sr.points[ts]
 		}
-		labels := make(map[string]string, len(sr.ref.Labels))
-		for k, v := range sr.ref.Labels {
-			labels[k] = v
-		}
+		labels := cloneLabels(sr.ref.Labels)
 		out = append(out, QuerySeries{
 			Name:    sr.ref.Name,
 			Labels:  labels,
@@ -822,11 +831,7 @@ func (s *MetricStore) snapshot(added, duplicates int) *BatchResult {
 		for i, ts := range tsList {
 			points[i] = Point{Timestamp: ts, Value: sr.points[ts]}
 		}
-		labels := make(map[string]string, len(sr.ref.Labels))
-		for k, v := range sr.ref.Labels {
-			labels[k] = v
-		}
-		views = append(views, SeriesView{Name: sr.ref.Name, Labels: labels, Points: points})
+		views = append(views, SeriesView{Name: sr.ref.Name, Labels: cloneLabels(sr.ref.Labels), Points: points})
 	}
 	sort.Slice(views, func(i, j int) bool {
 		if views[i].Name != views[j].Name {

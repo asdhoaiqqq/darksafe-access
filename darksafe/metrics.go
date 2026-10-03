@@ -64,6 +64,21 @@ type Conflict struct {
 	Submitted float64   `json:"submitted"`
 }
 
+// MaxLineBytes 是 ingest 单行原始输入字节数上限（64 MiB），不含行分隔符。
+// 恰好达到上限的行仍正常进入写入或查询处理；只有严格超过上限才因大小失败。
+const MaxLineBytes = 64 * 1024 * 1024
+
+// NewLineSizeError 返回超长行的结构化错误：只说明超过单行大小上限及上限数值，
+// 不带采样位置 index，也不带 conflict。行号由命令入口另行填入。
+func NewLineSizeError() *LineError {
+	return &LineError{
+		Status: "error",
+		Error: fmt.Sprintf(
+			"line too long: raw input line exceeds the single-line size limit of %d bytes (64 MiB), line separator excluded",
+			MaxLineBytes),
+	}
+}
+
 // LineError 是一行（一批）输入失败后的结构化结果。
 // Line 由命令入口按从 1 开始的行号填入；Index 为采样点在批次内从 1 开始的位置，
 // 整行 JSON 无法解析或不是数组时 Index 为零并省略。

@@ -330,38 +330,87 @@ func ValidateReleaseInput(in ReleasePlanInput) error {
 	return nil
 }
 
-// validateTagKeys checks tag keys in ascending order for deterministic errors.
-func validateTagKeys(clusterIndex int, tags map[string]string) error {
-	keys := make([]string, 0, len(tags))
-	for k := range tags {
+// Label rules shared by the JSON parser and ValidateReleaseInput: tag and
+// condition keys are used exactly as written (never trimmed or case-folded)
+// and must be non-empty; values are exact-match strings and an empty string
+// is a valid value. Keys are always examined in ascending order so that a
+// map with several problems reports the same one every time.
+
+// sortedKeys returns the keys of m in ascending order.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
-	for _, k := range keys {
+	return keys
+}
+
+// checkTagKeys applies the shared label-key rule to m, calling emptyKey to
+// build the caller-specific error for the first empty key found in ascending
+// key order.
+func checkTagKeys(m map[string]string, emptyKey func() error) error {
+	for _, k := range sortedKeys(m) {
 		if k == "" {
-			return fmt.Errorf("clusters[%d] 的标签键不能为空", clusterIndex)
+			return emptyKey()
 		}
 	}
 	return nil
 }
 
-// validateConditionKeys checks that every condition is non-empty and has only
-// non-empty keys; conditions are visited in original order and keys in
-// ascending order for deterministic errors.
+// decodeTags converts a decoded JSON object into a tag set under the shared
+// label rules: keys must be non-empty and values must be strings, both
+// checked in ascending key order so the reported field is deterministic.
+// Values are copied exactly as written; empty strings are kept. emptyKey and
+// valueType build the caller-specific errors.
+func decodeTags(obj map[string]any, emptyKey func() error, valueType func(key string) error) (map[string]string, error) {
+	tags := make(map[string]string, len(obj))
+	for _, k := range sortedKeys(obj) {
+		if k == "" {
+			return nil, emptyKey()
+		}
+		sv, ok := obj[k].(string)
+		if !ok {
+			return nil, valueType(k)
+		}
+		tags[k] = sv
+	}
+	return tags, nil
+}
+
+// Condition errors are identical on the JSON and Go-config paths, so both
+// build them through these constructors to keep the wording in one place.
+
+func errEmptyCondition(field string, i int) error {
+	return fmt.Errorf("%s[%d] 不能为空条件对象", field, i)
+}
+
+func errEmptyConditionKey(field string, i int) error {
+	return fmt.Errorf("%s[%d] 的标签键不能为空", field, i)
+}
+
+func errConditionValueType(field string, i int, key string) error {
+	return fmt.Errorf("%s[%d] 的标签 %q 值必须是字符串", field, i, key)
+}
+
+// validateTagKeys checks cluster tag keys against the shared label rules.
+func validateTagKeys(clusterIndex int, tags map[string]string) error {
+	return checkTagKeys(tags, func() error {
+		return fmt.Errorf("clusters[%d] 的标签键不能为空", clusterIndex)
+	})
+}
+
+// validateConditionKeys checks that every condition is non-empty and
+// satisfies the shared label rules; conditions are visited in original order.
 func validateConditionKeys(field string, conds []LabelCondition) error {
 	for i, cond := range conds {
 		if len(cond) == 0 {
-			return fmt.Errorf("%s[%d] 不能为空条件对象", field, i)
+			return errEmptyCondition(field, i)
 		}
-		keys := make([]string, 0, len(cond))
-		for k := range cond {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if k == "" {
-				return fmt.Errorf("%s[%d] 的标签键不能为空", field, i)
-			}
+		if err := checkTagKeys(cond, func() error {
+			return errEmptyConditionKey(field, i)
+		}); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -437,20 +486,11 @@ func parseClusters(v any) ([]Cluster, error) {
 			if !ok {
 				return nil, fmt.Errorf("集群 %q 的 \"tags\" 必须是对象", id)
 			}
-			keys := make([]string, 0, len(tm))
-			for k := range tm {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
-				if k == "" {
-					return nil, fmt.Errorf("集群 %q 的标签键不能为空", id)
-				}
-				sv, ok := tm[k].(string)
-				if !ok {
-					return nil, fmt.Errorf("集群 %q 的标签 %q 值必须是字符串", id, k)
-				}
-				tags[k] = sv
+			tags, err = decodeTags(tm,
+				func() error { return fmt.Errorf("集群 %q 的标签键不能为空", id) },
+				func(k string) error { return fmt.Errorf("集群 %q 的标签 %q 值必须是字符串", id, k) })
+			if err != nil {
+				return nil, err
 			}
 		}
 
@@ -474,25 +514,15 @@ func parseConditions(v any, field string) ([]LabelCondition, error) {
 			return nil, fmt.Errorf("%s[%d] 必须是对象", field, i)
 		}
 		if len(obj) == 0 {
-			return nil, fmt.Errorf("%s[%d] 不能为空条件对象", field, i)
+			return nil, errEmptyCondition(field, i)
 		}
-		cond := LabelCondition{}
-		keys := make([]string, 0, len(obj))
-		for k := range obj {
-			keys = append(keys, k)
+		cond, err := decodeTags(obj,
+			func() error { return errEmptyConditionKey(field, i) },
+			func(k string) error { return errConditionValueType(field, i, k) })
+		if err != nil {
+			return nil, err
 		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			if k == "" {
-				return nil, fmt.Errorf("%s[%d] 的标签键不能为空", field, i)
-			}
-			sv, ok := obj[k].(string)
-			if !ok {
-				return nil, fmt.Errorf("%s[%d] 的标签 %q 值必须是字符串", field, i, k)
-			}
-			cond[k] = sv
-		}
-		conds = append(conds, cond)
+		conds = append(conds, LabelCondition(cond))
 	}
 	return conds, nil
 }

@@ -11,6 +11,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 // Point 是一条序列上某个时间戳的采样值。
@@ -216,9 +218,96 @@ func (s *MetricStore) QueryLine(line string) (*QueryResult, *LineError) {
 	return s.queryFromObject(top)
 }
 
+// validateLineText 在 JSON 解析之前强制整行文本合法：原始字节必须是合法
+// UTF-8，字符串内的 Unicode 转义必须表示有效字符。编码层/JSON 解析器会把
+// 非法字节或未配对代理项静默替换成 U+FFFD，使损坏文本混入合法序列（被误判为
+// 重复、冲突或错误命中查询），因此这里一律拒绝而不是修补后继续。
+//
+// 逐字节扫描、只在字符串内部识别转义：跳过词法空白与全部非字符串 token。
+// 被转义的反斜杠（\\）后的 "uXXXX" 只是普通文本，不会被当成 Unicode 转义。
+func validateLineText(line string) *LineError {
+	if !utf8.ValidString(line) {
+		return &LineError{Status: "error", Error: "invalid JSON: input is not valid UTF-8 text"}
+	}
+	inString := false
+	for i := 0; i < len(line); i++ {
+		c := line[i]
+		if !inString {
+			if c == '"' {
+				inString = true
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = false
+		case '\\':
+			if i+1 >= len(line) {
+				break // 悬空反斜杠：交给 JSON 解析器报错
+			}
+			if line[i+1] != 'u' {
+				i++ // 单字符转义（\\、\"、\n 等），跳过被转义字符
+				continue
+			}
+			// i 指向 '\'，i+1 指向 'u'；转义占据 i..i+5。
+			r, size := decodeJSONHexEscape(line, i+1)
+			if size == 0 {
+				return &LineError{Status: "error", Error: "invalid JSON: invalid Unicode escape sequence"}
+			}
+			if !utf16.IsSurrogate(r) {
+				i += 5
+				continue
+			}
+			if r >= 0xDC00 {
+				// 单独出现的低代理项。
+				return &LineError{Status: "error", Error: "invalid JSON: unpaired Unicode surrogate escape"}
+			}
+			// 高代理项后必须紧接另一个表示低代理项的 \uXXXX 转义。
+			loPos := i + 6 // 第一个转义之后的字符位置
+			if loPos+1 >= len(line) || line[loPos] != '\\' || line[loPos+1] != 'u' {
+				return &LineError{Status: "error", Error: "invalid JSON: unpaired Unicode surrogate escape"}
+			}
+			lo, loSize := decodeJSONHexEscape(line, loPos+1)
+			if loSize == 0 || lo < 0xDC00 || lo > 0xDFFF {
+				return &LineError{Status: "error", Error: "invalid JSON: unpaired Unicode surrogate escape"}
+			}
+			i = loPos + loSize // 跳到第二转义的最后一个十六进制位，循环自增后越出
+		}
+	}
+	return nil
+}
+
+// decodeJSONHexEscape 解析 line[pos:] 处的 "uXXXX"（pos 指向 'u'），
+// 返回其码元与占用字节数（固定为 5）；不足四个十六进制数字时 size 为 0。
+func decodeJSONHexEscape(line string, pos int) (rune, int) {
+	if pos+4 >= len(line) {
+		return 0, 0
+	}
+	var v rune
+	for j := pos + 1; j <= pos+4; j++ {
+		c := line[j]
+		var d rune
+		switch {
+		case c >= '0' && c <= '9':
+			d = rune(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = rune(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = rune(c-'A') + 10
+		default:
+			return 0, 0
+		}
+		v = v<<4 | d
+	}
+	return v, 5
+}
+
 // decodeTopValue 解析单行中唯一的 JSON 值并返回其原始内容与首个非空白字节
 // （'[' 或 '{'）。整个值无法解析、为空或存在尾随内容时返回 *LineError。
 func decodeTopValue(line string) (json.RawMessage, byte, *LineError) {
+	if lerr := validateLineText(line); lerr != nil {
+		return nil, 0, lerr
+	}
 	dec := json.NewDecoder(strings.NewReader(line))
 	var top json.RawMessage
 	if err := dec.Decode(&top); err != nil {

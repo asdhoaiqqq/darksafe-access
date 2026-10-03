@@ -89,10 +89,18 @@ func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 }
 
 // duplicateMemberError reports a JSON object whose member name appears more
-// than once. Path is a JSONPath-style location: "$" for the document root,
-// "$.clusters[1]" for a cluster, "$.clusters[0].tags" for a tag object,
+// than once. Path is a JSONPath-style location that points at the object
+// owning the duplicate (the duplicate member name itself is reported
+// separately in field): "$" for the document root, "$.clusters[1]" for a
+// cluster, "$.clusters[0].tags" for a tag object,
 // "$.include[2]" / "$.exclude[1]" for a condition, and "$.foo.bar[0]" for
-// objects nested inside unknown fields.
+// objects nested inside unknown fields. A member name that is not a plain
+// identifier is wrapped in brackets around a JSON string, so that characters
+// in the name can never be read as hierarchy or an array index: a top-level
+// member "meta.info" is at $["meta.info"] (distinct from the nested object
+// $.meta.info), "zone[0]" stays one whole name at $["zone[0]"], and names
+// that are empty or contain quotes, backslashes or control characters are
+// rendered as decodable JSON strings such as $[""] or $["a\nb"].
 type duplicateMemberError struct {
 	field string
 	path  string
@@ -186,10 +194,53 @@ func walkJSONObject(dec *json.Decoder, path string) error {
 			}
 			return fmt.Errorf("JSON 格式错误: %w", err)
 		}
-		if err := walkJSONValueToken(dec, path+"."+key, vtok); err != nil {
+		if err := walkJSONValueToken(dec, joinMemberPath(path, key), vtok); err != nil {
 			return err
 		}
 	}
+}
+
+// isSimpleMemberName reports whether key may be written with dot notation:
+// it must start with an ASCII letter or underscore and contain only ASCII
+// letters, digits, and underscores afterward.
+func isSimpleMemberName(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i, r := range key {
+		switch {
+		case r == '_' || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z'):
+		case i > 0 && ('0' <= r && r <= '9'):
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// joinMemberPath extends an object location with one member name. Simple
+// identifier names keep the existing dot spelling ("$.clusters[0].tags");
+// every other name is rendered as brackets around a JSON-encoded string, so
+// the text decodes back to exactly the real member name and none of its
+// characters can be mistaken for a path separator or array index.
+func joinMemberPath(path, key string) string {
+	if isSimpleMemberName(key) {
+		return path + "." + key
+	}
+	return path + "[" + jsonEncodePathString(key) + "]"
+}
+
+// jsonEncodePathString renders key as a legal JSON string (including the
+// surrounding quotes); decoding the result restores key exactly, including
+// empty names and names containing quotes, backslashes, newlines or other
+// control characters.
+func jsonEncodePathString(key string) string {
+	bs, err := json.Marshal(key)
+	if err != nil {
+		// json.Marshal cannot fail for a Go string.
+		panic(fmt.Sprintf("json.Marshal(%q): %v", key, err))
+	}
+	return string(bs)
 }
 
 func walkJSONArray(dec *json.Decoder, path string) error {

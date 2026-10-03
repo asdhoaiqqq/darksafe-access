@@ -1,6 +1,7 @@
 package darksafe
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -634,6 +635,271 @@ func TestParse_ValidConfigsStillPlan(t *testing.T) {
 	}
 	if len(plan.Excluded) != 3 {
 		t.Fatalf("expected 3 excluded, got %+v", plan.Excluded)
+	}
+}
+
+// TestParse_DuplicatePathQuotesSpecialMemberNames covers the disambiguation
+// rule: the reported location points at the object owning the duplicate and
+// must encode member names so their characters cannot be read as hierarchy
+// or array indices. Identifier-style names keep dot notation; every other
+// name is rendered as brackets around a JSON string whose decoding restores
+// the exact member name. Arrays still use their real zero-based index.
+func TestParse_DuplicatePathQuotesSpecialMemberNames(t *testing.T) {
+	base := `"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[]`
+	cases := []struct {
+		name      string
+		body      string // JSON body without outer braces
+		wantField string
+		wantPath  string
+	}{
+		{
+			name:      "top-level dotted-name object is bracketed",
+			body:      base + `,"meta.info":{"x":1,"x":2}`,
+			wantField: "x",
+			wantPath:  `$["meta.info"]`,
+		},
+		{
+			name:      "nested meta then info stays dotted",
+			body:      base + `,"meta":{"info":{"x":1,"x":2}}`,
+			wantField: "x",
+			wantPath:  `$.meta.info`,
+		},
+		{
+			name:      "dotted name duplicated inside simple object",
+			body:      base + `,"meta":{"x.y":1,"x.y":2}`,
+			wantField: "x.y",
+			wantPath:  `$.meta`,
+		},
+		{
+			name:      "name looking like array access stays one member",
+			body:      base + `,"zone[0]":{"x":1,"x":2}`,
+			wantField: "x",
+			wantPath:  `$["zone[0]"]`,
+		},
+		{
+			name:      "array-like name nested in another object",
+			body:      base + `,"a":{"zone[0]":{"x":1,"x":2}}`,
+			wantField: "x",
+			wantPath:  `$.a["zone[0]"]`,
+		},
+		{
+			name:      "dotted object name in front of a real array",
+			body:      base + `,"a.b":[{"x":1,"x":2}]`,
+			wantField: "x",
+			wantPath:  `$["a.b"][0]`,
+		},
+		{
+			name:      "two dotted levels",
+			body:      base + `,"a.b":{"c.d":{"x":1,"x":2}}`,
+			wantField: "x",
+			wantPath:  `$["a.b"]["c.d"]`,
+		},
+		{
+			name:      "real array index then bracketed name",
+			body:      base + `,"items":[{"a.b":{"x":1,"x":2}}]`,
+			wantField: "x",
+			wantPath:  `$.items[0]["a.b"]`,
+		},
+		{
+			name:      "empty member name as owning object",
+			body:      base + `,"":{"x":1,"x":2}`,
+			wantField: "x",
+			wantPath:  `$[""]`,
+		},
+		{
+			name:      "quote in member name",
+			body:      base + `,"a\"b":{"x":1,"x":2}`,
+			wantField: "x",
+			wantPath:  `$["a\"b"]`,
+		},
+		{
+			name:      "backslash in member name",
+			body:      base + `,"a\\b":{"x":1,"x":2}`,
+			wantField: "x",
+			wantPath:  `$["a\\b"]`,
+		},
+		{
+			name:      "newline in member name",
+			body:      base + `,"a\nb":{"x":1,"x":2}`,
+			wantField: "x",
+			wantPath:  `$["a\nb"]`,
+		},
+		{
+			name:      "leading digit uses brackets",
+			body:      base + `,"1x":{"y":1,"y":2}`,
+			wantField: "y",
+			wantPath:  `$["1x"]`,
+		},
+		{
+			name:      "underscore start keeps dot",
+			body:      base + `,"_x1":{"y":1,"y":2}`,
+			wantField: "y",
+			wantPath:  `$._x1`,
+		},
+		{
+			name:      "non-ASCII letter uses brackets",
+			body:      base + `,"名":{"y":1,"y":2}`,
+			wantField: "y",
+			wantPath:  `$["名"]`,
+		},
+		{
+			name:      "simple existing paths unchanged through tags",
+			body:      `"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[{"id":"x","tags":{"env":1,"env":2}}]`,
+			wantField: "env",
+			wantPath:  `$.clusters[0].tags`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := parseDupErr(t, "{"+tc.body+"}")
+			dme, ok := err.(*duplicateMemberError)
+			if !ok {
+				t.Fatalf("expected *duplicateMemberError, got %T: %v", err, err)
+			}
+			if dme.field != tc.wantField {
+				t.Fatalf("field = %q, want %q", dme.field, tc.wantField)
+			}
+			if dme.path != tc.wantPath {
+				t.Fatalf("path = %q, want %q", dme.path, tc.wantPath)
+			}
+		})
+	}
+}
+
+// TestParse_DuplicatePathBracketSegmentsDecodeBack extracts every bracketed
+// JSON-string segment from a reported location and JSON-decodes it: each
+// segment must restore the exact decoded member name, including quotes,
+// backslashes, newlines and the empty string.
+func TestParse_DuplicatePathBracketSegmentsDecodeBack(t *testing.T) {
+	base := `"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[]`
+	cases := []struct {
+		body     string
+		wantSegs []string
+	}{
+		{base + `,"meta.info":{"x":1,"x":2}`, []string{"meta.info"}},
+		{base + `,"zone[0]":{"x":1,"x":2}`, []string{"zone[0]"}},
+		{base + `,"":{"x":1,"x":2}`, []string{""}},
+		{base + `,"a\"b":{"x":1,"x":2}`, []string{`a"b`}},
+		{base + `,"a\\b":{"x":1,"x":2}`, []string{`a\b`}},
+		{base + `,"a\nb":{"x":1,"x":2}`, []string{"a\nb"}},
+		{base + `,"a.b":{"c.d":{"x":1,"x":2}}`, []string{"a.b", "c.d"}},
+	}
+	for i, tc := range cases {
+		err := parseDupErr(t, "{"+tc.body+"}")
+		dme := err.(*duplicateMemberError)
+		rest := dme.path
+		var got []string
+		for {
+			open := strings.Index(rest, "[\"")
+			if open < 0 {
+				break
+			}
+			j := open + 2
+			for j < len(rest) {
+				if rest[j] == '\\' {
+					j += 2
+					continue
+				}
+				if rest[j] == '"' && j+1 < len(rest) && rest[j+1] == ']' {
+					break
+				}
+				j++
+			}
+			var s string
+			if err := json.Unmarshal([]byte(rest[open+1:j+1]), &s); err != nil {
+				t.Fatalf("case %d: segment %q is not legal JSON: %v", i, rest[open+1:j+1], err)
+			}
+			got = append(got, s)
+			rest = rest[j+2:]
+		}
+		if len(got) != len(tc.wantSegs) {
+			t.Fatalf("case %d: decoded segments %q, want %q (path %s)", i, got, tc.wantSegs, dme.path)
+		}
+		for k := range got {
+			if got[k] != tc.wantSegs[k] {
+				t.Fatalf("case %d: segment %d = %q, want %q", i, k, got[k], tc.wantSegs[k])
+			}
+		}
+	}
+}
+
+// TestParse_DuplicatePathSameForEquivalentSpellings ensures the location is
+// expressed from the JSON-decoded name: a name written literally and the
+// same name written with \uXXXX escapes produce an identical path.
+func TestParse_DuplicatePathSameForEquivalentSpellings(t *testing.T) {
+	base := `"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[]`
+	// "meta.info" vs "meta.info" — after decoding both are "meta.info".
+	literal := "{" + base + `,"meta.info":{"x":1,"x":2}}`
+	escaped := "{" + base + `,"m` + jsonUEsc('e') + `ta.info":{"x":1,"x":2}}`
+	litErr := parseDupErr(t, literal)
+	escErr := parseDupErr(t, escaped)
+	if litErr.(*duplicateMemberError).path != escErr.(*duplicateMemberError).path {
+		t.Fatalf("paths differ for equivalent spellings: %q vs %q",
+			litErr.(*duplicateMemberError).path, escErr.(*duplicateMemberError).path)
+	}
+	if litErr.(*duplicateMemberError).path != `$["meta.info"]` {
+		t.Fatalf("unexpected path %q", litErr.(*duplicateMemberError).path)
+	}
+}
+
+// TestParse_SpecialExtraNamesIgnoredWhenDistinct checks that member names
+// needing bracket notation do not make a configuration invalid: absent
+// duplicates, extra fields with dotted, array-like, empty or escaped names
+// are ignored exactly like other unknown fields, and the plan is unchanged.
+func TestParse_SpecialExtraNamesIgnoredWhenDistinct(t *testing.T) {
+	raw := `{
+		"app": "a", "revision": "r", "image": "i", "batchSize": 2,
+		"clusters": [{"id": "c1"}, {"id": "c2"}],
+		"meta.info": {"x": 1},
+		"zone[0]": {"y": 2},
+		"": "empty",
+		"a\"b\\c\n": 1,
+		"meta": {"info": true}
+	}`
+	in, err := ParseReleaseInput([]byte(raw))
+	if err != nil {
+		t.Fatalf("special extra names must be accepted: %v", err)
+	}
+	plan, err := MakeReleasePlan(in)
+	if err != nil {
+		t.Fatalf("plan failed: %v", err)
+	}
+	if len(plan.Batches) != 1 || strings.Join(plan.Batches[0].Clusters, ",") != "c1,c2" {
+		t.Fatalf("unexpected plan: %+v", plan.Batches)
+	}
+
+	// Same decoded special name in two different objects stays legal.
+	raw = `{"app":"a","revision":"r","image":"i","batchSize":1,"clusters":[],` +
+		`"meta.info":{"k":1},"other":{"meta.info":2}}`
+	if _, err := ParseReleaseInput([]byte(raw)); err != nil {
+		t.Fatalf("same name in different objects must be legal: %v", err)
+	}
+}
+
+// TestPlanCLI_DuplicateInDottedNameObjectFailsCleanly drives the CLI with the
+// exact ambiguous case from the issue: a duplicate inside a top-level
+// "meta.info" object. It must exit non-zero with empty stdout and report both
+// the member name and the disambiguated object position on stderr.
+func TestPlanCLI_DuplicateInDottedNameObjectFailsCleanly(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plan.json")
+	doc := `{
+		"app": "payments", "revision": "v1", "image": "img",
+		"batchSize": 1, "clusters": [],
+		"meta.info": {"x": 1, "x": 2}
+	}`
+	if err := os.WriteFile(path, []byte(doc), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, stdout, stderr := runCLI(t, "plan", path)
+	if code == 0 {
+		t.Fatalf("expected non-zero exit; stdout=%q stderr=%q", stdout, stderr)
+	}
+	if stdout != "" {
+		t.Fatalf("expected empty stdout, got %q", stdout)
+	}
+	if !strings.Contains(stderr, `"x"`) || !strings.Contains(stderr, `$["meta.info"]`) {
+		t.Fatalf("stderr should name field and bracketed position, got %q", stderr)
 	}
 }
 

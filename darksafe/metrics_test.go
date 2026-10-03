@@ -161,6 +161,92 @@ func TestWithinBatchDuplicateAndConflict(t *testing.T) {
 	}
 }
 
+// TestConflictResultIsIndependentOfStorage 保证失败返回的冲突记录是独立副本：
+// 调用方为整理错误信息而增删改其中的标签，不能回写已存储序列的身份、点值，
+// 也不能影响后续写入的去重与冲突判断、查询子集匹配及写入快照。
+func TestConflictResultIsIndependentOfStorage(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"cpu","timestamp":1000,"value":1,"labels":{"host":"a"}}]`)
+
+	lerr := mustFail(t, store, `[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]`)
+	c := lerr.Conflict
+	if c.Series.Name != "cpu" || c.Series.Labels["host"] != "a" ||
+		c.Timestamp != 1000 || c.Existing != 1 || c.Submitted != 2 || lerr.Index != 1 {
+		t.Fatalf("conflict detail = %+v", c)
+	}
+
+	// 调用方改写手中的冲突结果（改值、加键、删键、改指标名）。
+	c.Series.Labels["host"] = "b"
+	c.Series.Labels["extra"] = "z"
+	delete(c.Series.Labels, "host")
+	c.Series.Name = "mem"
+
+	// 原序列仍按 host=a 命中，数量与均值保持正确。
+	res := mustQuery(t, store, `{"op":"query","name":"cpu","start":0,"end":2000,"labels":{"host":"a"}}`)
+	if len(res.Series) != 1 || res.Series[0].Count != 1 || res.Series[0].Average != 1 {
+		t.Fatalf("host=a must still find the stored point, got %+v", res.Series)
+	}
+	// host=b 不能因这次编辑而匹配到该序列。
+	res = mustQuery(t, store, `{"op":"query","name":"cpu","start":0,"end":2000,"labels":{"host":"b"}}`)
+	if len(res.Series) != 0 {
+		t.Fatalf("edited label must not leak into queries, got %+v", res.Series)
+	}
+	// 后续写入快照反映真实存储。
+	snap := mustOK(t, store, `[]`)
+	if len(snap.Series) != 1 || snap.Series[0].Name != "cpu" ||
+		len(snap.Series[0].Labels) != 1 || snap.Series[0].Labels["host"] != "a" {
+		t.Fatalf("snapshot tainted by conflict edit: %+v", snap.Series)
+	}
+	// 后续写入的去重与冲突判断仍基于真实身份与原值。
+	dup := mustOK(t, store, `[{"name":"cpu","timestamp":1000,"value":1.0,"labels":{"host":"a"}}]`)
+	if dup.Added != 0 || dup.Duplicates != 1 {
+		t.Fatalf("dedup after conflict edit = %+v, want duplicate", dup)
+	}
+	again := mustFail(t, store, `[{"name":"cpu","timestamp":1000,"value":3,"labels":{"host":"a"}}]`)
+	if again.Conflict.Existing != 1 || again.Conflict.Submitted != 3 ||
+		again.Conflict.Series.Labels["host"] != "a" {
+		t.Fatalf("later conflict must report the real stored series, got %+v", again.Conflict)
+	}
+}
+
+// TestConflictResultIndependentForUnlabeledAndEmptyValue 覆盖无标签序列与
+// 空字符串标签值序列：编辑冲突结果中的标签集合不得给已有序列补标签或抹掉空值键。
+func TestConflictResultIndependentForUnlabeledAndEmptyValue(t *testing.T) {
+	// 无标签序列：在返回的空标签集合里加 host，不能给已有序列补上该标签。
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"m","timestamp":1,"value":1}]`)
+	lerr := mustFail(t, store, `[{"name":"m","timestamp":1,"value":2}]`)
+	if len(lerr.Conflict.Series.Labels) != 0 {
+		t.Fatalf("unlabeled conflict labels = %+v, want {}", lerr.Conflict.Series.Labels)
+	}
+	lerr.Conflict.Series.Labels["host"] = "b"
+	res := mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":2}`)
+	if len(res.Series) != 1 || len(res.Series[0].Labels) != 0 {
+		t.Fatalf("unlabeled series gained a label: %+v", res.Series)
+	}
+	res = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":2,"labels":{"host":"b"}}`)
+	if len(res.Series) != 0 {
+		t.Fatalf("fabricated label must not match, got %+v", res.Series)
+	}
+
+	// 原本带空字符串标签值的序列在删除冲突结果中的该键后，仍与缺少该键的序列区别。
+	store2 := NewMetricStore()
+	mustOK(t, store2, `[{"name":"m","timestamp":1,"value":1,"labels":{"zone":""}}]`)
+	lerr2 := mustFail(t, store2, `[{"name":"m","timestamp":1,"value":2,"labels":{"zone":""}}]`)
+	if v, ok := lerr2.Conflict.Series.Labels["zone"]; !ok || v != "" {
+		t.Fatalf("empty-value label not preserved in conflict: %+v", lerr2.Conflict.Series.Labels)
+	}
+	delete(lerr2.Conflict.Series.Labels, "zone")
+	res2 := mustQuery(t, store2, `{"op":"query","name":"m","start":0,"end":2,"labels":{"zone":""}}`)
+	if len(res2.Series) != 1 || res2.Series[0].Average != 1 {
+		t.Fatalf("empty-value series must keep its key, got %+v", res2.Series)
+	}
+	snap := mustOK(t, store2, `[]`)
+	if v, ok := snap.Series[0].Labels["zone"]; !ok || v != "" || len(snap.Series[0].Labels) != 1 {
+		t.Fatalf("snapshot lost empty-value label: %+v", snap.Series)
+	}
+}
+
 func TestOutOfOrderTimestampsSorted(t *testing.T) {
 	store := NewMetricStore()
 	mustOK(t, store, `[{"name":"m","timestamp":30,"value":3},{"name":"m","timestamp":10,"value":1}]`)

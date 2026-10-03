@@ -413,13 +413,19 @@ func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineE
 		return &LineError{Status: "error", Index: index, Error: msg}
 	}
 	conflictAt := func(index int, ref SeriesRef, ts int64, existing, submitted float64) *LineError {
+		// 冲突记录是本次失败的独立副本：其标签集合必须与存储内部身份断开别名，
+		// 调用方增删改返回结果中的标签只能影响手中的结果，不能回写已有序列。
+		labels := make(map[string]string, len(ref.Labels))
+		for k, v := range ref.Labels {
+			labels[k] = v
+		}
 		return &LineError{
 			Status: "error",
 			Index:  index,
 			Error: fmt.Sprintf("conflict: series %s at timestamp %d already has value %s, submitted %s",
 				ref, ts, formatFloat(existing), formatFloat(submitted)),
 			Conflict: &Conflict{
-				Series:    ref,
+				Series:    SeriesRef{Name: ref.Name, Labels: labels},
 				Timestamp: ts,
 				Existing:  existing,
 				Submitted: submitted,

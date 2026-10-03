@@ -3,6 +3,7 @@ package darksafe
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -313,38 +314,8 @@ func parseSample(raw json.RawMessage) (parsedSample, error) {
 			}
 			p.value = v
 		case "labels":
-			t, err := dec.Token()
+			labels, err := parseLabels(dec, `field "labels" must be an object of string keys to string values`)
 			if err != nil {
-				return p, err
-			}
-			d, ok := t.(json.Delim)
-			if !ok || d != '{' {
-				return p, fmt.Errorf(`field "labels" must be an object of string keys to string values`)
-			}
-			labels := map[string]string{}
-			for dec.More() {
-				labelKeyTok, err := dec.Token()
-				if err != nil {
-					return p, err
-				}
-				labelKey := labelKeyTok.(string)
-				if labelKey == "" {
-					return p, fmt.Errorf(`field "labels": label keys must be non-empty strings`)
-				}
-				valTok, err := dec.Token()
-				if err != nil {
-					return p, err
-				}
-				labelVal, ok := valTok.(string)
-				if !ok {
-					return p, fmt.Errorf(`field "labels": value of label %q must be a string`, labelKey)
-				}
-				if _, dup := labels[labelKey]; dup {
-					return p, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
-				}
-				labels[labelKey] = labelVal
-			}
-			if _, err := dec.Token(); err != nil { // 消耗 '}'
 				return p, err
 			}
 			p.labels = labels
@@ -366,6 +337,50 @@ func parseSample(raw json.RawMessage) (parsedSample, error) {
 		}
 	}
 	return p, nil
+}
+
+// parseLabels 从解码流中读取一个标签对象，写入与查询共用同一套规则：
+// 键必须是非空字符串且不可重复（即使值相同也不能覆盖），值必须是字符串；
+// 空字符串值合法，键值中的空格与大小写原样保留，不做清理或转换。
+// 校验按空键、值类型、重复键的顺序进行，与字段内其它错误的先后关系保持不变。
+// notObjectErr 是 labels 不是 JSON 对象时各操作自己的报错文案，
+// 由调用方按写入/查询的业务含义给出。
+func parseLabels(dec *json.Decoder, notObjectErr string) (map[string]string, error) {
+	t, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	d, ok := t.(json.Delim)
+	if !ok || d != '{' {
+		return nil, errors.New(notObjectErr)
+	}
+	labels := map[string]string{}
+	for dec.More() {
+		labelKeyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		labelKey := labelKeyTok.(string)
+		if labelKey == "" {
+			return nil, fmt.Errorf(`field "labels": label keys must be non-empty strings`)
+		}
+		valTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		labelVal, ok := valTok.(string)
+		if !ok {
+			return nil, fmt.Errorf(`field "labels": value of label %q must be a string`, labelKey)
+		}
+		if _, dup := labels[labelKey]; dup {
+			return nil, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
+		}
+		labels[labelKey] = labelVal
+	}
+	if _, err := dec.Token(); err != nil { // 消耗 '}'
+		return nil, err
+	}
+	return labels, nil
 }
 
 func nextJSONNumber(dec *json.Decoder, field string) (json.Number, error) {
@@ -591,38 +606,8 @@ func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 				q.end = v
 			}
 		case "labels":
-			t, err := dec.Token()
+			labels, err := parseLabels(dec, `field "labels" must be an object of non-empty string keys to string values`)
 			if err != nil {
-				return q, err
-			}
-			d, ok := t.(json.Delim)
-			if !ok || d != '{' {
-				return q, fmt.Errorf(`field "labels" must be an object of non-empty string keys to string values`)
-			}
-			labels := map[string]string{}
-			for dec.More() {
-				labelKeyTok, err := dec.Token()
-				if err != nil {
-					return q, err
-				}
-				labelKey := labelKeyTok.(string)
-				if labelKey == "" {
-					return q, fmt.Errorf(`field "labels": label keys must be non-empty strings`)
-				}
-				valTok, err := dec.Token()
-				if err != nil {
-					return q, err
-				}
-				labelVal, ok := valTok.(string)
-				if !ok {
-					return q, fmt.Errorf(`field "labels": value of label %q must be a string`, labelKey)
-				}
-				if _, dup := labels[labelKey]; dup {
-					return q, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
-				}
-				labels[labelKey] = labelVal
-			}
-			if _, err := dec.Token(); err != nil { // 消耗 '}'
 				return q, err
 			}
 			q.labels = labels

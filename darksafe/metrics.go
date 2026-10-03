@@ -334,95 +334,180 @@ type parsedSample struct {
 	labels map[string]string
 }
 
-// parseSample 对单个采样点做严格校验：仅允许四个已知字段、拒绝重复键，
-// 标量必须是精确的 JSON 类型，timestamp 为 int64 整数，value 为有限 float64。
-func parseSample(raw json.RawMessage) (parsedSample, error) {
-	var p parsedSample
-	p.labels = map[string]string{}
+// fieldSpec 声明一个允许的字段：parse 从 dec 读取并校验该字段的值。
+type fieldSpec struct {
+	name  string
+	parse func(dec *json.Decoder) error
+}
+
+// parseObject 流式解析一个严格 JSON 对象：仅允许 specs 中的字段，
+// 键名经 JSON 转义还原后在本对象内重复（即使两值相同）即拒绝，
+// unknownFieldError 给出未知字段的错误文本，notObjectError 给出首 token
+// 不是 '{' 时的错误文本。字段书写次序不影响结果，值在出现时立即校验，
+// 因而保留“按出现位置先类型后重复”的既有错误选择次序。
+// 判重严格限定在当前对象内：每次解析使用独立的已见字段集合，
+// labels 等嵌套对象由 parse 回调自行解析，不与外层共享集合。
+// 消耗完整个对象后，required 中按给定顺序缺失的第一个字段作为缺字段错误。
+func parseObject(raw json.RawMessage, specs []fieldSpec, required []string, notObjectError string, unknownFieldError func(key string) string, trailingError string) (map[string]bool, error) {
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
 
 	tok, err := dec.Token()
 	if err != nil {
-		return p, err
+		return nil, err
 	}
 	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return p, fmt.Errorf("each sample must be a JSON object")
+		return nil, fmt.Errorf("%s", notObjectError)
 	}
 
-	present := make(map[string]bool)
+	byName := make(map[string]fieldSpec, len(specs))
+	for _, f := range specs {
+		byName[f.name] = f
+	}
+	present := make(map[string]bool, len(specs))
 	for dec.More() {
-		keyTok, err := dec.Token()
+		key, err := nextObjectKey(dec, present)
 		if err != nil {
-			return p, err
+			return nil, err
 		}
-		key := keyTok.(string)
-		switch key {
-		case "name", "timestamp", "value", "labels":
-		default:
-			return p, fmt.Errorf("unknown field %q", key)
+		spec, ok := byName[key]
+		if !ok {
+			return nil, fmt.Errorf("%s", unknownFieldError(key))
 		}
-		if present[key] {
-			return p, fmt.Errorf("duplicate field %q", key)
-		}
-		present[key] = true
-
-		switch key {
-		case "name":
-			t, err := dec.Token()
-			if err != nil {
-				return p, err
-			}
-			s, ok := t.(string)
-			if !ok {
-				return p, fmt.Errorf(`field "name" must be a string`)
-			}
-			if s == "" {
-				return p, fmt.Errorf(`field "name" must be a non-empty string`)
-			}
-			p.name = s
-		case "timestamp":
-			n, err := nextJSONNumber(dec, "timestamp")
-			if err != nil {
-				return p, err
-			}
-			v, err := parseJSONInt(n)
-			if err != nil {
-				return p, fmt.Errorf(`field "timestamp": %s`, err)
-			}
-			p.ts = v
-		case "value":
-			n, err := nextJSONNumber(dec, "value")
-			if err != nil {
-				return p, err
-			}
-			v, err := parseFiniteFloat(n)
-			if err != nil {
-				return p, fmt.Errorf(`field "value": %s`, err)
-			}
-			p.value = v
-		case "labels":
-			labels, err := parseLabels(dec, `field "labels" must be an object of string keys to string values`)
-			if err != nil {
-				return p, err
-			}
-			p.labels = labels
+		if err := spec.parse(dec); err != nil {
+			return nil, err
 		}
 	}
 	if _, err := dec.Token(); err != nil { // 消耗 '}'
-		return p, err
+		return nil, err
 	}
 	if _, err := dec.Token(); err != io.EOF {
 		if err == nil {
-			return p, fmt.Errorf("unexpected content after the sample object")
+			return nil, fmt.Errorf("%s", trailingError)
 		}
-		return p, err
+		return nil, err
 	}
-
-	for _, field := range []string{"name", "timestamp", "value"} {
+	for _, field := range required {
 		if !present[field] {
-			return p, fmt.Errorf("missing required field %q", field)
+			return nil, fmt.Errorf("missing required field %q", field)
 		}
+	}
+	return present, nil
+}
+
+// nextObjectKey 从对象中读取下一个字段名并做本对象内的重复判定；
+// 键名为 JSON 解码器还原后的字符串，所以直接书写与 \uXXXX 转义书写的
+// 同名键视为同一个键。present 是属于当前对象的独立已见集合。
+func nextObjectKey(dec *json.Decoder, present map[string]bool) (string, error) {
+	keyTok, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	key := keyTok.(string)
+	if present[key] {
+		return "", fmt.Errorf("duplicate field %q", key)
+	}
+	present[key] = true
+	return key, nil
+}
+
+// nextStringField 读取一个必须为 JSON 字符串的标量字段。
+func nextStringField(dec *json.Decoder, field string) (string, error) {
+	t, err := dec.Token()
+	if err != nil {
+		return "", err
+	}
+	s, ok := t.(string)
+	if !ok {
+		return "", fmt.Errorf(`field %q must be a string`, field)
+	}
+	return s, nil
+}
+
+// nextNonEmptyStringField 读取一个必须为非空字符串的标量字段。
+func nextNonEmptyStringField(dec *json.Decoder, field string) (string, error) {
+	s, err := nextStringField(dec, field)
+	if err != nil {
+		return "", err
+	}
+	if s == "" {
+		return "", fmt.Errorf(`field %q must be a non-empty string`, field)
+	}
+	return s, nil
+}
+
+// nextInt64Field 读取一个必须为 int64 范围内毫秒整数的字段：
+// 数字字符串、布尔值一律拒绝，带小数点或指数的数值也不是整数。
+func nextInt64Field(dec *json.Decoder, field string) (int64, error) {
+	n, err := nextJSONNumber(dec, field)
+	if err != nil {
+		return 0, err
+	}
+	v, err := parseJSONInt(n)
+	if err != nil {
+		return 0, fmt.Errorf(`field %q: %s`, field, err)
+	}
+	return v, nil
+}
+
+// nextFiniteFloatField 读取一个必须为有限 float64 的字段。
+func nextFiniteFloatField(dec *json.Decoder, field string) (float64, error) {
+	n, err := nextJSONNumber(dec, field)
+	if err != nil {
+		return 0, err
+	}
+	v, err := parseFiniteFloat(n)
+	if err != nil {
+		return 0, fmt.Errorf(`field %q: %s`, field, err)
+	}
+	return v, nil
+}
+
+// parseSample 对单个采样点做严格校验：仅允许四个已知字段、拒绝重复键，
+// 标量必须是精确的 JSON 类型，timestamp 为 int64 整数，value 为有限 float64。
+// 字段白名单、重复键与必填检查由 parseObject 统一完成。
+func parseSample(raw json.RawMessage) (parsedSample, error) {
+	var p parsedSample
+	p.labels = map[string]string{}
+	_, err := parseObject(raw, []fieldSpec{
+		{name: "name", parse: func(dec *json.Decoder) error {
+			v, err := nextNonEmptyStringField(dec, "name")
+			if err != nil {
+				return err
+			}
+			p.name = v
+			return nil
+		}},
+		{name: "timestamp", parse: func(dec *json.Decoder) error {
+			v, err := nextInt64Field(dec, "timestamp")
+			if err != nil {
+				return err
+			}
+			p.ts = v
+			return nil
+		}},
+		{name: "value", parse: func(dec *json.Decoder) error {
+			v, err := nextFiniteFloatField(dec, "value")
+			if err != nil {
+				return err
+			}
+			p.value = v
+			return nil
+		}},
+		{name: "labels", parse: func(dec *json.Decoder) error {
+			labels, err := parseLabels(dec, `field "labels" must be an object of string keys to string values`)
+			if err != nil {
+				return err
+			}
+			p.labels = labels
+			return nil
+		}},
+	}, []string{"name", "timestamp", "value"},
+		"each sample must be a JSON object",
+		func(key string) string { return fmt.Sprintf("unknown field %q", key) },
+		"unexpected content after the sample object")
+	if err != nil {
+		return p, err
 	}
 	return p, nil
 }
@@ -621,98 +706,58 @@ func (s *MetricStore) queryFromObject(raw json.RawMessage) (*QueryResult, *LineE
 
 // parseQuery 对查询对象做严格校验：仅允许 op/name/start/end/labels，
 // 拒绝重复键与未知字段；标量必须是精确的 JSON 类型，start/end 为 int64 毫秒。
+// 字段白名单、重复键与必填检查与采样点共用 parseObject。
 func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 	var q parsedQuery
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-
-	tok, err := dec.Token()
-	if err != nil {
-		return q, err
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return q, fmt.Errorf("each query must be a JSON object")
-	}
-
-	present := make(map[string]bool)
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return q, err
-		}
-		key := keyTok.(string)
-		switch key {
-		case "op", "name", "start", "end", "labels":
-		default:
-			return q, fmt.Errorf("unknown field %q", key)
-		}
-		if present[key] {
-			return q, fmt.Errorf("duplicate field %q", key)
-		}
-		present[key] = true
-
-		switch key {
-		case "op":
-			t, err := dec.Token()
+	_, err := parseObject(raw, []fieldSpec{
+		{name: "op", parse: func(dec *json.Decoder) error {
+			op, err := nextStringField(dec, "op")
 			if err != nil {
-				return q, err
-			}
-			op, ok := t.(string)
-			if !ok {
-				return q, fmt.Errorf(`field "op" must be a string`)
+				return err
 			}
 			if op != "query" {
-				return q, fmt.Errorf(`unknown op %q (only "query" is supported)`, op)
+				return fmt.Errorf(`unknown op %q (only "query" is supported)`, op)
 			}
-		case "name":
-			t, err := dec.Token()
+			return nil
+		}},
+		{name: "name", parse: func(dec *json.Decoder) error {
+			v, err := nextNonEmptyStringField(dec, "name")
 			if err != nil {
-				return q, err
+				return err
 			}
-			name, ok := t.(string)
-			if !ok {
-				return q, fmt.Errorf(`field "name" must be a string`)
-			}
-			if name == "" {
-				return q, fmt.Errorf(`field "name" must be a non-empty string`)
-			}
-			q.name = name
-		case "start", "end":
-			n, err := nextJSONNumber(dec, key)
+			q.name = v
+			return nil
+		}},
+		{name: "start", parse: func(dec *json.Decoder) error {
+			v, err := nextInt64Field(dec, "start")
 			if err != nil {
-				return q, err
+				return err
 			}
-			v, err := parseJSONInt(n)
+			q.start = v
+			return nil
+		}},
+		{name: "end", parse: func(dec *json.Decoder) error {
+			v, err := nextInt64Field(dec, "end")
 			if err != nil {
-				return q, fmt.Errorf(`field %q: %s`, key, err)
+				return err
 			}
-			if key == "start" {
-				q.start = v
-			} else {
-				q.end = v
-			}
-		case "labels":
+			q.end = v
+			return nil
+		}},
+		{name: "labels", parse: func(dec *json.Decoder) error {
 			labels, err := parseLabels(dec, `field "labels" must be an object of non-empty string keys to string values`)
 			if err != nil {
-				return q, err
+				return err
 			}
 			q.labels = labels
-		}
-	}
-	if _, err := dec.Token(); err != nil { // 消耗 '}'
+			return nil
+		}},
+	}, []string{"op", "name", "start", "end"},
+		"each query must be a JSON object",
+		func(key string) string { return fmt.Sprintf("unknown field %q", key) },
+		"unexpected content after the query object")
+	if err != nil {
 		return q, err
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		if err == nil {
-			return q, fmt.Errorf("unexpected content after the query object")
-		}
-		return q, err
-	}
-
-	for _, field := range []string{"op", "name", "start", "end"} {
-		if !present[field] {
-			return q, fmt.Errorf("missing required field %q", field)
-		}
 	}
 	return q, nil
 }

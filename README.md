@@ -206,6 +206,140 @@ go run ./cmd/darksafe plan plan.json
 
 **成功与失败的统一约定**：成功时退出状态为 0，标准输出仅包含完整计划 JSON（应用信息、从 1 开始连续编号的批次、按标识升序的未入选集群及原因），标准错误为空；失败时退出状态非零（配置或规划规则问题退出码为 1，命令用法错误退出码为 2），问题说明写入标准错误，标准输出为空。
 
+## 在 Go 代码中调用（库方式）
+
+命令行的 `plan` 子命令只是 `darksafe` 包的一层封装。调用方也可以不经过 JSON 文件，直接在内存中构造 `ReleasePlanInput` 并调用 `MakeReleasePlan` 计算计划。计算同样**全程在本机离线完成：不连接任何集群，不执行实际发布**，与命令行方式共享同一套校验、筛选与分批规则。
+
+```go
+import "github.com/asdhoaiqqq/darksafe-access/darksafe"
+```
+
+### 1. 完整示例：内存配置计算计划
+
+下面是一个完整、可独立运行的程序：一个应用、一个修订、一份镜像配置；候选集群在代码中**刻意不按标识顺序**书写。`c-a`、`c-b` 属于 `east` 故障域，`c-c` 属于 `west`；`g0` 已停用、`g1` 同时命中包含与排除条件，两者都没有 `zone` 标签。
+
+```go
+package main
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+
+	"github.com/asdhoaiqqq/darksafe-access/darksafe"
+)
+
+func main() {
+	in := darksafe.ReleasePlanInput{
+		App:       "payments-gateway",
+		Revision:  "2026.10.0-r3",
+		Image:     "registry.example.net/payments-gateway:2026.10.0-r3",
+		BatchSize: 2,
+		SpreadBy:  "zone",
+		Include:   []darksafe.LabelCondition{{"env": "prod"}},
+		Exclude:   []darksafe.LabelCondition{{"quarantine": "true"}},
+		Clusters: []darksafe.Cluster{
+			{ID: "c-c", Tags: map[string]string{"env": "prod", "zone": "west"}},
+			{ID: "g1", Tags: map[string]string{"env": "prod", "quarantine": "true"}},
+			{ID: "c-b", Tags: map[string]string{"env": "prod", "zone": "east"}},
+			{ID: "g0", Disabled: true},
+			{ID: "c-a", Tags: map[string]string{"env": "prod", "zone": "east"}},
+		},
+	}
+
+	plan, err := darksafe.MakeReleasePlan(in)
+	if err != nil {
+		// 失败时 err 说明具体原因，返回的 plan 是零值，不能使用
+		fmt.Fprintln(os.Stderr, "计算发布计划失败:", err)
+		os.Exit(1)
+	}
+	out, err := json.MarshalIndent(plan, "", "  ")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "序列化计划失败:", err)
+		os.Exit(1)
+	}
+	fmt.Println(string(out))
+}
+```
+
+运行后标准输出的完整内容（与输入逐项对应、不含省略）：
+
+```json
+{
+  "app": {
+    "name": "payments-gateway",
+    "revision": "2026.10.0-r3",
+    "image": "registry.example.net/payments-gateway:2026.10.0-r3"
+  },
+  "batches": [
+    {
+      "index": 1,
+      "clusters": [
+        "c-a",
+        "c-c"
+      ]
+    },
+    {
+      "index": 2,
+      "clusters": [
+        "c-b"
+      ]
+    }
+  ],
+  "excluded": [
+    {
+      "id": "g0",
+      "reason": "集群已停用"
+    },
+    {
+      "id": "g1",
+      "reason": "命中排除条件"
+    }
+  ]
+}
+```
+
+### 2. 读取计划结果
+
+`MakeReleasePlan` 成功时返回 `ReleasePlan`，调用方按字段读取：
+
+- **`plan.App`**：`AppInfo{Name, Revision, Image}`，按输入的 `App`、`Revision`、`Image` 原样保留。
+- **`plan.Batches`**：批次切片，`Index` **从 1 开始连续编号**，`Clusters` 是该批的集群标识。上例中入选集群按标识升序为 `c-a`(east)、`c-b`(east)、`c-c`(west)；`BatchSize: 2` 且 `SpreadBy: "zone"` 要求同一故障域每批最多一个，因此批次 1 取 `c-a` 后 `c-b` 冲突延后、`c-c` 照常进入，得到 `[c-a, c-c]`，批次 2 为 `[c-b]`。候选在代码中的书写顺序（`c-c` 写在最前）不影响结果。
+- **`plan.Excluded`**：未入选列表，按标识**升序**排列，每项含 `ID` 和 `Reason`。`Reason` 是三种固定文案之一，对应包内常量 `ReasonDisabled`（集群已停用）、`ReasonExcludeMatched`（命中排除条件）、`ReasonIncludeNotMatched`（未命中包含条件）。判定优先级与命令行一致：**停用优先于排除，排除优先于包含**——`g1` 同时满足包含条件（`env=prod`）和排除条件（`quarantine=true`），以排除为准。`g0`、`g1` 都没有 `zone` 标签，但故障域标签只要求**入选**集群携带，因此它们照常进入未入选列表，不影响计划成功。
+
+失败时 `MakeReleasePlan` 返回非空 `err` 和零值 `ReleasePlan`：**调用方必须先检查 `err`，不能把出错时的返回值当成成功计划使用**。错误文本直接说明具体原因（如 `集群 "c-b" 缺少故障域标签 "zone"`，或所有候选都被筛掉时按标识升序列出的全部未入选原因），与命令行写到标准错误的内容一致。
+
+### 3. 用 ValidateReleaseInput 单独校验配置
+
+`ValidateReleaseInput` 检查配置是否**合法**：应用、修订、镜像非空，`BatchSize` 为正整数，`SpreadBy` 为空或可用的标签键，集群标识唯一，标签键与条件键非空。`MakeReleasePlan` 内部会先调用它，因此直接计算计划时无需重复校验；它适合调用方在计算之前单独做一次配置检查。
+
+需要注意：**校验成功并不保证有集群可发布**。`ValidateReleaseInput` 不检查候选列表是否为空，也不预测筛选结果。最典型的区别是空候选列表——应用信息与其他参数都合法时，单独校验成功，但计算计划会失败：
+
+```go
+in := darksafe.ReleasePlanInput{
+	App:      "payments-gateway",
+	Revision: "2026.10.0-r3",
+	Image:    "registry.example.net/payments-gateway:2026.10.0-r3",
+	BatchSize: 2,
+	Include:  []darksafe.LabelCondition{{"env": "prod"}},
+	// Clusters 为空
+}
+
+err := darksafe.ValidateReleaseInput(in)
+// err == nil：配置本身合法
+
+_, err = darksafe.MakeReleasePlan(in)
+// err != nil："没有可发布的集群：未提供候选集群"
+```
+
+因此 `ValidateReleaseInput` 返回 `nil` 只表示"配置合法"，不能据此认为计划一定可算；是否可算仍以 `MakeReleasePlan` 的返回为准。
+
+### 4. 集群标识的唯一性与精确性
+
+- **重复标识必须报错**，且唯一性检查先于任何筛选：重复项即使已停用、或注定被包含/排除条件筛掉，也仍然报错。错误信息指明**后出现记录的位置**（从 0 开始的下标）和重复的标识，例如第 4 个候选重复了 `c-a`：`clusters[3]: 重复的集群标识 "c-a"`。
+- 合法标识**按原字符串保留和比较**：不修剪、不归一化、不合并。`"c-a"`、`"C-A"`、`" c-a"`（带首尾空格）是三个不同的集群，可以同时出现在候选列表中。
+- **空字符串和只含空白的标识不合法**，报 `clusters[<下标>]: 字段 "id" 不能为空或只含空白`。空白检查只用于判定非法，合法的带空格标识不会被改写。
+
 ## 长期产品方向
 
 identity, authorization, rbac, audit-log, account-abstraction, zk-identity, wallet-security

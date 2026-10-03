@@ -696,6 +696,11 @@ func VerifyAudit(org string, records []AuditRecord, cp Checkpoint) error {
 // decision record against the policy version that decision actually used.
 // Later publishes or rollbacks cannot alter the result. Non-decision
 // records and missing sequences return distinguishable errors.
+//
+// The record and the version snapshot come exclusively from this
+// organization's own live history; the version-zero and historical-policy
+// judgment itself is shared with RecheckDecisionOffline in
+// replayRecordedDecision.
 func (s *Store) RecheckDecision(org string, seq int) (Decision, error) {
 	if org == "" {
 		return Decision{}, ErrMissingOrganization
@@ -715,19 +720,21 @@ func (s *Store) RecheckDecision(org string, seq int) (Decision, error) {
 	}
 	req := rec.Decision.Request
 	version := rec.Decision.Decision.Version
-	if version == 0 {
-		// The original decision evaluated no published version: requests
-		// rejected at the envelope, or an organization with no publish yet.
-		if d, ok := checkRequest(org, req); !ok {
-			return d, nil
+	resolve := func(version int) versionPolicies {
+		src, ok := st.versions[version]
+		if !ok {
+			// A decision's version is immutable and never deleted; its
+			// absence indicates store tampering rather than normal
+			// operation.
+			return versionPolicies{status: replayVersionAbsent}
 		}
-		return Decision{Allowed: false, Reason: "organization has no published version"}, nil
+		// Live snapshots are immutable; detach anyway so the returned
+		// decision can never share storage with the store.
+		return versionPolicies{policies: append([]Policy(nil), src...)}
 	}
-	src, ok := st.versions[version]
-	if !ok {
-		// A decision's version is immutable and never deleted; its absence
-		// indicates store tampering rather than normal operation.
+	d, status := replayRecordedDecision(org, req, version, resolve)
+	if status == replayVersionAbsent {
 		return Decision{}, fmt.Errorf("%w: decision used version %d, which no longer exists", ErrVersionNotFound, version)
 	}
-	return evaluate(req, append([]Policy(nil), src...), version), nil
+	return d, nil
 }

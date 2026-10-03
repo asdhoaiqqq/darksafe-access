@@ -334,6 +334,41 @@ func checkSpreadBy(s string) error {
 	return nil
 }
 
+// clusterIDError reports the business problem with one candidate's identity:
+// an empty or whitespace-only ID, or an ID already used by an earlier
+// candidate. index is the candidate's zero-based position in the input array.
+// These are the identity errors both configuration paths share; the JSON path
+// keeps its own distinct errors for an id that is absent or not a string.
+func clusterIDError(index int, id string, duplicate bool) error {
+	if duplicate {
+		return fmt.Errorf("clusters[%d]: 重复的集群标识 %q", index, id)
+	}
+	return fmt.Errorf("clusters[%d]: 字段 %q 不能为空或只含空白", index, "id")
+}
+
+// checkClusterID enforces the single cluster identity rule shared by the JSON
+// document path (ParseReleaseInput) and the directly-constructed Go-config
+// path (ValidateReleaseInput): an ID that is empty or only whitespace is
+// invalid, and every candidate ID must be unique among all candidates —
+// disabled clusters and clusters that include/exclude filtering would drop
+// still count, since identity is checked before and independently of
+// selection. Emptiness recognizes leading/trailing whitespace, but uniqueness
+// compares the ID exactly as written, never trimming it: "c-a", "C-A" and
+// " c-a" are three different IDs. The ID is recorded only after it passes, so
+// an empty ID is reported as empty rather than as a duplicate of an earlier
+// empty one, and a later candidate's tag problem can never precede an earlier
+// candidate's identity problem.
+func checkClusterID(seen map[string]struct{}, index int, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return clusterIDError(index, id, false)
+	}
+	if _, dup := seen[id]; dup {
+		return clusterIDError(index, id, true)
+	}
+	seen[id] = struct{}{}
+	return nil
+}
+
 // ValidateReleaseInput checks that a release configuration is well-formed:
 // app/revision/image are non-empty, batchSize is a positive integer, spreadBy
 // is empty or a usable tag key (not whitespace-only), cluster
@@ -361,13 +396,9 @@ func ValidateReleaseInput(in ReleasePlanInput) error {
 	}
 	seen := make(map[string]struct{}, len(in.Clusters))
 	for i, c := range in.Clusters {
-		if strings.TrimSpace(c.ID) == "" {
-			return fmt.Errorf("clusters[%d]: 字段 %q 不能为空或只含空白", i, "id")
+		if err := checkClusterID(seen, i, c.ID); err != nil {
+			return err
 		}
-		if _, dup := seen[c.ID]; dup {
-			return fmt.Errorf("clusters[%d]: 重复的集群标识 %q", i, c.ID)
-		}
-		seen[c.ID] = struct{}{}
 		if err := validateTagKeys(i, c.Tags); err != nil {
 			return err
 		}
@@ -441,20 +472,22 @@ func parseClusters(v any) ([]Cluster, error) {
 		return nil, errors.New("字段 \"clusters\" 必须是数组")
 	}
 	clusters := make([]Cluster, 0, len(raw))
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{}, len(raw))
 	for i, item := range raw {
 		obj, ok := item.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("clusters[%d] 必须是对象", i)
 		}
+		// requiredString keeps the JSON-specific reasons and their positions for
+		// a missing id, a non-string id and an empty/whitespace-only id; the
+		// shared identity rule then enforces uniqueness across every candidate.
 		id, err := requiredString(obj, "id")
 		if err != nil {
 			return nil, fmt.Errorf("clusters[%d]: %w", i, err)
 		}
-		if seen[id] {
-			return nil, fmt.Errorf("clusters[%d]: 重复的集群标识 %q", i, id)
+		if err := checkClusterID(seen, i, id); err != nil {
+			return nil, err
 		}
-		seen[id] = true
 
 		disabled := false
 		if dv, present := obj["disabled"]; present {

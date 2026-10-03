@@ -327,6 +327,121 @@ func decodeTopValue(line string) (json.RawMessage, byte, *LineError) {
 	return top, trimmed[0], nil
 }
 
+// fieldReader 从 dec 读取并校验当前字段的值，写入调用方持有的结果。
+// 采样点与查询对象各自注册自己允许的字段及字段含义。
+type fieldReader func(dec *json.Decoder) error
+
+// parseStrictObject 是写入采样点与查询对象共用的严格对象校验骨架：
+// 仅允许 fields 中列出的字段（未知字段先于判重被拒绝），同一对象内按转义还原
+// 后的字段名判重（即使两个值相同也拒绝；判重不跨对象、不跨层级），按输入次序
+// 逐字段调用对应的 fieldReader，对象结束后要求输入恰好耗尽，最后按 required
+// 的顺序报告缺失的必填字段。notObjectMsg 与 trailingMsg 由调用方给出，
+// 保留各自输入的措辞。
+func parseStrictObject(raw json.RawMessage, notObjectMsg, trailingMsg string, required []string, fields map[string]fieldReader) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return fmt.Errorf("%s", notObjectMsg)
+	}
+
+	present := make(map[string]bool)
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key := keyTok.(string)
+		read, ok := fields[key]
+		if !ok {
+			return fmt.Errorf("unknown field %q", key)
+		}
+		if present[key] {
+			return fmt.Errorf("duplicate field %q", key)
+		}
+		present[key] = true
+		if err := read(dec); err != nil {
+			return err
+		}
+	}
+	if _, err := dec.Token(); err != nil { // 消耗 '}'
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return fmt.Errorf("%s", trailingMsg)
+		}
+		return err
+	}
+
+	for _, field := range required {
+		if !present[field] {
+			return fmt.Errorf("missing required field %q", field)
+		}
+	}
+	return nil
+}
+
+// readNameField 读取写入与查询共用的指标名字段：必须是非空字符串。
+func readNameField(dec *json.Decoder, dst *string) error {
+	t, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	s, ok := t.(string)
+	if !ok {
+		return fmt.Errorf(`field "name" must be a string`)
+	}
+	if s == "" {
+		return fmt.Errorf(`field "name" must be a non-empty string`)
+	}
+	*dst = s
+	return nil
+}
+
+// readInt64Field 读取 int64 毫秒整数字段（timestamp/start/end）：
+// 必须是 JSON 整数且在 int64 范围内，数字字符串、布尔值、带小数点一律拒绝。
+func readInt64Field(dec *json.Decoder, field string, dst *int64) error {
+	n, err := nextJSONNumber(dec, field)
+	if err != nil {
+		return err
+	}
+	v, err := parseJSONInt(n)
+	if err != nil {
+		return fmt.Errorf("field %q: %s", field, err)
+	}
+	*dst = v
+	return nil
+}
+
+// readFiniteFloatField 读取采样值字段：必须是可表示为有限 float64 的 JSON 数字。
+func readFiniteFloatField(dec *json.Decoder, field string, dst *float64) error {
+	n, err := nextJSONNumber(dec, field)
+	if err != nil {
+		return err
+	}
+	v, err := parseFiniteFloat(n)
+	if err != nil {
+		return fmt.Errorf("field %q: %s", field, err)
+	}
+	*dst = v
+	return nil
+}
+
+// readLabelsField 读取标签对象字段并写入 dst；notObjectMsg 保留各输入侧措辞。
+func readLabelsField(dec *json.Decoder, notObjectMsg string, dst *map[string]string) error {
+	labels, err := parseLabels(dec, notObjectMsg)
+	if err != nil {
+		return err
+	}
+	*dst = labels
+	return nil
+}
+
 type parsedSample struct {
 	name   string
 	ts     int64
@@ -339,92 +454,19 @@ type parsedSample struct {
 func parseSample(raw json.RawMessage) (parsedSample, error) {
 	var p parsedSample
 	p.labels = map[string]string{}
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-
-	tok, err := dec.Token()
-	if err != nil {
-		return p, err
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return p, fmt.Errorf("each sample must be a JSON object")
-	}
-
-	present := make(map[string]bool)
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return p, err
-		}
-		key := keyTok.(string)
-		switch key {
-		case "name", "timestamp", "value", "labels":
-		default:
-			return p, fmt.Errorf("unknown field %q", key)
-		}
-		if present[key] {
-			return p, fmt.Errorf("duplicate field %q", key)
-		}
-		present[key] = true
-
-		switch key {
-		case "name":
-			t, err := dec.Token()
-			if err != nil {
-				return p, err
-			}
-			s, ok := t.(string)
-			if !ok {
-				return p, fmt.Errorf(`field "name" must be a string`)
-			}
-			if s == "" {
-				return p, fmt.Errorf(`field "name" must be a non-empty string`)
-			}
-			p.name = s
-		case "timestamp":
-			n, err := nextJSONNumber(dec, "timestamp")
-			if err != nil {
-				return p, err
-			}
-			v, err := parseJSONInt(n)
-			if err != nil {
-				return p, fmt.Errorf(`field "timestamp": %s`, err)
-			}
-			p.ts = v
-		case "value":
-			n, err := nextJSONNumber(dec, "value")
-			if err != nil {
-				return p, err
-			}
-			v, err := parseFiniteFloat(n)
-			if err != nil {
-				return p, fmt.Errorf(`field "value": %s`, err)
-			}
-			p.value = v
-		case "labels":
-			labels, err := parseLabels(dec, `field "labels" must be an object of string keys to string values`)
-			if err != nil {
-				return p, err
-			}
-			p.labels = labels
-		}
-	}
-	if _, err := dec.Token(); err != nil { // 消耗 '}'
-		return p, err
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		if err == nil {
-			return p, fmt.Errorf("unexpected content after the sample object")
-		}
-		return p, err
-	}
-
-	for _, field := range []string{"name", "timestamp", "value"} {
-		if !present[field] {
-			return p, fmt.Errorf("missing required field %q", field)
-		}
-	}
-	return p, nil
+	err := parseStrictObject(raw,
+		"each sample must be a JSON object",
+		"unexpected content after the sample object",
+		[]string{"name", "timestamp", "value"},
+		map[string]fieldReader{
+			"name":      func(dec *json.Decoder) error { return readNameField(dec, &p.name) },
+			"timestamp": func(dec *json.Decoder) error { return readInt64Field(dec, "timestamp", &p.ts) },
+			"value":     func(dec *json.Decoder) error { return readFiniteFloatField(dec, "value", &p.value) },
+			"labels": func(dec *json.Decoder) error {
+				return readLabelsField(dec, `field "labels" must be an object of string keys to string values`, &p.labels)
+			},
+		})
+	return p, err
 }
 
 // parseLabels 从 dec 读取一个标签对象并做统一校验：必须是 JSON 对象
@@ -623,98 +665,33 @@ func (s *MetricStore) queryFromObject(raw json.RawMessage) (*QueryResult, *LineE
 // 拒绝重复键与未知字段；标量必须是精确的 JSON 类型，start/end 为 int64 毫秒。
 func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 	var q parsedQuery
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber()
-
-	tok, err := dec.Token()
-	if err != nil {
-		return q, err
-	}
-	if d, ok := tok.(json.Delim); !ok || d != '{' {
-		return q, fmt.Errorf("each query must be a JSON object")
-	}
-
-	present := make(map[string]bool)
-	for dec.More() {
-		keyTok, err := dec.Token()
-		if err != nil {
-			return q, err
-		}
-		key := keyTok.(string)
-		switch key {
-		case "op", "name", "start", "end", "labels":
-		default:
-			return q, fmt.Errorf("unknown field %q", key)
-		}
-		if present[key] {
-			return q, fmt.Errorf("duplicate field %q", key)
-		}
-		present[key] = true
-
-		switch key {
-		case "op":
-			t, err := dec.Token()
-			if err != nil {
-				return q, err
-			}
-			op, ok := t.(string)
-			if !ok {
-				return q, fmt.Errorf(`field "op" must be a string`)
-			}
-			if op != "query" {
-				return q, fmt.Errorf(`unknown op %q (only "query" is supported)`, op)
-			}
-		case "name":
-			t, err := dec.Token()
-			if err != nil {
-				return q, err
-			}
-			name, ok := t.(string)
-			if !ok {
-				return q, fmt.Errorf(`field "name" must be a string`)
-			}
-			if name == "" {
-				return q, fmt.Errorf(`field "name" must be a non-empty string`)
-			}
-			q.name = name
-		case "start", "end":
-			n, err := nextJSONNumber(dec, key)
-			if err != nil {
-				return q, err
-			}
-			v, err := parseJSONInt(n)
-			if err != nil {
-				return q, fmt.Errorf(`field %q: %s`, key, err)
-			}
-			if key == "start" {
-				q.start = v
-			} else {
-				q.end = v
-			}
-		case "labels":
-			labels, err := parseLabels(dec, `field "labels" must be an object of non-empty string keys to string values`)
-			if err != nil {
-				return q, err
-			}
-			q.labels = labels
-		}
-	}
-	if _, err := dec.Token(); err != nil { // 消耗 '}'
-		return q, err
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		if err == nil {
-			return q, fmt.Errorf("unexpected content after the query object")
-		}
-		return q, err
-	}
-
-	for _, field := range []string{"op", "name", "start", "end"} {
-		if !present[field] {
-			return q, fmt.Errorf("missing required field %q", field)
-		}
-	}
-	return q, nil
+	err := parseStrictObject(raw,
+		"each query must be a JSON object",
+		"unexpected content after the query object",
+		[]string{"op", "name", "start", "end"},
+		map[string]fieldReader{
+			"op": func(dec *json.Decoder) error {
+				t, err := dec.Token()
+				if err != nil {
+					return err
+				}
+				op, ok := t.(string)
+				if !ok {
+					return fmt.Errorf(`field "op" must be a string`)
+				}
+				if op != "query" {
+					return fmt.Errorf(`unknown op %q (only "query" is supported)`, op)
+				}
+				return nil
+			},
+			"name":  func(dec *json.Decoder) error { return readNameField(dec, &q.name) },
+			"start": func(dec *json.Decoder) error { return readInt64Field(dec, "start", &q.start) },
+			"end":   func(dec *json.Decoder) error { return readInt64Field(dec, "end", &q.end) },
+			"labels": func(dec *json.Decoder) error {
+				return readLabelsField(dec, `field "labels" must be an object of non-empty string keys to string values`, &q.labels)
+			},
+		})
+	return q, err
 }
 
 // labelsMatch 实现子集匹配：want 中每个键都必须在 stored 中存在且值完全相等，

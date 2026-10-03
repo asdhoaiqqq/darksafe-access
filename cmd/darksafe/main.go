@@ -12,6 +12,10 @@ import (
 	"github.com/asdhoaiqqq/darksafe-access/darksafe"
 )
 
+// maxIngestLineBytes 是 ingest 单行内容的原始字节上限：64 MiB。
+// 行分隔符 '\n' 不计入；内容恰好达到上限仍可进入写入或查询处理，只有超过才失败。
+const maxIngestLineBytes = 64 * 1024 * 1024 // 67,108,864
+
 func main() {
 	command := "demo"
 	if len(os.Args) > 1 {
@@ -47,7 +51,13 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  queries only read data committed by earlier successful write lines and")
 	fmt.Fprintln(w, "  never change storage. Blank lines produce no result but still count toward")
 	fmt.Fprintln(w, "  line numbers. Accepted data is held in memory for this process only and is")
-	fmt.Fprintln(w, "  never written to disk.")
+	fmt.Fprintln(w, "  never written to disk. A single line may contain at most 67,108,864 raw")
+	fmt.Fprintln(w, "  bytes (64 MiB); the line separator is not counted, so a line of exactly")
+	fmt.Fprintln(w, "  that length is still processed. A longer line always fails as one whole")
+	fmt.Fprintln(w, "  line: it is never split into multiple inputs and even a valid JSON prefix")
+	fmt.Fprintln(w, "  is never treated as a complete request, so it writes no points and runs no")
+	fmt.Fprintln(w, "  query. It still produces one error result, data committed by earlier lines")
+	fmt.Fprintln(w, "  is retained, and later lines continue to be processed in input order.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  Write line: a JSON array of sample objects; each line is one batch.")
 	fmt.Fprintln(w, "  A sample is {\"name\": string, \"timestamp\": <int64 milliseconds>,")
@@ -86,6 +96,8 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "           \"conflict\":{...}} — index is the 1-based sample position and is")
 	fmt.Fprintln(w, "           omitted when the whole line cannot be parsed or for query lines;")
 	fmt.Fprintln(w, "           conflict reports the series, timestamp, existing and submitted values.")
+	fmt.Fprintln(w, "           An over-long line reports the size limit as a whole-line error with")
+	fmt.Fprintln(w, "           no index and no conflict.")
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  Processing continues after a failed line. The command exits non-zero if any")
 	fmt.Fprintln(w, "  line failed, and zero when every line succeeded.")
@@ -94,21 +106,42 @@ func usage(w io.Writer) {
 // runIngest 逐行处理标准输入，逐行输出 JSON 结果。返回进程退出码。
 func runIngest(in io.Reader, out io.Writer) int {
 	store := darksafe.NewMetricStore()
-	scanner := bufio.NewScanner(in)
-	// 单行可能包含任意大的批次，提高缓冲上限。
-	scanner.Buffer(make([]byte, 0, 64*1024), 64*1024*1024)
+	r := bufio.NewReaderSize(in, 64*1024)
 	enc := json.NewEncoder(out)
 	enc.SetEscapeHTML(false)
 
 	exitCode := 0
 	lineNo := 0
-	for scanner.Scan() {
+	for {
+		line, err := readIngestLine(r)
+		if err == io.EOF {
+			return exitCode
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ingest: read error:", err)
+			return 1
+		}
 		lineNo++
-		line := scanner.Text()
-		if len(strings.TrimSpace(line)) == 0 {
+		if line.tooLong {
+			// 超长行从开头到下一个行分隔符都属于同一条失败输入：
+			// 内容已整体排空，不解析、不写入任何点、不执行任何查询。
+			lineErr := &darksafe.LineError{
+				Status: "error",
+				Line:   lineNo,
+				Error: fmt.Sprintf("line exceeds the %d-byte (64 MiB) single-line size limit",
+					maxIngestLineBytes),
+			}
+			if err := enc.Encode(lineErr); err != nil {
+				fmt.Fprintln(os.Stderr, "ingest: write error:", err)
+				return 1
+			}
+			exitCode = 1
+			continue
+		}
+		if len(strings.TrimSpace(line.text)) == 0 {
 			continue // 空白行不产生结果，但已计入行号
 		}
-		result, lineErr := store.ProcessLine(line)
+		result, lineErr := store.ProcessLine(line.text)
 		if lineErr != nil {
 			lineErr.Line = lineNo
 			if err := enc.Encode(lineErr); err != nil {
@@ -123,11 +156,65 @@ func runIngest(in io.Reader, out io.Writer) int {
 			return 1
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		fmt.Fprintln(os.Stderr, "ingest: read error:", err)
-		return 1
+}
+
+// ingestLine 是读到的一行内容，不含结尾的 '\n' 分隔符（分隔符不计入行大小）。
+// tooLong 为 true 时表示该行内容超过 maxIngestLineBytes，text 不保留其内容；
+// 该行从开头到下一个 '\n' 的全部字节都已被排空，不会拆成多条输入。
+type ingestLine struct {
+	text    string
+	tooLong bool
+}
+
+// readIngestLine 读取下一行输入。沿用 bufio.Scanner 的换行识别方式：
+// 以 '\n' 分隔，结尾的 '\n' 不属于行内容（"foo\r\n" 的内容仍为 "foo\r"，
+// 因此空白判定与现有行为一致）。行内容不超过上限时累积到 text；
+// 一旦超过上限，停止累积并继续排空到下一个 '\n' 或输入结束，返回 tooLong。
+// 输入直接结束且没有任何字节时返回 io.EOF；超长行在末尾无换行结束时
+// 同样作为一条失败行返回，下一次调用才返回 io.EOF，不会丢失或重复。
+// 除 io.EOF 外的非空 error 均为底层输入读取故障，调用方应终止处理。
+func readIngestLine(r *bufio.Reader) (ingestLine, error) {
+	var b strings.Builder
+	size := 0
+	tooLong := false
+	for {
+		chunk, err := r.ReadSlice('\n')
+		if len(chunk) > 0 {
+			if chunk[len(chunk)-1] == '\n' {
+				chunk = chunk[:len(chunk)-1]
+			}
+			size += len(chunk)
+			if size > maxIngestLineBytes {
+				tooLong = true
+				b = strings.Builder{} // 内容已注定失败，排空后续片段时不再保留此前累积
+			}
+			if !tooLong {
+				b.Write(chunk)
+			}
+		}
+		switch err {
+		case nil:
+			if tooLong {
+				return ingestLine{tooLong: true}, nil
+			}
+			return ingestLine{text: b.String()}, nil
+		case bufio.ErrBufferFull:
+			// 行尚未结束且本次缓冲已耗尽，继续读取后续片段。
+			continue
+		case io.EOF:
+			// 最后一行没有结尾换行；完全没有读到字节才表示输入结束，
+			// 否则最后一行（含超长行）在本次返回，下次调用才得到 io.EOF。
+			if size == 0 {
+				return ingestLine{}, io.EOF
+			}
+			if tooLong {
+				return ingestLine{tooLong: true}, nil
+			}
+			return ingestLine{text: b.String()}, nil
+		default:
+			return ingestLine{}, err
+		}
 	}
-	return exitCode
 }
 
 func runDemo() {

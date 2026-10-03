@@ -82,9 +82,10 @@ func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, se
 
 	original := cloneDecisionValue(rec.Decision.Decision)
 	req := rec.Decision.Request
-	if len(req.Subject.Roles) > 0 {
-		req.Subject.Roles = append([]string(nil), req.Subject.Roles...)
-	}
+	// Detach even an empty role list: checkRequest/evaluate only read it,
+	// but the request handed around here must never share spare capacity
+	// with the exported material the caller is free to append to.
+	req.Subject.Roles = cloneStrings(req.Subject.Roles)
 	version := original.Version
 
 	var recomputed Decision
@@ -149,11 +150,10 @@ func policiesBefore(records []AuditRecord, limit, version int) ([]Policy, bool) 
 }
 
 // cloneDecisionValue returns a decision detached from the input's matched
-// slice.
+// slice. The list is copied even when empty, so an empty non-nil matched
+// list with spare capacity stays independent of the input material.
 func cloneDecisionValue(d Decision) Decision {
-	if len(d.Matched) > 0 {
-		d.Matched = append([]string(nil), d.Matched...)
-	}
+	d.Matched = cloneStrings(d.Matched)
 	return d
 }
 

@@ -354,9 +354,9 @@ func TestEmptyListShapesAndMatchlessDenialsPreserved(t *testing.T) {
 	}
 
 	nilReq := request("acme", "u1", "r1", "org/a", "read") // roles left nil
-	nilDeny := s.Decide("acme", nilReq)                     // seq 2
+	nilDeny := s.Decide("acme", nilReq)                    // seq 2
 	emptyReq := request("acme", "u2", "r1", "org/a", "read")
-	emptyReq.Subject.Roles = []string{} // explicitly empty
+	emptyReq.Subject.Roles = []string{}     // explicitly empty
 	emptyDeny := s.Decide("acme", emptyReq) // seq 3
 	disabledReq := request("acme", "u3", "r1", "org/a", "read")
 	disabledReq.Subject.Disabled = true
@@ -443,6 +443,244 @@ func TestEmptyListShapesAndMatchlessDenialsPreserved(t *testing.T) {
 		if rv := mustOfflineReview(t, recs, cp, seq); !rv.Consistent {
 			t.Fatalf("matchless denial seq %d review inconsistent: %+v", seq, rv)
 		}
+	}
+}
+
+// emptyCapacityRequest builds a legal request whose subject carries a
+// non-nil, empty role list with spare capacity: make([]string, 0, cap).
+// That is the one empty shape append can grow in place, and it is exactly
+// what a careless "copy only non-empty lists" clone leaves aliased.
+func emptyCapacityRequest(subject string, capacity int) OrgRequest {
+	req := request("acme", subject, "r1", "org/a", "read")
+	req.Subject.Roles = make([]string, 0, capacity)
+	return req
+}
+
+// assertEmptyRolesStored pins both the shape and the detachment of an
+// empty role list read back from one record: non-nil, length zero, and no
+// spare capacity shared with any other material.
+func assertEmptyRolesStored(t *testing.T, r *AuditRecord, seq int) {
+	t.Helper()
+	roles := r.Decision.Request.Subject.Roles
+	if roles == nil {
+		t.Fatalf("seq %d: explicitly empty roles read back as nil", seq)
+	}
+	if len(roles) != 0 {
+		t.Fatalf("seq %d: stored roles = %q, want empty", seq, roles)
+	}
+	if cap(roles) != 0 {
+		t.Fatalf("seq %d: empty roles keep spare capacity %d; the copy still shares an array", seq, cap(roles))
+	}
+}
+
+// TestEmptyCapacityRoleListsAreDetachedCopies covers the edge the
+// non-empty list tests cannot reach: the request's role list is a non-nil
+// empty slice carrying spare capacity (a list the caller built intending
+// to append later). The audit material is an independent snapshot taken
+// at Decide time, so an empty list must obey the same rule as a populated
+// one — regardless of whether the access was allowed, denied by policy,
+// or rejected at the envelope by a disabled subject.
+//
+// Two materials obtained by export, the first query page and a later page
+// each hand back an empty list the caller may append to immediately, with
+// no copy of its own: roles appended to one material can never overwrite
+// roles appended to another, and appending to the request the caller
+// originally submitted reaches neither the retained materials nor the
+// stored chain. A fresh read still shows the empty list (non-nil, not
+// nil), and the original allowance, reason, matched policies and actual
+// version are unchanged; the unedited material keeps verifying and
+// reviewing against the original checkpoint.
+func TestEmptyCapacityRoleListsAreDetachedCopies(t *testing.T) {
+	s := NewStore()
+	if _, err := s.Publish("acme", 0, listIsolationPolicies()); err != nil { // seq 1, v1
+		t.Fatal(err)
+	}
+
+	allowReq := emptyCapacityRequest("u2", 4)
+	allowD := s.Decide("acme", allowReq) // seq 2, allowed
+	denyReq := emptyCapacityRequest("u1", 4)
+	denyD := s.Decide("acme", denyReq) // seq 3, denied with matches
+	disabledReq := emptyCapacityRequest("u3", 4)
+	disabledReq.Subject.Disabled = true
+	envDeny := s.Decide("acme", disabledReq) // seq 4, envelope rejection
+
+	if !allowD.Allowed || allowD.Version != 1 {
+		t.Fatalf("setup allow decision = %+v", allowD)
+	}
+	if denyD.Allowed || denyD.Reason != "matched deny policy" || denyD.Version != 1 || len(denyD.Matched) != 3 {
+		t.Fatalf("setup deny decision = %+v, want a denial carrying 3 matches", denyD)
+	}
+	if envDeny.Allowed || envDeny.Reason != "subject is disabled" || envDeny.Version != 0 || envDeny.Matched != nil {
+		t.Fatalf("setup envelope denial = %+v, want nil matched, version 0", envDeny)
+	}
+	wantAllow := cloneDecisionValue(allowD)
+	wantDeny := cloneDecisionValue(denyD)
+	wantEnv := cloneDecisionValue(envDeny)
+
+	// A pristine export and checkpoint retained before any caller edit.
+	pristine, cp, err := s.AuditExport("acme", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyAudit("acme", pristine, cp); err != nil {
+		t.Fatalf("pristine material must verify: %v", err)
+	}
+
+	// Two complete exports, obtained separately, must not share storage.
+	m1, _, err := s.AuditExport("acme", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2, _, err := s.AuditExport("acme", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First query page and a later page hand back independently editable
+	// copies as well: page 1 covers seq 1-2, page 2 covers seq 3-4.
+	page1, err := s.AuditQuery("acme", 1, 2, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	page2, err := s.AuditPage(page1.Checkpoint, page1.Next, 2, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page2.Next != 0 || len(page1.Records) != 2 || len(page2.Records) != 2 ||
+		page1.Records[1].Seq != 2 || page2.Records[0].Seq != 3 || page2.Records[1].Seq != 4 {
+		t.Fatalf("paging layout wrong: page1=%+v page2=%+v", page1.Records, page2.Records)
+	}
+
+	// Every handed-out empty list starts non-nil, empty and capacity-free.
+	for _, view := range []struct {
+		name string
+		rec  *AuditRecord
+	}{
+		{"export one", recordBySeq(t, m1, 2)},
+		{"export two", recordBySeq(t, m2, 2)},
+		{"first page", recordBySeq(t, page1.Records, 2)},
+		{"later page", recordBySeq(t, page2.Records, 3)},
+		{"disabled record", recordBySeq(t, page2.Records, 4)},
+	} {
+		assertEmptyRolesStored(t, view.rec, view.rec.Seq)
+	}
+
+	// Append to the first export's empty list, then the second export's:
+	// the first appended role must survive the second append.
+	first := recordBySeq(t, m1, 2)
+	first.Decision.Request.Subject.Roles = append(first.Decision.Request.Subject.Roles, "临时角色甲")
+	second := recordBySeq(t, m2, 2)
+	second.Decision.Request.Subject.Roles = append(second.Decision.Request.Subject.Roles, "临时角色乙")
+	if got := first.Decision.Request.Subject.Roles; !reflect.DeepEqual(got, []string{"临时角色甲"}) {
+		t.Fatalf("first material roles = %q, want [临时角色甲]: the second append overwrote it", got)
+	}
+	if got := second.Decision.Request.Subject.Roles; !reflect.DeepEqual(got, []string{"临时角色乙"}) {
+		t.Fatalf("second material roles = %q, want [临时角色乙]", got)
+	}
+
+	// Edits through the paged materials stay with those copies too,
+	// including the disabled subject's rejection record.
+	pageAllow := recordBySeq(t, page1.Records, 2)
+	pageAllow.Decision.Request.Subject.Roles = append(pageAllow.Decision.Request.Subject.Roles, "分页角色甲")
+	pageDeny := recordBySeq(t, page2.Records, 3)
+	pageDeny.Decision.Request.Subject.Roles = append(pageDeny.Decision.Request.Subject.Roles, "分页角色乙")
+	pageEnv := recordBySeq(t, page2.Records, 4)
+	pageEnv.Decision.Request.Subject.Roles = append(pageEnv.Decision.Request.Subject.Roles, "分页角色停用")
+	for _, view := range []struct {
+		name string
+		rec  *AuditRecord
+		want []string
+	}{
+		{"export one", first, []string{"临时角色甲"}},
+		{"export two", second, []string{"临时角色乙"}},
+		{"first page", pageAllow, []string{"分页角色甲"}},
+		{"later page deny", pageDeny, []string{"分页角色乙"}},
+		{"later page disabled", pageEnv, []string{"分页角色停用"}},
+	} {
+		if got := view.rec.Decision.Request.Subject.Roles; !reflect.DeepEqual(got, view.want) {
+			t.Fatalf("%s roles = %q, want %q: materials share storage", view.name, got, view.want)
+		}
+	}
+
+	// Appending to the request the caller originally submitted reaches
+	// neither the materials already handed out nor the stored decision.
+	allowReq.Subject.Roles = append(allowReq.Subject.Roles, "原始列表追加")
+	denyReq.Subject.Roles = append(denyReq.Subject.Roles, "原始拒绝追加")
+	disabledReq.Subject.Roles = append(disabledReq.Subject.Roles, "原始停用追加")
+	if got := first.Decision.Request.Subject.Roles; !reflect.DeepEqual(got, []string{"临时角色甲"}) {
+		t.Fatalf("first material changed from the caller's own later append: %q", got)
+	}
+	if got := second.Decision.Request.Subject.Roles; !reflect.DeepEqual(got, []string{"临时角色乙"}) {
+		t.Fatalf("second material changed from the caller's own later append: %q", got)
+	}
+
+	// A fresh read still shows the decision-time empty lists — non-nil,
+	// never unified with the nil shape — and the decisions themselves are
+	// exactly the ones originally returned.
+	fresh, freshCP, err := s.AuditExport("acme", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freshCP != cp {
+		t.Fatalf("checkpoint changed: %+v vs %+v", freshCP, cp)
+	}
+	if err := VerifyAudit("acme", fresh, cp); err != nil {
+		t.Fatalf("fresh export fails the original checkpoint: %v", err)
+	}
+	if !reflect.DeepEqual(fresh, pristine) {
+		t.Fatal("pristine material diverged after other copies were edited")
+	}
+	emptyButNotNil := []string{}
+	assertDecisionListContent(t, recordBySeq(t, fresh, 2), 2, emptyButNotNil, wantAllow)
+	assertDecisionListContent(t, recordBySeq(t, fresh, 3), 3, emptyButNotNil, wantDeny)
+	assertDecisionListContent(t, recordBySeq(t, fresh, 4), 4, emptyButNotNil, wantEnv)
+	for _, seq := range []int{2, 3, 4} {
+		assertEmptyRolesStored(t, recordBySeq(t, fresh, seq), seq)
+	}
+
+	// Online and offline rechecks still reach the original conclusions,
+	// and the paged read agrees with the export.
+	if got, err := s.RecheckDecision("acme", 2); err != nil || !reflect.DeepEqual(got, wantAllow) {
+		t.Fatalf("online allow recheck = %+v, %v, want %+v", got, err, wantAllow)
+	}
+	if got, err := s.RecheckDecision("acme", 3); err != nil || !reflect.DeepEqual(got, wantDeny) {
+		t.Fatalf("online deny recheck = %+v, %v, want %+v", got, err, wantDeny)
+	}
+	if got, err := s.RecheckDecision("acme", 4); err != nil || !reflect.DeepEqual(got, wantEnv) {
+		t.Fatalf("online envelope recheck = %+v, %v, want %+v", got, err, wantEnv)
+	}
+	for _, seq := range []int{2, 3, 4} {
+		if rv := mustOfflineReview(t, pristine, cp, seq); !rv.Consistent {
+			t.Fatalf("seq %d offline review inconsistent: %+v", seq, rv)
+		}
+	}
+	if got := drainAudit(t, s, "acme", AuditDecision, ""); !reflect.DeepEqual(got, fresh[1:]) {
+		t.Fatal("paged query disagrees with the fresh export")
+	}
+
+	// The unedited material still archives, reads back and reviews
+	// offline exactly as before, with every empty list non-nil.
+	archive, err := EncodeAuditArchive("acme", pristine, cp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := DecodeAuditArchive(archive, "acme", cp)
+	if err != nil {
+		t.Fatalf("archive decode: %v", err)
+	}
+	if !reflect.DeepEqual(decoded, pristine) {
+		t.Fatal("archive round trip changed the empty-list material")
+	}
+	for _, seq := range []int{2, 3, 4} {
+		assertEmptyRolesStored(t, recordBySeq(t, decoded, seq), seq)
+		if rv := mustOfflineReview(t, decoded, cp, seq); !rv.Consistent {
+			t.Fatalf("archived seq %d offline review inconsistent: %+v", seq, rv)
+		}
+	}
+
+	// All of the above is read-only: no record was appended.
+	if got := len(drainAudit(t, s, "acme", "", "")); got != 4 {
+		t.Fatalf("records = %d, want 4; reads and edits must not append", got)
 	}
 }
 

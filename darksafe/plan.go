@@ -110,6 +110,11 @@ func (e *duplicateMemberError) Error() string {
 // second occurrence that appears earliest wins, regardless of value type.
 func checkDuplicateMembers(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	// Numbers are only walked past, never interpreted: UseNumber keeps legal
+	// JSON numbers beyond float64 range (e.g. 1e400) from being turned into an
+	// unmarshal-overflow error here. Whether a number is acceptable for a given
+	// field is decided later by business validation.
+	dec.UseNumber()
 	if err := walkJSONValue(dec, "$"); err != nil {
 		return err
 	}

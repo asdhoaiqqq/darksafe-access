@@ -219,6 +219,11 @@ func (s *MetricStore) QueryLine(line string) (*QueryResult, *LineError) {
 // decodeTopValue 解析单行中唯一的 JSON 值并返回其原始内容与首个非空白字节
 // （'[' 或 '{'）。整个值无法解析、为空或存在尾随内容时返回 *LineError。
 func decodeTopValue(line string) (json.RawMessage, byte, *LineError) {
+	// 编码校验必须先于任何 JSON 解析：encoding/json 会把非法 UTF-8 字节与未配对
+	// 代理项转义静默替换为 U+FFFD，损坏文本因此可能混入合法序列身份。
+	if lerr := validateLineEncoding(line); lerr != nil {
+		return nil, 0, lerr
+	}
 	dec := json.NewDecoder(strings.NewReader(line))
 	var top json.RawMessage
 	if err := dec.Decode(&top); err != nil {

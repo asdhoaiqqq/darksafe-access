@@ -359,15 +359,11 @@ func ValidateReleaseInput(in ReleasePlanInput) error {
 	if err := checkSpreadBy(in.SpreadBy); err != nil {
 		return err
 	}
-	seen := make(map[string]struct{}, len(in.Clusters))
+	ids := newClusterIDSet(len(in.Clusters))
 	for i, c := range in.Clusters {
-		if strings.TrimSpace(c.ID) == "" {
-			return fmt.Errorf("clusters[%d]: 字段 %q 不能为空或只含空白", i, "id")
+		if err := ids.check(i, c.ID); err != nil {
+			return err
 		}
-		if _, dup := seen[c.ID]; dup {
-			return fmt.Errorf("clusters[%d]: 重复的集群标识 %q", i, c.ID)
-		}
-		seen[c.ID] = struct{}{}
 		if err := validateTagKeys(i, c.Tags); err != nil {
 			return err
 		}
@@ -441,20 +437,16 @@ func parseClusters(v any) ([]Cluster, error) {
 		return nil, errors.New("字段 \"clusters\" 必须是数组")
 	}
 	clusters := make([]Cluster, 0, len(raw))
-	seen := make(map[string]bool)
+	ids := newClusterIDSet(len(raw))
 	for i, item := range raw {
 		obj, ok := item.(map[string]any)
 		if !ok {
 			return nil, fmt.Errorf("clusters[%d] 必须是对象", i)
 		}
-		id, err := requiredString(obj, "id")
+		id, err := clusterIDFromJSON(obj, i, ids)
 		if err != nil {
-			return nil, fmt.Errorf("clusters[%d]: %w", i, err)
+			return nil, err
 		}
-		if seen[id] {
-			return nil, fmt.Errorf("clusters[%d]: 重复的集群标识 %q", i, id)
-		}
-		seen[id] = true
 
 		disabled := false
 		if dv, present := obj["disabled"]; present {
@@ -483,6 +475,25 @@ func parseClusters(v any) ([]Cluster, error) {
 		clusters = append(clusters, Cluster{ID: id, Disabled: disabled, Tags: tags})
 	}
 	return clusters, nil
+}
+
+// clusterIDFromJSON reads the "id" member of one candidate object and applies
+// the shared cluster-identity rule. A missing member or a non-string value is
+// a JSON decoding problem with its own reason; an empty or duplicate ID is
+// reported by the shared rule exactly as for a directly constructed config.
+func clusterIDFromJSON(obj map[string]any, index int, ids *clusterIDSet) (string, error) {
+	v, ok := obj["id"]
+	if !ok {
+		return "", fmt.Errorf("clusters[%d]: 缺少必需字段 %q", index, "id")
+	}
+	id, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("clusters[%d]: 字段 %q 必须是字符串", index, "id")
+	}
+	if err := ids.check(index, id); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 func parseConditions(v any, field string) ([]LabelCondition, error) {

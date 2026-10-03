@@ -6,6 +6,8 @@ darksafe 目前已交付、可独立使用的功能是**容器应用发布计划
 
 计划全程在本机计算：**不连接 Kubernetes 或任何集群，不执行实际发布**，不需要外部服务或网络。
 
+同一份规划能力也以 **Go 库**形式公开：不经过 JSON 文件和命令行，直接在内存中构造 `darksafe.ReleasePlanInput` 并调用 `darksafe.MakeReleasePlan` 即可得到计划，用法见下文[「作为 Go 库使用：用内存配置计算计划」](#作为-go-库使用用内存配置计算计划)。
+
 仓库的长期产品方向是零信任身份与授权决策平台（见 `PRODUCT_GOAL.md`）：访问决策核心位于 `darksafe/`，由 `demo` 命令演示；发布计划的领域逻辑同样位于 `darksafe/`，命令入口位于 `cmd/darksafe/`。
 
 ## 运行要求
@@ -205,6 +207,135 @@ go run ./cmd/darksafe plan plan.json
 ```
 
 **成功与失败的统一约定**：成功时退出状态为 0，标准输出仅包含完整计划 JSON（应用信息、从 1 开始连续编号的批次、按标识升序的未入选集群及原因），标准错误为空；失败时退出状态非零（配置或规划规则问题退出码为 1，命令用法错误退出码为 2），问题说明写入标准错误，标准输出为空。
+
+## 作为 Go 库使用：用内存配置计算计划
+
+如果调用方已经在 Go 程序里持有应用与集群信息，就不必先写 JSON 文件再调命令行：`darksafe` 包把规划能力作为公开 API 提供，**直接用内存中的 `darksafe.ReleasePlanInput` 计算计划**。计算仍然全部在本机进程内完成，不连接集群、不执行实际发布，也不需要任何外部服务。
+
+- `darksafe.ReleasePlanInput`：一份发布配置，字段与 JSON 配置一一对应——`App`、`Revision`、`Image`、`BatchSize`、`Clusters`、`Include`、`Exclude`、`SpreadBy`；候选集群是 `darksafe.Cluster{ID, Disabled, Tags}`，条件是 `darksafe.LabelCondition`（一个 `map[string]string`，键值需全部匹配）。
+- `darksafe.MakeReleasePlan(in)`：校验配置并计算计划，成功返回 `darksafe.ReleasePlan`（含 `App`、`Batches`、`Excluded`）和 `nil` 错误；失败返回**零值计划**和非空错误。它不会修改传入的 `in`。
+- `darksafe.ValidateReleaseInput(in)`：只检查配置是否合法，不做规划；`MakeReleasePlan` 在计算前会自动调用它，库调用方也可以单独调用（例如提前校验表单输入）。
+
+下面是一个**完整、可独立运行**的示例（一个应用、一个修订、一份镜像配置），展示应用信息、候选集群、筛选条件与分批参数的传入方式，以及成功后如何读取批次和未入选原因：
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"strings"
+
+	"github.com/asdhoaiqqq/darksafe-access/darksafe"
+)
+
+func main() {
+	// 候选在代码中的书写顺序刻意不同于标识顺序：c-c 写在最前。
+	in := darksafe.ReleasePlanInput{
+		App:       "payments-gateway",
+		Revision:  "2026.10.0-r3",
+		Image:     "registry.example.net/payments-gateway:2026.10.0-r3",
+		BatchSize: 2,
+		SpreadBy:  "zone",
+		Include:   []darksafe.LabelCondition{{"env": "prod"}},
+		Exclude:   []darksafe.LabelCondition{{"quarantine": "true"}},
+		Clusters: []darksafe.Cluster{
+			{ID: "c-c", Tags: map[string]string{"env": "prod", "zone": "west"}},
+			{ID: "c-e", Tags: map[string]string{"env": "prod", "quarantine": "true"}},
+			{ID: "c-a", Tags: map[string]string{"env": "prod", "zone": "east"}},
+			{ID: "c-d", Disabled: true},
+			{ID: "c-b", Tags: map[string]string{"env": "prod", "zone": "east"}},
+		},
+	}
+
+	plan, err := darksafe.MakeReleasePlan(in)
+	if err != nil {
+		log.Fatal(err) // 失败时 err 即具体原因；此时 plan 是零值，不能当成成功计划使用
+	}
+
+	fmt.Printf("应用: %s  修订: %s  镜像: %s\n", plan.App.Name, plan.App.Revision, plan.App.Image)
+	for _, b := range plan.Batches {
+		fmt.Printf("第 %d 批: %s\n", b.Index, strings.Join(b.Clusters, ", "))
+	}
+	for _, e := range plan.Excluded {
+		fmt.Printf("未入选 %s: %s\n", e.ID, e.Reason)
+	}
+}
+```
+
+`c-a`、`c-b` 属于 `east` 故障域，`c-c` 属于 `west`；`BatchSize` 为 2、`SpreadBy` 为 `zone`。实际输出：
+
+```
+应用: payments-gateway  修订: 2026.10.0-r3  镜像: registry.example.net/payments-gateway:2026.10.0-r3
+第 1 批: c-a, c-c
+第 2 批: c-b
+未入选 c-d: 集群已停用
+未入选 c-e: 命中排除条件
+```
+
+对照输入逐条理解：
+
+- **应用信息按输入保留**：`plan.App.Name`、`plan.App.Revision`、`plan.App.Image` 原样回显。
+- **分批**：入选集群先按标识升序考察。第 1 批从 `c-a`（占用 east）开始；`c-b` 同为 east 而冲突，延后到后续批次；`c-c` 属于 west，不与 east 冲突，照常进入本批，批次达到容量 2 后关闭为 `[c-a, c-c]`。第 2 批只剩延后的 `c-b`，以 1 个集群关闭。批次编号**从 1 开始连续**，批内标识保持升序；候选在代码中的书写顺序（`c-c` 在最前）不影响任何结果。
+- **未入选列表按标识升序排列**：`c-d` 已停用（`Disabled: true`，且没有 `zone` 标签），原因是「集群已停用」；`c-e` 同时命中包含条件（`env=prod`）与排除条件（`quarantine=true`），按「停用 → 排除 → 包含」的固定优先级，原因是「命中排除条件」。两者都没有 `zone` 标签，但因为在筛选阶段就已离开候选，**不需要故障域标签，仍按各自的筛选优先级进入未入选列表，不影响计划成功**。
+
+### 单独校验与计算计划的区别
+
+`ValidateReleaseInput` 只回答「这份配置**合不合法**」，**校验成功并不保证有集群可发布**——是否真的算出批次，要由 `MakeReleasePlan` 决定。用**空候选列表**最能说明这个区别：应用信息与其他参数都合法时，单独校验可以成功，而计算计划会失败：
+
+```go
+empty := in
+empty.Clusters = nil
+
+fmt.Println(darksafe.ValidateReleaseInput(empty)) // 配置合法：<nil>
+plan, err := darksafe.MakeReleasePlan(empty)
+fmt.Println(err)  // 没有可发布的集群：未提供候选集群
+_ = plan          // 此时为零值计划，不能当成“空但成功”的计划使用
+```
+
+输出：
+
+```
+<nil>
+没有可发布的集群：未提供候选集群
+```
+
+也就是说，**调用方不能把出错时返回的计划值当成成功计划**：`MakeReleasePlan` 一旦返回非空错误，返回的 `ReleasePlan` 就是零值，必须先判断 `err`。同样地，当所有候选都被筛掉、或入选集群缺少 `SpreadBy` 指定的标签时，`MakeReleasePlan` 也返回非空错误和零值计划，错误文案与命令行一节展示的完全一致（前者在错误中按标识升序列出全部候选的未入选原因，后者指出缺失的标签名和标识最小的问题集群）。
+
+### 候选标识规则与重复标识错误
+
+集群 `ID` 在**全部候选中必须唯一**，检查发生在任何停用/筛选判断之前：因此重复项**即使已停用、或注定会被包含/排除条件筛掉，也照样报错**，不会因为“反正要被丢弃”而被放过。错误会指明**后出现那条记录的位置（从 0 开始）以及重复的标识**，例如：
+
+```go
+dup := in
+dup.Clusters = []darksafe.Cluster{
+	{ID: "c-a", Tags: map[string]string{"env": "prod", "zone": "east"}},
+	{ID: "c-a", Disabled: true}, // 与第 0 项重复，即使已停用也报错
+}
+_, err := darksafe.MakeReleasePlan(dup)
+fmt.Println(err)
+```
+
+输出：
+
+```
+clusters[1]: 重复的集群标识 "c-a"
+```
+
+合法标识按**原字符串保留和比较**，不做大小写折叠或首尾修剪：`"c-a"`、`"C-A"`、`" c-a "` 是三个互不相同的集群，可以同时入选，回显和排期都保持原样；而**空字符串和只含空白的标识不合法**（`clusters[0]: 字段 "id" 不能为空或只含空白`）。标签键、标签值和条件同理，都按原字符串精确匹配。
+
+### 库调用与命令行的关系
+
+两种入口共用同一套规则与错误文案，差别只在配置来源和结果去向：
+
+| | 命令行 `plan <JSON文件>` | Go 库 `MakeReleasePlan` |
+|---|---|---|
+| 配置来源 | JSON 文件（经 `ParseReleaseInput` 解析，重复 JSON 成员名会被拒绝） | 内存中的 `ReleasePlanInput` 结构体 |
+| 成功 | 退出码 0，完整计划写到标准输出 | 返回 `ReleasePlan, nil`，由调用方读取 `App`/`Batches`/`Excluded` |
+| 失败 | 非零退出，原因写到标准错误，标准输出为空 | 返回零值 `ReleasePlan` 和非空 `error`，错误说明具体原因 |
+| 可选的预校验 | — | `ValidateReleaseInput` 只校验合法性，不保证有集群可发布 |
+
+无论哪种入口，计算都在本机离线完成：**不连接 Kubernetes 或任何集群，不执行实际发布**。
 
 ## 长期产品方向
 

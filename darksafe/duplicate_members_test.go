@@ -146,7 +146,8 @@ func TestParse_DuplicateRejectedRegardlessOfValues(t *testing.T) {
 
 func TestParse_DuplicateNamesComparedAfterDecoding(t *testing.T) {
 	base := `"app":"a","revision":"r","image":"i","batchSize":1`
-	// Equivalent Unicode escape spellings are the same name.
+	// "env" written directly vs. with its "v" written as a \u escape are the
+	// same name once decoded.
 	body := `{"id":"x","tags":{"env":"prod","env":"dev"}}`
 	err := parseDupErr(t, `{`+base+`,"clusters":[`+body+`]}`)
 	if !strings.Contains(err.Error(), `"env"`) {

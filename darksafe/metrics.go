@@ -313,38 +313,8 @@ func parseSample(raw json.RawMessage) (parsedSample, error) {
 			}
 			p.value = v
 		case "labels":
-			t, err := dec.Token()
+			labels, err := parseLabels(dec, `field "labels" must be an object of string keys to string values`)
 			if err != nil {
-				return p, err
-			}
-			d, ok := t.(json.Delim)
-			if !ok || d != '{' {
-				return p, fmt.Errorf(`field "labels" must be an object of string keys to string values`)
-			}
-			labels := map[string]string{}
-			for dec.More() {
-				labelKeyTok, err := dec.Token()
-				if err != nil {
-					return p, err
-				}
-				labelKey := labelKeyTok.(string)
-				if labelKey == "" {
-					return p, fmt.Errorf(`field "labels": label keys must be non-empty strings`)
-				}
-				valTok, err := dec.Token()
-				if err != nil {
-					return p, err
-				}
-				labelVal, ok := valTok.(string)
-				if !ok {
-					return p, fmt.Errorf(`field "labels": value of label %q must be a string`, labelKey)
-				}
-				if _, dup := labels[labelKey]; dup {
-					return p, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
-				}
-				labels[labelKey] = labelVal
-			}
-			if _, err := dec.Token(); err != nil { // 消耗 '}'
 				return p, err
 			}
 			p.labels = labels
@@ -366,6 +336,48 @@ func parseSample(raw json.RawMessage) (parsedSample, error) {
 		}
 	}
 	return p, nil
+}
+
+// parseLabels 从 dec 读取一个标签对象并做统一校验：必须是 JSON 对象
+// （否则返回调用方给出的 notObjectMsg，写入与查询措辞不同），键为非空字符串、
+// 值为字符串（空串合法，键值均不做清理），重复键一律拒绝。
+// 返回的集合不含标签时也是非 nil 的空 map，与省略 labels 的语义一致。
+func parseLabels(dec *json.Decoder, notObjectMsg string) (map[string]string, error) {
+	t, err := dec.Token()
+	if err != nil {
+		return nil, err
+	}
+	d, ok := t.(json.Delim)
+	if !ok || d != '{' {
+		return nil, fmt.Errorf("%s", notObjectMsg)
+	}
+	labels := map[string]string{}
+	for dec.More() {
+		labelKeyTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		labelKey := labelKeyTok.(string)
+		if labelKey == "" {
+			return nil, fmt.Errorf(`field "labels": label keys must be non-empty strings`)
+		}
+		valTok, err := dec.Token()
+		if err != nil {
+			return nil, err
+		}
+		labelVal, ok := valTok.(string)
+		if !ok {
+			return nil, fmt.Errorf(`field "labels": value of label %q must be a string`, labelKey)
+		}
+		if _, dup := labels[labelKey]; dup {
+			return nil, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
+		}
+		labels[labelKey] = labelVal
+	}
+	if _, err := dec.Token(); err != nil { // 消耗 '}'
+		return nil, err
+	}
+	return labels, nil
 }
 
 func nextJSONNumber(dec *json.Decoder, field string) (json.Number, error) {
@@ -591,38 +603,8 @@ func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 				q.end = v
 			}
 		case "labels":
-			t, err := dec.Token()
+			labels, err := parseLabels(dec, `field "labels" must be an object of non-empty string keys to string values`)
 			if err != nil {
-				return q, err
-			}
-			d, ok := t.(json.Delim)
-			if !ok || d != '{' {
-				return q, fmt.Errorf(`field "labels" must be an object of non-empty string keys to string values`)
-			}
-			labels := map[string]string{}
-			for dec.More() {
-				labelKeyTok, err := dec.Token()
-				if err != nil {
-					return q, err
-				}
-				labelKey := labelKeyTok.(string)
-				if labelKey == "" {
-					return q, fmt.Errorf(`field "labels": label keys must be non-empty strings`)
-				}
-				valTok, err := dec.Token()
-				if err != nil {
-					return q, err
-				}
-				labelVal, ok := valTok.(string)
-				if !ok {
-					return q, fmt.Errorf(`field "labels": value of label %q must be a string`, labelKey)
-				}
-				if _, dup := labels[labelKey]; dup {
-					return q, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
-				}
-				labels[labelKey] = labelVal
-			}
-			if _, err := dec.Token(); err != nil { // 消耗 '}'
 				return q, err
 			}
 			q.labels = labels

@@ -30,6 +30,83 @@ printf '%s\n' \
 
 查询对 `[start,end]` 闭区间内的点按序列返回 `count` 与算术平均 `average`；`labels` 省略或为 `{}` 时匹配该指标的全部序列，否则按子集匹配。详见 `go run ./cmd/darksafe help`。
 
+## 重复与冲突：同一序列、同一时间戳的再次提交
+
+一条序列由指标名加完整标签集合唯一确定；标签的书写顺序不影响身份，`{"host":"a","dc":"x"}` 与 `{"dc":"x","host":"a"}` 是同一条序列。对同一序列的同一时间戳再次提交时：
+
+- **数值相等**（`1` 与 `1.0` 相等）：视为重复采样，成功忽略，计入该批结果的 `duplicates`，不改变已存数据。
+- **数值不同**：视为冲突，整批被拒绝——已存在的值不会被覆盖，本批中排在前面的合法新增点也不会保留。写入不支持覆盖更新。
+
+成功结果中的 `added` 与 `duplicates` 只统计当前这一批；`series` 则展示截至目前的全部已提交数据，其中此前批次写入的旧点也会列出，它们不是本批新增。
+
+### 示例：冲突拒绝整批，改回等值后重提
+
+写入与查询放在同一次命令调用内；数据只保存在本次进程的内存中，进程结束即丢弃，不写盘、也不跨进程保留。先向 `cpu`、`host=a` 写入时间戳 1000、值 2；再提交一批：时间戳 2000、值 4 的新增点在前，时间戳 1000、值 9 的冲突点在后；随后查询覆盖两者的区间；最后把冲突点改回与已存值相等的 2，原样重提同一批次并再次查询：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '[{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}}]' \
+  '{"op":"query","name":"cpu","start":0,"end":3000,"labels":{"host":"a"}}' \
+  '[{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '{"op":"query","name":"cpu","start":0,"end":3000,"labels":{"host":"a"}}' \
+  | go run ./cmd/darksafe ingest
+```
+
+逐行输出：
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":2,"index":2,"error":"conflict: series cpu{host=a} at timestamp 1000 already has value 2, submitted 9","conflict":{"series":{"name":"cpu","labels":{"host":"a"}},"timestamp":1000,"existing":2,"submitted":9}}
+{"status":"ok","op":"query","series":[{"name":"cpu","labels":{"host":"a"},"count":1,"average":2}]}
+{"status":"ok","added":1,"duplicates":1,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2},{"timestamp":2000,"value":4}]}]}
+{"status":"ok","op":"query","series":[{"name":"cpu","labels":{"host":"a"},"count":2,"average":3}]}
+```
+
+第二行失败：`index` 为 2，指出出错的是批内第 2 个采样点；`conflict` 给出序列身份、时间戳、已存在的值（`existing` 为 2）与本次提交的值（`submitted` 为 9）。整批被拒绝：时间戳 1000 上仍是原来的 2，批内排在前面、本身合法的新增点（时间戳 2000、值 4）也没有写入，所以随后的查询仍只有一个点、平均值为 2。第四行把冲突点改回 2 后重提同一批次：时间戳 2000 的点作为新增写入（`added` 为 1），时间戳 1000 的等值点被忽略（`duplicates` 为 1）；查询得到两个点、平均值为 3。
+
+### 失败结果怎么读：line、index 与 conflict
+
+- `line` 是原始输入的行号，`index` 是出错采样点在数组内的位置，两者都从 1 开始。空白行不输出任何结果，但仍占行号。
+- 只有数值冲突才带 `conflict`。字段校验失败（缺字段、类型不对、重复键等）与整行解析失败都不附带 `conflict`——不要把所有 `error` 都当成数值冲突。
+- `conflict` 中的 `existing` 不一定已经写入存储：同一批次内首次对同一位置提交两个不同值时，`existing` 指批内较早出现的那个值；失败后这两个点都不会留下。
+- 某行失败后，后续各行仍按输入顺序继续处理；但只要出现过失败行，命令最终以非零退出码结束。
+
+下面这次调用在第 2 行留了一个空白行：它不产生输出，但占用了行号，所以第 3 行的批内冲突报告 `line` 为 3。该批对同一时间戳 2000 先提交 4、再提交 5——这是同一位置在本批的首次提交，`existing` 是批内较早出现的 4，而不是已写入的数据；整批失败后这两个点都不存在，查询仍只有第 1 行写入的点：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '' \
+  '[{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":2000,"value":5,"labels":{"host":"a"}}]' \
+  '{"op":"query","name":"cpu","start":0,"end":3000,"labels":{"host":"a"}}' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":3,"index":2,"error":"conflict: series cpu{host=a} at timestamp 2000 already has value 4, submitted 5","conflict":{"series":{"name":"cpu","labels":{"host":"a"}},"timestamp":2000,"existing":4,"submitted":5}}
+{"status":"ok","op":"query","series":[{"name":"cpu","labels":{"host":"a"},"count":1,"average":2}]}
+```
+
+再对比两类不带 `conflict` 的失败：下面第 1 行批内第 2 个采样点的 `timestamp` 是字符串，属于字段校验失败，带 `index` 但不带 `conflict`；第 2 行整体不是合法 JSON，属于整行解析失败，`index` 与 `conflict` 都没有。两行失败后第 3 行仍正常处理并写入：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2},{"name":"cpu","timestamp":"soon","value":3}]' \
+  'not json' \
+  '[{"name":"cpu","timestamp":2000,"value":4}]' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"error","line":1,"index":2,"error":"field \"timestamp\" must be a JSON number"}
+{"status":"error","line":2,"error":"invalid JSON: invalid character 'o' in literal null (expecting 'u')"}
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{},"points":[{"timestamp":2000,"value":4}]}]}
+```
+
+以上三次调用都包含失败行，因此命令均以非零退出码结束；用 `go run` 运行时它会在标准错误额外打印一行 `exit status 1`，那是 `go` 工具对非零退出码的转述，不是 ingest 的输出行。
+
 ## 数值结果的解读
 
 ### 存储与计算的精度约定

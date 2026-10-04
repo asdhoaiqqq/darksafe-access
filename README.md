@@ -30,6 +30,71 @@ printf '%s\n' \
 
 查询对 `[start,end]` 闭区间内的点按序列返回 `count` 与算术平均 `average`；`labels` 省略或为 `{}` 时匹配该指标的全部序列，否则按子集匹配。详见 `go run ./cmd/darksafe help`。
 
+## 冲突处理：同一序列同一时间戳的再次提交
+
+一条序列由指标名和完整标签集合共同确定，标签的书写顺序不影响身份（`{"host":"a","dc":"x"}` 与 `{"dc":"x","host":"a"}` 是同一条序列）。对同一序列的同一时间戳再次提交时，按数值是否相等分两种结果：
+
+- **数值相等**：视为重复采样，成功忽略，计入该批结果的 `duplicates`。相等按存储值判断，`1` 与 `1.0` 是同一个值。
+- **数值不同**：整批拒绝——既不覆盖已有值，也不保留本批前面已经校验通过的合法新增点；此前各批成功提交的数据原样保留。失败结果带 `conflict`，给出序列、时间戳、已有值 `existing` 与本次提交值 `submitted`。
+
+成功结果中的 `added` 与 `duplicates` 只统计当前这一批；`series` 展示的则是截至目前的全部已提交数据，其中的旧点并不是本批新增的。
+
+下面是一个连贯示例，写入与查询放在同一次命令调用内（数据只保存在本次进程内存中，进程结束即丢弃）。先向 `cpu`、`host=a` 写入时间戳 1000、值 2；第 2 行是空白行；第 3 行提交一个批次，包含新增点（时间戳 2000、值 4）和冲突点（时间戳 1000、值 9）；随后查询覆盖两个时间戳的区间；最后把冲突点改回值 2 再提交同一批次并复查：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '' \
+  '[{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}}]' \
+  '{"op":"query","name":"cpu","start":0,"end":3000,"labels":{"host":"a"}}' \
+  '[{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '{"op":"query","name":"cpu","start":0,"end":3000,"labels":{"host":"a"}}' \
+  | go run ./cmd/darksafe ingest
+```
+
+逐行输出（每个非空输入行对应一行结果）：
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":3,"index":2,"error":"conflict: series cpu{host=a} at timestamp 1000 already has value 2, submitted 9","conflict":{"series":{"name":"cpu","labels":{"host":"a"}},"timestamp":1000,"existing":2,"submitted":9}}
+{"status":"ok","op":"query","series":[{"name":"cpu","labels":{"host":"a"},"count":1,"average":2}]}
+{"status":"ok","added":1,"duplicates":1,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2},{"timestamp":2000,"value":4}]}]}
+{"status":"ok","op":"query","series":[{"name":"cpu","labels":{"host":"a"},"count":2,"average":3}]}
+```
+
+读到失败行时可以这样定位与推断：
+
+- `line` 是原始输入的行号，`index` 是出错采样点在数组内的位置，两者都从 1 开始。这里的 `line` 是 3 而不是 2：第 2 行的空白行不产生任何输出，但仍占一个行号。`index` 为 2 指向批内的第二个采样点，即时间戳 1000、值 9 的那一条。
+- `conflict` 说明该位置已有值 2（`existing`）、本次提交的是 9（`submitted`）。整批被拒绝：时间戳 2000、值 4 这个合法新增点也没有写入，时间戳 1000 上仍是原来的 2，不会被覆盖成 9。紧随其后的查询证实了这一点：区间内仍只有一个点，`count` 为 1、`average` 为 2。
+- 把冲突点改回与已有值相等的 2 后，同一批次成功：时间戳 2000 的点新增（`added` 为 1），时间戳 1000 的点作为同值重复被忽略（`duplicates` 为 1）。注意该批结果的 `series` 里时间戳 1000 的点来自第一批，不是本批新增；`added`/`duplicates` 也只反映本批。再次查询得到两个点，`count` 为 2、`average` 为 3。
+- 失败不中断后续处理：失败行之后的各行仍按输入顺序正常执行，但只要出现过失败行，命令最终以非零退出码结束（本例退出码为 1）。
+
+`conflict` 中的 `existing` 不一定来自此前已写入的数据。同一批次内首次向同一序列同一时间戳提交两个不同的值时，`existing` 指本批中较早出现的那个值；整批失败后这两个点都不会留下：
+
+```bash
+printf '%s\n' \
+  '[{"name":"mem","timestamp":500,"value":7},{"name":"mem","timestamp":500,"value":8}]' \
+  '{"op":"query","name":"mem","start":0,"end":1000}' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"error","line":1,"index":2,"error":"conflict: series mem{} at timestamp 500 already has value 7, submitted 8","conflict":{"series":{"name":"mem","labels":{}},"timestamp":500,"existing":7,"submitted":8}}
+{"status":"ok","op":"query","series":[]}
+```
+
+`existing` 的 7 来自本批第一个采样点，并非已提交的数据；失败后查询返回空 `series`，说明 7 和 8 都没有写入。
+
+并非所有 `status` 为 `error` 的结果都是数值冲突：字段校验失败（类型不对、缺字段、重复键、数值不合法等）或整行解析失败（非法 JSON、损坏文本、超长行）不附带 `conflict`，整行解析失败也不带 `index`。例如把 `value` 写成字符串：
+
+```bash
+printf '%s\n' '[{"name":"cpu","timestamp":1000,"value":"2"}]' | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"error","line":1,"index":1,"error":"field \"value\" must be a JSON number"}
+```
+
 ## 数值结果的解读
 
 ### 存储与计算的精度约定

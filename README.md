@@ -107,6 +107,83 @@ printf '%s\n' \
 
 以上三次调用都包含失败行，因此命令均以非零退出码结束；用 `go run` 运行时它会在标准错误额外打印一行 `exit status 1`，那是 `go` 工具对非零退出码的转述，不是 ingest 的输出行。
 
+## 查询失败：一次只返回一个原因
+
+ingest 中的查询是一行独立的 JSON 对象。一条查询同时存在几个问题时，结果里只有一条 `error`：按下面确定的次序选出当前要报告的那一个原因，其余问题不合并成错误列表，也不返回任何部分统计结果（没有 `series`）。因此修正查询的方式是：按本次返回的原因修掉它指出的问题，重发查询，再看下一条原因。修掉一个问题后再次失败是正常现象——说明还有尚未修正的问题，新原因会指出下一个。
+
+**整行解析先于一切字段校验。** 只有整行是唯一、完整且文本合法的 JSON 值（合法 UTF-8、代理项转义合法、对象闭合、对象之后没有第二个值或非空白内容）时，才进入字段校验。整行不满足时，即使对象前面已经写出有类型错误的字段，返回的仍是整行解析失败（`invalid JSON: ...`），前面的字段问题不会被当作最终原因。
+
+**结构完整的对象按字段原始书写次序校验。** 已出现的字段按书写先后逐个检查，遇到未知字段、重复字段或类型错误时立即报告该问题。因此把未知字段和类型错误交换位置，可能得到不同原因——谁在前就先报告谁（见下文对照示例）。
+
+**缺字段与倒置区间排在已出现字段之后，且两者也不混为一谈。** 已出现字段全部合法后，才检查必填项：同时缺少多个必填字段时按 op、name、start、end 的顺序报告第一个缺项，与字段在对象中的书写位置无关。四个必填项齐全且全部合法后，才可能报告 `start` 大于 `end` 的倒置区间，原因中给出两个边界的实际取值。
+
+查询失败一律不带 `index` 与 `conflict`（`index` 只标记写入批内出错采样点的位置，`conflict` 只属于数值冲突），失败查询不改变已存数据，此前写入的点在后续合法查询中原样可见。
+
+### 示例：同一次 ingest 中逐步修正一条查询
+
+先向 `cpu`、`host=a` 写入三个点，再连续修正一条同时含有未知字段、类型错误与倒置区间的查询。第 2 行是空白行：它不产生输出，但仍占行号，所以第一条查询报告 `line` 为 3：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}},{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":3000,"value":6,"labels":{"host":"a"}}]' \
+  '' \
+  '{"op":"query","bogus":1,"name":7,"start":5000,"end":1000}' \
+  '{"op":"query","name":7,"start":5000,"end":1000}' \
+  '{"op":"query","name":"cpu","start":5000,"end":1000}' \
+  '{"op":"query","name":"cpu","start":1000,"end":3000,"labels":{"host":"a"}}' \
+  | go run ./cmd/darksafe ingest
+```
+
+逐行输出（第 2 行空白行无输出）：
+
+```json
+{"status":"ok","added":3,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2},{"timestamp":2000,"value":4},{"timestamp":3000,"value":6}]}]}
+{"status":"error","line":3,"error":"unknown field \"bogus\""}
+{"status":"error","line":4,"error":"field \"name\" must be a string"}
+{"status":"error","line":5,"error":"invalid range: \"start\" must not be greater than \"end\" (5000 > 1000)"}
+{"status":"ok","op":"query","series":[{"name":"cpu","labels":{"host":"a"},"count":3,"average":4}]}
+```
+
+第 3 行的查询同时有三个问题（未知字段 `bogus`、`name` 应为字符串、区间倒置），但只报告书写位置最靠前的未知字段。每次只改当前原因指出的问题：删掉 `bogus` 后，第 4 行暴露出 `name` 的类型错误；把 `name` 改成字符串后，第 5 行才报告倒置区间，并给出实际边界 `5000 > 1000`；把区间改为 `[1000,3000]` 后，第 6 行成功，返回本次 ingest 开头写入的三个点的统计（`count` 为 3、`average` 为 4）。注意本次调用中间出现过失败行，即使最后一行成功，命令仍以非零退出码结束。
+
+### 对照：交换两个错误字段的位置
+
+同样的两个问题——未知字段 `bogus` 与 `name` 的类型错误——书写顺序不同，报告的原因就不同：
+
+```bash
+printf '%s\n' \
+  '{"op":"query","bogus":1,"name":7,"start":0,"end":1}' \
+  '{"op":"query","name":7,"bogus":1,"start":0,"end":1}' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"error","line":1,"error":"unknown field \"bogus\""}
+{"status":"error","line":2,"error":"field \"name\" must be a string"}
+```
+
+### 对照：整行解析失败与缺字段的报告顺序
+
+```bash
+printf '%s\n' \
+  '{"op":"query","name":7,"start":0' \
+  '{"end":100}' \
+  '{"op":"query","end":100}' \
+  '{"op":"query","name":"cpu"}' \
+  '{"op":"query","name":"cpu","start":0}' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"error","line":1,"error":"invalid JSON: unexpected EOF"}
+{"status":"error","line":2,"error":"missing required field \"op\""}
+{"status":"error","line":3,"error":"missing required field \"name\""}
+{"status":"error","line":4,"error":"missing required field \"start\""}
+{"status":"error","line":5,"error":"missing required field \"end\""}
+```
+
+第 1 行的对象未闭合，不是唯一、完整的 JSON 值：即使 `name` 的类型错误写在前面，返回的仍是整行解析失败。后四行结构完整、已出现字段全部合法，进入必填项检查：第 2 行同时缺 op、name、start，按固定顺序报告 op；之后每补上一个字段，下一条原因按 op、name、start、end 的顺序指出下一个缺项，与字段书写位置无关。
+
 ## 数值结果的解读
 
 ### 存储与计算的精度约定

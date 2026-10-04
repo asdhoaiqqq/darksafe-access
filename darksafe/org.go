@@ -120,17 +120,38 @@ func (s *Store) Publish(org string, expectedVersion int, policies []Policy) (int
 	if expectedVersion != st.current {
 		return 0, fmt.Errorf("%w: expected %d, current is %d", ErrVersionConflict, expectedVersion, st.current)
 	}
+	// An ordinary publish names no source version.
+	return st.commitPolicyChangeLocked(org, snapshot, 0, false), nil
+}
+
+// commitPolicyChangeLocked is the single place a successful policy change
+// is finalized, shared by Publish and Rollback. It advances the current
+// version exactly once, stores the new version's full policy set, and
+// appends its policy-change audit record as one atomic step under the store
+// mutex: the version and its audit record always become visible together,
+// so a reader can never observe the new policies without the matching
+// change record. Callers have already performed their operation-specific
+// validation and the expected-version check; this method does no checking
+// and cannot fail, so a rejected change never reaches it and consumes no
+// version or audit sequence.
+//
+// policies is detached on the way in, so later caller mutation of a
+// submitted, queried or exported slice can never reach either the stored
+// snapshot or the audit material. sourceVersion is the historical version
+// copied by a rollback (0 for an ordinary publish); rolledBack marks the
+// rollback record. The returned number is always the newly created
+// version, never a rollback's target version.
+func (st *orgState) commitPolicyChangeLocked(org string, policies []Policy, sourceVersion int, rolledBack bool) int {
+	snapshot := clonePolicies(policies)
 	st.current++
 	st.versions[st.current] = snapshot
-	// The change and its audit record become visible together; a failed
-	// publish never reaches this point and leaves no record.
 	st.appendAuditLocked(org, AuditPolicyChange, &PolicyChange{
 		Version:       st.current,
 		Policies:      snapshot,
-		SourceVersion: 0,
-		RolledBack:    false,
+		SourceVersion: sourceVersion,
+		RolledBack:    rolledBack,
 	}, nil)
-	return st.current, nil
+	return st.current
 }
 
 // Rollback republishes the full content of an existing historical version
@@ -149,18 +170,9 @@ func (s *Store) Rollback(org string, expectedVersion, targetVersion int) (int, e
 	if expectedVersion != st.current {
 		return 0, fmt.Errorf("%w: expected %d, current is %d", ErrVersionConflict, expectedVersion, st.current)
 	}
-	st.current++
-	snapshot := append([]Policy(nil), src...)
-	st.versions[st.current] = snapshot
-	// A rollback record names the source version in addition to carrying
-	// the full content of the new version.
-	st.appendAuditLocked(org, AuditPolicyChange, &PolicyChange{
-		Version:       st.current,
-		Policies:      snapshot,
-		SourceVersion: targetVersion,
-		RolledBack:    true,
-	}, nil)
-	return st.current, nil
+	// A rollback republishes the target version's full content as a new
+	// version; the record additionally names the source version.
+	return st.commitPolicyChangeLocked(org, src, targetVersion, true), nil
 }
 
 // Policies returns a copy of the full policy set of one version. Mutating

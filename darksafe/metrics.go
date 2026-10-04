@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -828,19 +829,45 @@ func roundScaledRatio(num, den *big.Int, scale int) *big.Int {
 	return q
 }
 
-// String 让冲突原因中的序列身份可读：name{k=v,...}，标签按键排序。
+// String 让冲突原因中的序列身份可读且无歧义：name{k=v,...}，标签按键排序。
+// 名称、标签键、标签值是不含分隔字符（逗号、等号、花括号、引号、反斜杠）、
+// 不含首尾空白与不可打印字符的非空字符串时按原文呈现（cpu{host=a} 保持原样）；
+// 否则以带引号的字符串字面量呈现，使内容字符与标签边界永远可以区分——
+// 单标签值 "1,b=2" 渲染为 a="1,b=2"，与两标签 a=1,b=2 不再混淆；换行、
+// 制表符等呈现为 \n、\t 这样的可辨认文字标记，一条冲突原因始终是一条记录；
+// 空字符串值渲染为 ""，与无标签的 {} 明确区分。渲染只依赖解析后的真实身份，
+// 与标签书写顺序、字符是否以 JSON 转义书写无关。
 func (r SeriesRef) String() string {
 	var b strings.Builder
-	b.WriteString(r.Name)
+	b.WriteString(identityText(r.Name))
 	b.WriteByte('{')
 	for i, p := range sortedPairs(r.Labels) {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		fmt.Fprintf(&b, "%s=%s", p.Key, p.Value)
+		b.WriteString(identityText(p.Key))
+		b.WriteByte('=')
+		b.WriteString(identityText(p.Value))
 	}
 	b.WriteByte('}')
 	return b.String()
+}
+
+// identityText 把身份组成部分（指标名、标签键、标签值）渲染为无歧义文本：
+// 不含分隔字符、首尾空白与不可打印字符的非空字符串原样返回；其余情况用
+// strconv.Quote 加引号并转义，引号边界标出内容的起止（首尾空格、空串可见），
+// 控制字符呈现为 \n、\t 等转义标记。分隔字符与引号、反斜杠一律被引号包裹，
+// 因此渲染结果不会把内容字符误读为标签边界。
+func identityText(s string) string {
+	if s == "" || s != strings.TrimSpace(s) {
+		return strconv.Quote(s)
+	}
+	for _, r := range s {
+		if !unicode.IsPrint(r) || strings.ContainsRune(`,={}"\`, r) {
+			return strconv.Quote(s)
+		}
+	}
+	return s
 }
 
 // organizedSeries 是一次结果整理中的一条序列：携带已存序列指针，

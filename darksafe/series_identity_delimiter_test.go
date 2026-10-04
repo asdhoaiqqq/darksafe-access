@@ -299,10 +299,10 @@ func TestDelimiterIdentityDuplicateAcrossOrderAndEscapes(t *testing.T) {
 		c.Timestamp != 5 || c.Existing != 4 || c.Submitted != 40 {
 		t.Fatalf("conflict must name real identity/values, got %+v", c)
 	}
-	// 冲突原因文本里的序列按 name{k=v,...} 呈现；该表示对含分隔字符的数据有歧义
-	// （单标签 a=b=2 与两标签 a=1,b=2 的渲染相同），因此冲突的权威归属以结构化
-	// conflict.series 为准。这里锁定现有文本格式不被意外改动。
-	if !strings.HasPrefix(lerr.Error, "conflict: series m:x{a:1=x;y,b={z}} at timestamp 5 already has value 4, submitted 40") {
+	// 冲突原因文本里的序列按 name{k=v,...} 呈现，标签按键排序；含分隔字符的
+	// 名称、键或值以带引号形式呈现，内容字符与标签边界可区分（值 "{z}" 含花括号，
+	// 因此渲染为 "{z}"）。文本与结构化 conflict.series 指向同一真实身份。
+	if !strings.HasPrefix(lerr.Error, `conflict: series m:x{a:1=x;y,b="{z}"} at timestamp 5 already has value 4, submitted 40`) {
 		t.Fatalf("conflict message = %q", lerr.Error)
 	}
 	// 原采样点保持不变。
@@ -312,18 +312,19 @@ func TestDelimiterIdentityDuplicateAcrossOrderAndEscapes(t *testing.T) {
 	}
 }
 
-// TestLookAlikeIdentitiesDoNotConflict：两条文本渲染完全相同的不同序列，在同一
+// TestLookAlikeIdentitiesDoNotConflict：两条朴素文本渲染会撞车的不同序列，在同一
 // 时间戳分别提交不同数值不得互相冲突；随后对其中一条再改值才冲突，且冲突报告的
-// 是结构化的真实完整标签集合，而不是有歧义的渲染文本。
+// 是结构化的真实完整标签集合，冲突原因文本也把两条序列渲染成可区分的身份。
 func TestLookAlikeIdentitiesDoNotConflict(t *testing.T) {
 	store := NewMetricStore()
 	mustOK(t, store, `[{"name":"cpu","timestamp":1,"value":1,"labels":{"a":"b=2"}}]`)
-	// 单标签 a="b=2" 与两标签 a=1,b=2 的 String() 都是 cpu{a=b=2}，但身份不同。
+	// 单标签 a="b=2" 与两标签 a=1,b=2 身份不同：不同值各自新增，互不冲突。
 	res := mustOK(t, store, `[{"name":"cpu","timestamp":1,"value":2,"labels":{"a":"1","b":"2"}}]`)
 	if res.Added != 1 || res.Duplicates != 0 || len(res.Series) != 2 {
 		t.Fatalf("look-alike identities with different values must both be added, got %+v", res)
 	}
-	// 对单标签序列提交不同值：冲突，结构化标签只有一个键且值原样为 "b=2"。
+	// 对单标签序列提交不同值：冲突，结构化标签只有一个键且值原样为 "b=2"；
+	// 原因文本把含等号的值加引号渲染，与两标签序列的 cpu{a=1,b=2} 可区分。
 	lerr := mustFail(t, store, `[{"name":"cpu","timestamp":1,"value":9,"labels":{"a":"b=2"}}]`)
 	if lerr.Conflict == nil || lerr.Conflict.Existing != 1 || lerr.Conflict.Submitted != 9 {
 		t.Fatalf("single-label conflict values wrong: %+v", lerr.Conflict)
@@ -331,13 +332,20 @@ func TestLookAlikeIdentitiesDoNotConflict(t *testing.T) {
 	if labels := lerr.Conflict.Series.Labels; len(labels) != 1 || labels["a"] != "b=2" {
 		t.Fatalf("conflict must name real single-label identity, got %v", labels)
 	}
-	// 对两标签序列提交不同值同样冲突，结构化标签是两个键。
+	if !strings.Contains(lerr.Error, `series cpu{a="b=2"} at timestamp 1 already has value 1, submitted 9`) {
+		t.Fatalf("single-label conflict message = %q", lerr.Error)
+	}
+	// 对两标签序列提交不同值同样冲突，结构化标签是两个键，
+	// 原因文本渲染为不带引号的 cpu{a=1,b=2}，与单标签序列明确不同。
 	lerr = mustFail(t, store, `[{"name":"cpu","timestamp":1,"value":9,"labels":{"a":"1","b":"2"}}]`)
 	if lerr.Conflict == nil || lerr.Conflict.Existing != 2 {
 		t.Fatalf("two-label conflict values wrong: %+v", lerr.Conflict)
 	}
 	if labels := lerr.Conflict.Series.Labels; len(labels) != 2 || labels["a"] != "1" || labels["b"] != "2" {
 		t.Fatalf("conflict must name real two-label identity, got %v", labels)
+	}
+	if !strings.Contains(lerr.Error, `series cpu{a=1,b=2} at timestamp 1 already has value 2, submitted 9`) {
+		t.Fatalf("two-label conflict message = %q", lerr.Error)
 	}
 	// 两条序列原有采样点都保持各自的值，全量查询仍返回两条独立序列。
 	full := mustQuery(t, store, `{"op":"query","name":"cpu","start":0,"end":10}`)
@@ -410,6 +418,121 @@ func TestWhitespaceInIdentityPreservedVerbatim(t *testing.T) {
 	got := queryOne(t, store, queryLabels("n", 0, 10, map[string]string{" z ": ""}))
 	if len(got.Labels) != 1 || got.Labels[" z "] != "" || got.Average != 2 {
 		t.Fatalf("spaced-key empty-value label not preserved: %+v", got)
+	}
+}
+
+// TestConflictMessageDistinguishesLookAlikeSeries 是任务场景的核心回归：
+// cpu 的 {"a":"1,b=2"} 与 {"a":"1","b":"2"} 是两条不同序列，都在时间戳 1000
+// 存有值 1；分别提交同时间戳的值 2 时，两条冲突原因的身份部分必须不同，
+// 用户只看 error 字符串就能分辨冲突属于哪条真实序列。
+func TestConflictMessageDistinguishesLookAlikeSeries(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[
+		{"name":"cpu","timestamp":1000,"value":1,"labels":{"a":"1,b=2"}},
+		{"name":"cpu","timestamp":1000,"value":1,"labels":{"a":"1","b":"2"}}
+	]`)
+	single := mustFail(t, store, `[{"name":"cpu","timestamp":1000,"value":2,"labels":{"a":"1,b=2"}}]`)
+	if want := `conflict: series cpu{a="1,b=2"} at timestamp 1000 already has value 1, submitted 2`; single.Error != want {
+		t.Fatalf("single-label conflict = %q, want %q", single.Error, want)
+	}
+	pair := mustFail(t, store, `[{"name":"cpu","timestamp":1000,"value":2,"labels":{"a":"1","b":"2"}}]`)
+	if want := `conflict: series cpu{a=1,b=2} at timestamp 1000 already has value 1, submitted 2`; pair.Error != want {
+		t.Fatalf("two-label conflict = %q, want %q", pair.Error, want)
+	}
+	// 同一批次内两个不同值撞上同一采样点：身份渲染相同规则，原值取批内较早
+	// 出现的点，失败位置指向造成冲突的采样点；整批新增点不提交。
+	inBatch := mustFail(t, store, `[
+		{"name":"cpu","timestamp":2000,"value":3,"labels":{"a":"1,b=2"}},
+		{"name":"cpu","timestamp":2000,"value":4,"labels":{"a":"1,b=2"}}
+	]`)
+	if inBatch.Index != 2 {
+		t.Fatalf("in-batch conflict index = %d, want 2", inBatch.Index)
+	}
+	if want := `conflict: series cpu{a="1,b=2"} at timestamp 2000 already has value 3, submitted 4`; inBatch.Error != want {
+		t.Fatalf("in-batch conflict = %q, want %q", inBatch.Error, want)
+	}
+	if inBatch.Conflict == nil || inBatch.Conflict.Timestamp != 2000 ||
+		inBatch.Conflict.Existing != 3 || inBatch.Conflict.Submitted != 4 {
+		t.Fatalf("in-batch conflict detail = %+v", inBatch.Conflict)
+	}
+	for _, s := range mustOK(t, store, `[]`).Series {
+		for _, p := range s.Points {
+			if p.Timestamp == 2000 {
+				t.Fatalf("rejected batch must not commit, found %+v in %v", p, s.Labels)
+			}
+		}
+	}
+	// 此前成功写入的点保持原值。
+	for _, s := range mustQuery(t, store, `{"op":"query","name":"cpu","start":1000,"end":1000}`).Series {
+		if s.Count != 1 || s.Average != 1 {
+			t.Fatalf("stored point of %v must stay 1, got count=%d average=%v", s.Labels, s.Count, s.Average)
+		}
+	}
+}
+
+// TestConflictMessageIdentityIndependentOfOrderAndEscapes：同一真实身份无论标签
+// 在输入中如何排列、同一字符直接书写还是以合法 JSON 转义书写，冲突原因里的
+// 身份部分都相同，标签仍按键排序展示。
+func TestConflictMessageIdentityIndependentOfOrderAndEscapes(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"cpu","timestamp":1000,"value":1,"labels":{"a":"1,b=2","b":"x"}}]`)
+	want := `conflict: series cpu{a="1,b=2",b=x} at timestamp 1000 already has value 1, submitted 2`
+	// 标签顺序调换。
+	if lerr := mustFail(t, store, `[{"name":"cpu","timestamp":1000,"value":2,"labels":{"b":"x","a":"1,b=2"}}]`); lerr.Error != want {
+		t.Fatalf("reordered-labels conflict = %q, want %q", lerr.Error, want)
+	}
+	// 值里的逗号与等号改用 \u002C、\u003D 两个 JSON 转义书写，解析后身份相同，渲染也相同。
+	escaped := `[{"name":"cpu","timestamp":1000,"value":2,"labels":{"a":"1` + uescape("002c") + `b` + uescape("003d") + `2","b":"x"}}]`
+	if lerr := mustFail(t, store, escaped); lerr.Error != want {
+		t.Fatalf("escaped-labels conflict = %q, want %q", lerr.Error, want)
+	}
+}
+
+// TestConflictMessageRendersControlAndEdgeWhitespace：名称或标签中的换行与制表符
+// 在冲突原因里呈现为 \n、\t 文字标记（一条原因仍是一条记录，不含原始控制字符）；
+// 首尾空格与空字符串值以引号边界呈现，无标签与空值标签的渲染明确区分。
+func TestConflictMessageRendersControlAndEdgeWhitespace(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"cp\nu","timestamp":1,"value":1,"labels":{" sp ":"","ho st":"a\tb","k":" v "}}]`)
+	// 标签顺序调换后身份相同；渲染按键排序，控制字符呈现为转义标记。
+	lerr := mustFail(t, store, `[{"name":"cp\nu","timestamp":1,"value":2,"labels":{"k":" v ","ho st":"a\tb"," sp ":""}}]`)
+	want := `conflict: series "cp\nu"{" sp "="",ho st="a\tb",k=" v "} at timestamp 1 already has value 1, submitted 2`
+	if lerr.Error != want {
+		t.Fatalf("conflict = %q, want %q", lerr.Error, want)
+	}
+	if strings.ContainsAny(lerr.Error, "\n\t") {
+		t.Fatalf("conflict message must not contain raw control characters: %q", lerr.Error)
+	}
+	// 结构化 conflict 中的名称与标签保持解析后的真实内容，不受渲染影响。
+	if lerr.Conflict.Series.Name != "cp\nu" ||
+		!reflect.DeepEqual(lerr.Conflict.Series.Labels, map[string]string{" sp ": "", "ho st": "a\tb", "k": " v "}) {
+		t.Fatalf("structured conflict must keep verbatim identity, got %+v", lerr.Conflict.Series)
+	}
+
+	// 无标签与存在空字符串值标签是不同序列，冲突原因里 {} 与 k="" 明确区分。
+	mustOK(t, store, `[
+		{"name":"n","timestamp":1,"value":1},
+		{"name":"n","timestamp":1,"value":1,"labels":{"k":""}}
+	]`)
+	bare := mustFail(t, store, `[{"name":"n","timestamp":1,"value":2}]`)
+	if !strings.Contains(bare.Error, "series n{} at timestamp 1") {
+		t.Fatalf("no-label conflict = %q", bare.Error)
+	}
+	emptyVal := mustFail(t, store, `[{"name":"n","timestamp":1,"value":2,"labels":{"k":""}}]`)
+	if !strings.Contains(emptyVal.Error, `series n{k=""} at timestamp 1`) {
+		t.Fatalf("empty-value conflict = %q", emptyVal.Error)
+	}
+}
+
+// TestConflictMessagePlainIdentityUnchanged：不含特殊字符的现有说明保留原样，
+// 名称、键、值都不加引号。
+func TestConflictMessagePlainIdentityUnchanged(t *testing.T) {
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"cpu","timestamp":1000,"value":1,"labels":{"host":"a","zone":"east"}}]`)
+	lerr := mustFail(t, store, `[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a","zone":"east"}}]`)
+	want := "conflict: series cpu{host=a,zone=east} at timestamp 1000 already has value 1, submitted 2"
+	if lerr.Error != want {
+		t.Fatalf("plain conflict = %q, want %q", lerr.Error, want)
 	}
 }
 

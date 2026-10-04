@@ -181,3 +181,70 @@ func TestRunIngestDelimiterCharactersAreUserData(t *testing.T) {
 		t.Fatalf("delimiter-in-name series = %v", s9)
 	}
 }
+
+// TestRunIngestConflictMessageDistinguishesRealSeries 端到端验证：两条朴素渲染会
+// 撞车的序列分别冲突时，解析输出 JSON 后读到的 error 字符串身份部分不同，
+// 用户只看错误原因就能分辨冲突属于哪条真实序列；名称或标签中的换行与制表符
+// 呈现为可辨认的文字标记，一条原因不会被误读成多条记录。
+func TestRunIngestConflictMessageDistinguishesRealSeries(t *testing.T) {
+	lines := []string{
+		// 行 1：两条序列都在时间戳 1000 写入值 1：
+		//   cpu {"a":"1,b=2"}     一个标签，值文本上像两个标签
+		//   cpu {"a":"1","b":"2"} 真实的两个标签
+		`[{"name":"cpu","timestamp":1000,"value":1,"labels":{"a":"1,b=2"}},` +
+			`{"name":"cpu","timestamp":1000,"value":1,"labels":{"a":"1","b":"2"}}]`,
+		// 行 2/3：分别对两条序列提交同时间戳的不同值，各自冲突。
+		`[{"name":"cpu","timestamp":1000,"value":2,"labels":{"a":"1,b=2"}}]`,
+		`[{"name":"cpu","timestamp":1000,"value":2,"labels":{"b":"2","a":"1"}}]`,
+		// 行 4：名称含换行、标签值含制表符的序列写入。
+		`[{"name":"cp\nu","timestamp":1,"value":1,"labels":{"ho\tst":"a"}}]`,
+		// 行 5：同一序列（标签键以 	转义书写）提交不同值，冲突。
+		`[{"name":"cp\nu","timestamp":1,"value":2,"labels":{"ho\tst":"a"}}]`,
+	}
+	var out bytes.Buffer
+	code := runIngest(strings.NewReader(strings.Join(lines, "\n")), &out)
+	if code == 0 {
+		t.Fatalf("exit code = 0, want non-zero because lines 2/3/5 conflicted")
+	}
+	got := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(got) != 5 {
+		t.Fatalf("got %d output lines, want 5: %v", len(got), got)
+	}
+	if first := decodeResultLine(t, got[0]); first["status"] != "ok" || first["added"].(float64) != 2 {
+		t.Fatalf("line 1 = %v, want ok with 2 added", first)
+	}
+
+	// 行 2：单标签序列的冲突，值里的逗号与等号被引号包裹，身份是 cpu{a="1,b=2"}。
+	single := decodeResultLine(t, got[1])
+	if single["status"] != "error" || int(single["line"].(float64)) != 2 {
+		t.Fatalf("line 2 = %v, want error on input line 2", single)
+	}
+	if want := `conflict: series cpu{a="1,b=2"} at timestamp 1000 already has value 1, submitted 2`; single["error"] != want {
+		t.Fatalf("line 2 error = %q, want %q", single["error"], want)
+	}
+	// 行 3：两标签序列（输入中标签顺序调换）的冲突，身份是 cpu{a=1,b=2}，
+	// 与行 2 的 error 字符串明确不同。
+	pair := decodeResultLine(t, got[2])
+	if want := `conflict: series cpu{a=1,b=2} at timestamp 1000 already has value 1, submitted 2`; pair["error"] != want {
+		t.Fatalf("line 3 error = %q, want %q", pair["error"], want)
+	}
+	if single["error"] == pair["error"] {
+		t.Fatalf("conflicts of two different series must read differently, both = %q", single["error"])
+	}
+
+	// 行 4/5：换行与制表符在 error 字符串里是 \n、\t 文字标记，
+	// 解析输出 JSON 后一条原因仍是一条记录，不含原始控制字符。
+	ctrl := decodeResultLine(t, got[4])
+	if want := `conflict: series "cp\nu"{"ho\tst"=a} at timestamp 1 already has value 1, submitted 2`; ctrl["error"] != want {
+		t.Fatalf("line 5 error = %q, want %q", ctrl["error"], want)
+	}
+	if s := ctrl["error"].(string); strings.ContainsAny(s, "\n\t") {
+		t.Fatalf("error string must not contain raw control characters: %q", s)
+	}
+	// 结构化 conflict 仍携带解析后的真实名称与标签。
+	cSeries := ctrl["conflict"].(map[string]interface{})["series"].(map[string]interface{})
+	if cSeries["name"] != "cp\nu" ||
+		!reflect.DeepEqual(cSeries["labels"], map[string]interface{}{"ho\tst": "a"}) {
+		t.Fatalf("structured conflict must keep verbatim identity, got %v", cSeries)
+	}
+}

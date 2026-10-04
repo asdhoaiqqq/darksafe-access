@@ -86,9 +86,11 @@ invalid / historical version unavailable, 2 bad arguments or unreadable
 file.
 
 Example:
-  darksafe review --archive payments.audit \
-      --org 'acme payments' --seq 7 --end-seq 12 \
-      --fingerprint 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+  (materials produced by examples/offline_review; seq 1 is the
+  policy publish record, seq 2 is the read decision being reviewed)
+  darksafe review --archive acme-factory.audit \
+      --org 'acme factory' --seq 2 --end-seq 2 \
+      --fingerprint 04b274dbb4cf039bbb4b78f5ee5aae03278d2c34833fe87fecb13ade51ef5299
 `)
 }
 

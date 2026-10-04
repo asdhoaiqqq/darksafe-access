@@ -74,17 +74,202 @@ go test ./...
 
 退出码：`0` 已得到完整复核结果（含不一致）；`1` 归档校验失败（`ErrInvalidArchive`/`ErrInvalidRange`）、目标序号不存在（`ErrAuditNotFound`）、目标不是决策记录（`ErrAuditNotADecision`）或历史策略版本无法取得（`ErrVersionNotFound`），错误信息可区分且只写标准错误；`2` 文件无法读取、必填输入缺失、序号无法解析为整数、目标序号非正或截至序号为负，具体原因写标准错误。
 
-完整示例：
+## 完整示例：先保存一条真实决策，再离线复核
 
-```bash
-darksafe review \
-  --archive payments.audit \
-  --org 'acme payments' \
-  --seq 7 \
-  --end-seq 12 \
-  --fingerprint 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+下面的流程只围绕**一个组织、一份账本、一次读取请求**，全部材料都可在本机离线生成；完整程序是 [`examples/offline_review/main.go`](examples/offline_review/main.go)，只依赖本项目公开 API 与 Go 标准库。场景取值在后续每个调用中都保持逐字节一致：
+
+- 组织名 `acme factory`（**包含空格**，命令行必须加引号）。
+- 账本资源 ID `ledger-2026`，作用域 `acme/factory/ledger`。
+- 策略 `p-ledger-read-2026` 只允许主体 `svc-audit-reader` 读取**这份**账本：动作 `read`、作用域精确匹配，且 `ResourceID` 明确限定为 `ledger-2026`。
+- 通过组织级 `Decide` 做一次读取决策得到允许结果，随后导出完整审计链、编码归档，并把检查点保存到**另一个文件**。
+
+### 第一步：保存访问决策、归档与独立检查点
+
+```go
+// Command offline_review_example is the end-to-end worked example for
+// `darksafe review`. It makes one real access decision, saves the complete
+// audit archive and a separately retained checkpoint, and prints the exact
+// review command to run next.
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/asdhoaiqqq/darksafe-access/darksafe"
+)
+
+const (
+	archivePath    = "acme-factory.audit"
+	checkpointPath = "acme-factory.checkpoint"
+)
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, "offline review example: failed:", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	const org = "acme factory" // 组织名含空格，所有调用必须逐字节一致
+	const (
+		ledgerID    = "ledger-2026"
+		ledgerScope = "acme/factory/ledger"
+		subjectID   = "svc-audit-reader"
+	)
+
+	store := darksafe.NewStore()
+
+	// 发布一条只允许指定主体读取这份账本的策略；0 表示该组织此前未发布过。
+	published, err := store.Publish(org, 0, []darksafe.Policy{{
+		ID:         "p-ledger-read-2026",
+		Subject:    subjectID,
+		Action:     "read",
+		Scope:      ledgerScope,
+		Effect:     darksafe.EffectAllow,
+		ResourceID: ledgerID, // 明确限定账本的资源标识
+	}})
+	if err != nil {
+		return fmt.Errorf("publish ledger-read policy as version 1: %w", err)
+	}
+
+	// 通过组织级决策功能发起一次读取请求；两个组织字段都等于决策组织。
+	req := darksafe.OrgRequest{
+		SubjectOrg:  org,
+		ResourceOrg: org,
+		Subject:     darksafe.Subject{ID: subjectID, Kind: "service"},
+		Resource:    darksafe.Resource{ID: ledgerID, Scope: ledgerScope},
+		Action:      "read",
+	}
+	decision := store.Decide(org, req)
+	if !decision.Allowed {
+		return fmt.Errorf("expected the read to be allowed, got denial: %+v", decision)
+	}
+	fmt.Printf("online decision: allowed=%v reason=%q matched=%v policy version=%d\n",
+		decision.Allowed, decision.Reason, decision.Matched, decision.Version)
+	fmt.Printf("published policy became version %d\n", published)
+
+	// 导出完整审计链（序号 1 的发布记录 + 序号 2 的决策记录）与对应检查点；
+	// 返回的副本与内存 Store 完全脱离。
+	records, cp, err := store.AuditExport(org, 0)
+	if err != nil {
+		return fmt.Errorf("export complete audit chain: %w", err)
+	}
+	if len(records) != 2 ||
+		records[0].Kind != darksafe.AuditPolicyChange ||
+		records[1].Kind != darksafe.AuditDecision {
+		return fmt.Errorf("expected seq 1 publish + seq 2 decision, got %+v", records)
+	}
+	targetSeq := records[1].Seq // 决策记录序号：发布占用 1，决策是 2
+
+	// 保存完整审计归档。
+	archive, err := darksafe.EncodeAuditArchive(org, records, cp)
+	if err != nil {
+		return fmt.Errorf("encode audit archive: %w", err)
+	}
+	if err := os.WriteFile(archivePath, archive, 0o600); err != nil {
+		return fmt.Errorf("write archive %s: %w", archivePath, err)
+	}
+
+	// 检查点与归档分开保存。归档内部也携带一份检查点，但仅供参考，
+	// 永远不能代替这份外部材料。
+	content := fmt.Sprintf("org=%q\nend_seq=%d\nfingerprint=%s\n", cp.Org, cp.EndSeq, cp.Fingerprint)
+	if err := os.WriteFile(checkpointPath, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("write checkpoint %s: %w", checkpointPath, err)
+	}
+
+	fmt.Printf("saved archive %s and separately retained checkpoint %s\n", archivePath, checkpointPath)
+	fmt.Printf("review: --seq %d --end-seq %d --fingerprint %s\n", targetSeq, cp.EndSeq, cp.Fingerprint)
+	return nil
+}
 ```
 
+在模块根目录运行（材料写入当前工作目录；输出是确定性的，重复运行得到相同字节与指纹）：
+
+```bash
+go run ./examples/offline_review
+```
+
+第一步结束后磁盘上有两份**相互独立**的材料：
+
+- `acme-factory.audit`：完整审计归档。链中两条记录——**序号 1 是策略发布记录，序号 2 才是读取决策记录**。
+- `acme-factory.checkpoint`：另行保留的检查点（组织、截至序号、指纹）。复核一律以它为准；归档内嵌的检查点只是参考信息，不能代替这份外部材料。
+
+检查点文件内容：
+
+```text
+org="acme factory"
+end_seq=2
+fingerprint=04b274dbb4cf039bbb4b78f5ee5aae03278d2c34833fe87fecb13ade51ef5299
+```
+
+### 第二步：仅凭保存的材料离线复核
+
+材料生成后，原来的内存存储不再需要（进程结束也没关系），也**不需要重新提交访问请求**。在保存材料的目录直接执行：
+
+```bash
+go run ./cmd/darksafe review \
+  --archive acme-factory.audit \
+  --org 'acme factory' \
+  --seq 2 \
+  --end-seq 2 \
+  --fingerprint 04b274dbb4cf039bbb4b78f5ee5aae03278d2c34833fe87fecb13ade51ef5299
+```
+
+其中文件路径、组织、目标序号、截至序号与指纹全部对应第一步刚保存的材料。`--seq 2` 是目标记录在**该组织审计链中的序号**：策略发布也占用序号，所以读取决策落在 2。它**既不是策略版本号**（决策实际使用的策略版本是输出中的 `policy version: 1`），**也不是第几次访问**（本例只访问了一次，序号仍然是 2）。
+
+成功时退出码为 0，标准输出依次为：
+
+```text
+target sequence: 2
+original decision:
+  allowed: true
+  reason: "matched allow policy"
+  matched policies: ["p-ledger-read-2026"]
+  policy version: 1
+recomputed decision:
+  allowed: true
+  reason: "matched allow policy"
+  matched policies: ["p-ledger-read-2026"]
+  policy version: 1
+consistent: yes
+```
+
+各部分表达的含义：
+
+- `target sequence`：复核目标在审计链中的序号（本例为 2，即决策记录）。
+- **原决策（original decision）**：决策记录中保存的、当时在线实际返回的结果。
+- **重算决策（recomputed decision）**：复核时仅凭归档——用记录里保存的请求、以及目标之前策略变更记录携带的版本 1 完整策略——重新计算的结果；归档中即使存在更新版本也绝不使用。
+- **命中策略（matched policies）**：实际命中的策略标识；本例是明确限定本账本资源 ID 的 `p-ledger-read-2026`。
+- **实际版本（policy version）**：决策实际使用的策略版本，本例为 1。
+- **一致性结论（consistent）**：原决策与重算决策在允许与否、理由、命中策略、实际版本上逐字段比较的结果。
+
+本例应得到**允许结果**（两份决策均为 `allowed: true`，理由 `matched allow policy`，命中 `p-ledger-read-2026`）与 **`consistent: yes`**：历史材料重算出的结论与当时记录完全一致。
+
+### 两种容易选错材料的情况
+
+以下两种错误都以退出码 **1** 结束，**只在标准错误**报告可区分的原因，标准输出为空、不输出任何部分复核结果：
+
+1. **目标序号指向策略发布记录**：把 `--seq 2` 错写成 `--seq 1`。序号 1 是 `policy_change` 记录，不是决策记录，对应 `ErrAuditNotADecision`：
+
+   ```bash
+   go run ./cmd/darksafe review --archive acme-factory.audit \
+     --org 'acme factory' --seq 1 --end-seq 2 \
+     --fingerprint 04b274dbb4cf039bbb4b78f5ee5aae03278d2c34833fe87fecb13ade51ef5299
+   # 退出码 1；标准输出为空；标准错误：
+   # review: darksafe: audit record is not a decision: sequence 1 is policy_change
+   ```
+
+2. **提供与归档不符的外部检查点**：例如指纹被改动，或拿了另一份归档的检查点。整份材料链校验失败，对应 `ErrInvalidRange`，不会打印任何决策：
+
+   ```bash
+   go run ./cmd/darksafe review --archive acme-factory.audit \
+     --org 'acme factory' --seq 2 --end-seq 2 \
+     --fingerprint 0000000000000000000000000000000000000000000000000000000000000000
+   # 退出码 1；标准输出为空；标准错误：
+   # review: archive validation failed: darksafe: invalid audit range: embedded checkpoint does not match the retained checkpoint
+   ```
 
 ## 技术方向
 

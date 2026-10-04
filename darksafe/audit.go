@@ -13,10 +13,8 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"unicode/utf8"
 )
 
 // Audit record categories.
@@ -77,48 +75,11 @@ type AuditRecord struct {
 	Fingerprint string
 }
 
-// hashEnvelope is the canonical, organization-bound representation that
-// fingerprints are computed over. It is never exposed, so callers cannot
-// forge one by constructing an AuditRecord with copied fields.
-type hashEnvelope struct {
-	Org             string          `json:"org"`
-	Seq             int             `json:"seq"`
-	Kind            string          `json:"kind"`
-	Change          *PolicyChange   `json:"change,omitempty"`
-	Decision        *DecisionRecord `json:"decision,omitempty"`
-	PrevFingerprint string          `json:"prev"`
-}
-
-// envelopeUsesRawBytes reports whether any string protected by the
-// fingerprint carries bytes that are not valid UTF-8. Such envelopes are
-// hashed through encodeCanonical instead of encoding/json, because JSON
-// string encoding replaces invalid bytes with U+FFFD and would let two
-// different raw contents share a fingerprint.
-func envelopeUsesRawBytes(env *hashEnvelope) bool {
-	if !utf8.ValidString(env.Org) || !utf8.ValidString(env.Kind) ||
-		!utf8.ValidString(env.PrevFingerprint) {
-		return true
-	}
-	if env.Change != nil {
-		// Which change content is protected is decided by the single
-		// policy-change field table (change_fields.go), shared with the
-		// encoder, the archive and the detaching copy, rather than named here
-		// a second time; the policy strings inside it remain governed by the
-		// single policy field table.
-		if changeHasNonUTF8(env.Change) {
-			return true
-		}
-	}
-	if env.Decision != nil {
-		// Which decision strings are protected is decided by the single
-		// decision field table (decision_fields.go), shared with the encoder
-		// and the archive, rather than named here a second time.
-		if decisionRecordHasNonUTF8(env.Decision) {
-			return true
-		}
-	}
-	return false
-}
+// Which outer fields an envelope protects, in which order, and how their
+// raw bytes are scanned for invalid UTF-8 are all defined by the single
+// outer record field table in record_fields.go, shared with the archive.
+// Nested payload fields are defined the same way in change_fields.go and
+// decision_fields.go, so no field list is maintained in this file.
 
 // rawEnvelopePrefix opens every raw-byte canonical encoding. It never
 // coincides with the start of a JSON envelope (always '{'), so
@@ -292,59 +253,11 @@ func (e *fingerprintEncoder) decisionRecord(d *DecisionRecord) {
 	}
 }
 
-// encodeCanonical returns the raw bytes fingerprinted for an envelope
-// whose strings include invalid UTF-8. Every string the record carries
-// reaches the output byte-for-byte, at whatever nesting depth or list
-// position it occupies. The prefix separates this encoding space from
-// JSON fingerprints.
-func encodeCanonical(env *hashEnvelope) []byte {
-	e := &fingerprintEncoder{buf: []byte(rawEnvelopePrefix)}
-	e.tag(tagEnvelope)
-	e.rawString(env.Org)
-	e.int64Tag(tagSeq, int64(env.Seq))
-	e.rawString(env.Kind)
-	e.change(env.Change)
-	e.decisionRecord(env.Decision)
-	e.rawString(env.PrevFingerprint)
-	return e.buf
-}
-
 // genesisFingerprint derives the chain root from the organization name,
 // keeping equal identifiers in different organizations independent.
 func genesisFingerprint(org string) string {
 	sum := sha256.Sum256([]byte("darksafe-audit-genesis\x00" + org))
 	return hex.EncodeToString(sum[:])
-}
-
-// computeFingerprint returns the fingerprint for an envelope. Records made
-// exclusively of valid UTF-8 keep the historical JSON fingerprint, so old
-// exports and checkpoints remain valid; records containing invalid bytes
-// use the length-prefixed raw encoding that protects their exact bytes.
-func computeFingerprint(env *hashEnvelope) string {
-	if envelopeUsesRawBytes(env) {
-		sum := sha256.Sum256(encodeCanonical(env))
-		return hex.EncodeToString(sum[:])
-	}
-	b, err := json.Marshal(env)
-	if err != nil {
-		// All envelope fields are plain, JSON-encodable values; a failure
-		// here indicates a programming error, not user input.
-		panic(fmt.Errorf("darksafe: audit envelope must encode: %w", err))
-	}
-	sum := sha256.Sum256(b)
-	return hex.EncodeToString(sum[:])
-}
-
-// fingerprintFor builds and fingerprints the envelope for a record.
-func fingerprintFor(r *AuditRecord) string {
-	return computeFingerprint(&hashEnvelope{
-		Org:             r.Org,
-		Seq:             r.Seq,
-		Kind:            r.Kind,
-		Change:          r.Change,
-		Decision:        r.Decision,
-		PrevFingerprint: r.PrevFingerprint,
-	})
 }
 
 // clonePolicies returns a detached copy of a policy set.

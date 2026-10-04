@@ -189,6 +189,30 @@ func (w *archiveWriter) decisionRecord(d *DecisionRecord) {
 	}
 }
 
+// recordEnvelope writes the outer fields one record fingerprint protects,
+// walking the single outer record field table so the archive lists org,
+// sequence, category, the two payloads and the predecessor fingerprint in
+// exactly the fingerprint's order. The record's own current fingerprint is
+// deliberately not part of that walk — it is the hash output, never a
+// protected field — so EncodeAuditArchive writes it at the tail itself.
+func (w *archiveWriter) recordEnvelope(r *AuditRecord) {
+	for i := range recordFields {
+		f := &recordFields[i]
+		switch f.kind {
+		case recordFieldString:
+			w.stringField(f.getString(r))
+		case recordFieldInt:
+			w.u32(f.getInt(r))
+		case recordFieldChangePayload:
+			w.change(f.getChange(r))
+		case recordFieldDecisionPayload:
+			w.decisionRecord(f.getDecision(r))
+		default:
+			panic(fmt.Errorf("darksafe: unknown outer record field kind %d", f.kind))
+		}
+	}
+}
+
 // EncodeAuditArchive serializes one complete audit export into savable
 // bytes. org is the organization name, records is its complete chain from
 // sequence 1 (a valid prefix ending at some historical sequence is enough,
@@ -220,12 +244,10 @@ func EncodeAuditArchive(org string, records []AuditRecord, cp Checkpoint) ([]byt
 	pw.u32(len(records))
 	for i := range records {
 		r := &records[i]
-		pw.stringField(r.Org)
-		pw.u32(r.Seq)
-		pw.stringField(r.Kind)
-		pw.change(r.Change)
-		pw.decisionRecord(r.Decision)
-		pw.stringField(r.PrevFingerprint)
+		// Protected outer fields come from the one field table the
+		// fingerprint walks; the current fingerprint is the hash result and
+		// therefore follows separately at the tail.
+		pw.recordEnvelope(r)
 		pw.stringField(r.Fingerprint)
 	}
 	if pw.err != nil {
@@ -447,6 +469,28 @@ func (r *archiveReader) decisionRecord() *DecisionRecord {
 	return d
 }
 
+// recordEnvelope reads the protected outer fields back in the single outer
+// field table's (write and fingerprint) order, so a field can never be
+// restored into the wrong member or skipped. The record's own current
+// fingerprint follows separately at the tail and is read by the caller.
+func (r *archiveReader) recordEnvelope(rec *AuditRecord) {
+	for i := range recordFields {
+		f := &recordFields[i]
+		switch f.kind {
+		case recordFieldString:
+			f.setString(rec, r.stringField())
+		case recordFieldInt:
+			f.setInt(rec, r.u32())
+		case recordFieldChangePayload:
+			f.setChange(rec, r.change())
+		case recordFieldDecisionPayload:
+			f.setDecision(rec, r.decisionRecord())
+		default:
+			panic(fmt.Errorf("darksafe: unknown outer record field kind %d", f.kind))
+		}
+	}
+}
+
 // DecodeAuditArchive reads one archive produced by EncodeAuditArchive and
 // returns records that can be handed directly to RecheckDecisionOffline.
 // org is the organization the caller expects, and cp is the checkpoint the
@@ -503,12 +547,10 @@ func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecor
 	records := make([]AuditRecord, 0, n)
 	for i := 0; i < n; i++ {
 		var rec AuditRecord
-		rec.Org = r.stringField()
-		rec.Seq = r.u32()
-		rec.Kind = r.stringField()
-		rec.Change = r.change()
-		rec.Decision = r.decisionRecord()
-		rec.PrevFingerprint = r.stringField()
+		// Protected outer fields come back from the one field table the
+		// writer walked; the current fingerprint was written at the tail
+		// because it is the hash result, never one of its own inputs.
+		r.recordEnvelope(&rec)
 		rec.Fingerprint = r.stringField()
 		records = append(records, rec)
 	}

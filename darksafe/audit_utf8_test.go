@@ -26,15 +26,27 @@ const replacementRune = string(rune(0xFFFD))
 // legacyJSONFingerprint is the exact fingerprint algorithm used before
 // the raw-content integrity fix: encoding/json over the envelope. Tests
 // use it to prove valid-UTF-8 records keep byte-identical fingerprints.
+// The envelope shape is redeclared locally on purpose: this helper must
+// reproduce the legacy JSON independently of the production table-driven
+// marshalRecordEnvelopeJSON, so the fingerprint-family test cannot pass
+// merely by comparing the implementation against itself.
 func legacyJSONFingerprint(r *AuditRecord) string {
-	b, err := json.Marshal(&hashEnvelope{
+	env := struct {
+		Org             string          `json:"org"`
+		Seq             int             `json:"seq"`
+		Kind            string          `json:"kind"`
+		Change          *PolicyChange   `json:"change,omitempty"`
+		Decision        *DecisionRecord `json:"decision,omitempty"`
+		PrevFingerprint string          `json:"prev"`
+	}{
 		Org:             r.Org,
 		Seq:             r.Seq,
 		Kind:            r.Kind,
 		Change:          r.Change,
 		Decision:        r.Decision,
 		PrevFingerprint: r.PrevFingerprint,
-	})
+	}
+	b, err := json.Marshal(&env)
 	if err != nil {
 		panic(err)
 	}

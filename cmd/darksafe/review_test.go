@@ -445,7 +445,7 @@ func TestReviewPreservesDistinctRawBytes(t *testing.T) {
 
 // syntheticEnvelope mirrors the library's internal fingerprint envelope for
 // the all-valid-UTF-8 case: record fingerprints are the SHA-256 of this JSON
-// shape (see audit.go's hashEnvelope), and the genesis root is
+// shape (see recordJSONEnvelope in record_fields.go), and the genesis root is
 // SHA-256("darksafe-audit-genesis\x00"+org). Field order and tags are
 // load-bearing because the hash is order-sensitive; EncodeAuditArchive below
 // independently re-verifies every fingerprint, so any drift fails the test

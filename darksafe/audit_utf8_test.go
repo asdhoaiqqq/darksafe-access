@@ -23,6 +23,22 @@ const anotherInvalidByte = "\xfe"
 // lone invalid bytes.
 const replacementRune = string(rune(0xFFFD))
 
+// hashEnvelope is the historical fingerprint envelope struct the legacy
+// JSON fingerprint family was computed over. Production no longer names
+// it — the single record field table (record_fields.go) defines the
+// envelope now — but the tests keep it as an independent oracle: if the
+// table-driven JSON encoder ever drifted from the historical
+// encoding/json output, the comparisons against legacyJSONFingerprint
+// would catch it.
+type hashEnvelope struct {
+	Org             string          `json:"org"`
+	Seq             int             `json:"seq"`
+	Kind            string          `json:"kind"`
+	Change          *PolicyChange   `json:"change,omitempty"`
+	Decision        *DecisionRecord `json:"decision,omitempty"`
+	PrevFingerprint string          `json:"prev"`
+}
+
 // legacyJSONFingerprint is the exact fingerprint algorithm used before
 // the raw-content integrity fix: encoding/json over the envelope. Tests
 // use it to prove valid-UTF-8 records keep byte-identical fingerprints.

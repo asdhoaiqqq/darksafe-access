@@ -219,14 +219,25 @@ func EncodeAuditArchive(org string, records []AuditRecord, cp Checkpoint) ([]byt
 	pw.stringField(cp.Fingerprint)
 	pw.u32(len(records))
 	for i := range records {
-		r := &records[i]
-		pw.stringField(r.Org)
-		pw.u32(r.Seq)
-		pw.stringField(r.Kind)
-		pw.change(r.Change)
-		pw.decisionRecord(r.Decision)
-		pw.stringField(r.PrevFingerprint)
-		pw.stringField(r.Fingerprint)
+		rec := &records[i]
+		// The outer record fields walk the single record field table, so
+		// the archive's record layout is the fingerprint envelope's layout
+		// — plus the record's own fingerprint, which the envelope excludes
+		// — by construction, and no outer field can be skipped or
+		// reordered here alone.
+		for j := range recordFields {
+			f := &recordFields[j]
+			switch f.kind {
+			case recordFieldString:
+				pw.stringField(f.getString(rec))
+			case recordFieldInt:
+				pw.u32(f.getInt(rec))
+			case recordFieldChange:
+				pw.change(f.getChange(rec))
+			case recordFieldDecision:
+				pw.decisionRecord(f.getDecision(rec))
+			}
+		}
 	}
 	if pw.err != nil {
 		return nil, pw.err
@@ -502,14 +513,23 @@ func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecor
 	}
 	records := make([]AuditRecord, 0, n)
 	for i := 0; i < n; i++ {
+		// Read the outer fields in the single record field table's (write
+		// and fingerprint) order, so a field can never be restored into
+		// the wrong member or skipped.
 		var rec AuditRecord
-		rec.Org = r.stringField()
-		rec.Seq = r.u32()
-		rec.Kind = r.stringField()
-		rec.Change = r.change()
-		rec.Decision = r.decisionRecord()
-		rec.PrevFingerprint = r.stringField()
-		rec.Fingerprint = r.stringField()
+		for j := range recordFields {
+			f := &recordFields[j]
+			switch f.kind {
+			case recordFieldString:
+				f.setString(&rec, r.stringField())
+			case recordFieldInt:
+				f.setInt(&rec, r.u32())
+			case recordFieldChange:
+				f.setChange(&rec, r.change())
+			case recordFieldDecision:
+				f.setDecision(&rec, r.decisionRecord())
+			}
+		}
 		records = append(records, rec)
 	}
 	if r.err != nil {

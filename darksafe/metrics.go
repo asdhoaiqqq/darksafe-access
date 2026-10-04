@@ -170,7 +170,9 @@ var (
 )
 
 // ProcessLine 处理一行非空输入：JSON 数组为写入批次，JSON 对象为查询/操作。
-// 成功时返回 BatchResult 或 *QueryResult；失败返回 *LineError（Index 始终为零）。
+// 成功时返回非 nil 的 *BatchResult 或 *QueryResult 且错误为 nil；任何失败都返回
+// 真正的 nil 结果与 *LineError，调用方直接比较 result == nil 即可判定失败，
+// 无须先区分结果类型。空写入数组与无命中的查询仍是成功，结果不为 nil。
 func (s *MetricStore) ProcessLine(line string) (any, *LineError) {
 	top, ok, lerr := decodeTopValue(line)
 	if lerr != nil {
@@ -182,9 +184,20 @@ func (s *MetricStore) ProcessLine(line string) (any, *LineError) {
 		if err := json.Unmarshal(top, &items); err != nil {
 			return nil, &LineError{Status: "error", Error: "invalid JSON: " + err.Error()}
 		}
-		return s.ingestItems(items)
+		// 不能把 *BatchResult 直接装进 any 返回：失败时它是带类型的 nil 指针，
+		// 接口值非 nil，调用方会把失败误判为有结果。
+		batch, lerr := s.ingestItems(items)
+		if lerr != nil {
+			return nil, lerr
+		}
+		return batch, nil
 	case '{':
-		return s.queryFromObject(top)
+		// 同上：失败时不能把带类型 nil 的 *QueryResult 装进 any。
+		query, lerr := s.queryFromObject(top)
+		if lerr != nil {
+			return nil, lerr
+		}
+		return query, nil
 	default:
 		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a JSON array of samples or a query object"}
 	}

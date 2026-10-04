@@ -883,12 +883,14 @@ func identityText(s string) string {
 	return s
 }
 
-// organizedSeries 是一次结果整理中的一条序列：携带已存序列指针，
-// 以及供结果直接使用的独立标签副本（标签书写顺序不影响身份，
-// 副本使调用方对结果的修改不能回写存储）。
+// organizedSeries 是一次结果整理中的一条序列：携带已存序列指针、
+// 供结果直接使用的独立标签副本（标签书写顺序不影响身份，
+// 副本使调用方对结果的修改不能回写存储），以及该副本按键升序
+// 整理好的键值对，供排序比较直接复用。
 type organizedSeries struct {
-	sr  *storedSeries
-	ref SeriesRef
+	sr    *storedSeries
+	ref   SeriesRef
+	pairs []labelPair
 }
 
 // organizeSeries 是写入快照与区间查询共用的数据整理逻辑：
@@ -896,22 +898,27 @@ type organizedSeries struct {
 // 先按指标名字符串字典序，再按标签键升序后的键值对逐对比较
 // （先比键再比值，前一对相同才比下一对；较短集合是完整前缀时排前，
 // 无标签序列因此排在最前）。标签值按字符串比较（"10" 在 "2" 之前）。
-// 整理结果不复制采样点；采样点的选取与升序排列由 sortedSeriesPoints 完成。
+// 每条序列的标签只在遍历时整理一次：排序后的键值对随条目保留，
+// sort 的反复比较直接复用同一份结果，不会因一条序列参与多次比较
+// 而反复整理同一套标签。整理结果不复制采样点；采样点的选取与升序
+// 排列由 sortedSeriesPoints 完成。
 func (s *MetricStore) organizeSeries() []organizedSeries {
 	out := make([]organizedSeries, 0, len(s.series))
 	for _, sr := range s.series {
 		// 标签必须复制：成功结果是当次操作的独立记录，
 		// 调用方修改结果标签不能改动已存序列的身份。
+		labels := cloneLabels(sr.ref.Labels)
 		out = append(out, organizedSeries{
-			sr:  sr,
-			ref: SeriesRef{Name: sr.ref.Name, Labels: cloneLabels(sr.ref.Labels)},
+			sr:    sr,
+			ref:   SeriesRef{Name: sr.ref.Name, Labels: labels},
+			pairs: sortedPairs(labels),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].ref.Name != out[j].ref.Name {
 			return out[i].ref.Name < out[j].ref.Name
 		}
-		return compareLabelPairs(sortedPairs(out[i].ref.Labels), sortedPairs(out[j].ref.Labels)) < 0
+		return compareLabelPairs(out[i].pairs, out[j].pairs) < 0
 	})
 	return out
 }

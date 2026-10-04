@@ -30,6 +30,71 @@ printf '%s\n' \
 
 查询对 `[start,end]` 闭区间内的点按序列返回 `count` 与算术平均 `average`；`labels` 省略或为 `{}` 时匹配该指标的全部序列，否则按子集匹配。详见 `go run ./cmd/darksafe help`。
 
+## 数值精度与区间平均值
+
+写入值按十进制 JSON 数字书写，但进入系统时会转换为有限的 **float64**（IEEE 双精度二进制浮点数）后存储；超出 float64 范围、无穷或 `NaN` 一律按既有规则拒绝。float64 只有约 16 位十进制有效数字，两个不同的十进制写法可能落到同一个存储值上（如 `1` 与 `1.0000000000000001`），所以系统**不承诺逐位保留任意十进制精度**，查询依据的始终是实际存储下来的 float64 值。
+
+查询对每条匹配序列**分别**计算平均值：只取该序列在闭区间 `[start,end]` 内、此前已成功写入的点，先求出它们的**精确算术平均**（求和与除以 `count` 都按精确有理数完成，不做 float64 连加，与点的顺序和批次划分无关），再把结果**舍入到最近的可表示 float64** 输出。
+
+恰好处在两个相邻可表示值正中间时，选择其中**二进制有效数字末位为零（偶数）**的那一个。这是二进制层面的“中点取偶”规则，正数与负数完全相同；不要按“小数点后第几位数四舍五入”这类十进制舍入去理解它——数轴上的可表示值不是均匀刻度，越靠近零越密、越远越疏，中点落在格子之间时挑末位为偶的格子，只是为了让大量舍入不系统性地偏向同一侧。平均值精确为零时输出 `0`。
+
+下面的输入可直接交给现有 `ingest` 入口；写入行与查询行在**同一次进程内**交替提交，字段与结果结构沿用既有约定。
+
+```bash
+printf '%s\n' \
+'[{"name":"signal","timestamp":1000,"value":1e16,"labels":{"host":"a"}},{"name":"signal","timestamp":2000,"value":1,"labels":{"host":"a"}},{"name":"signal","timestamp":3000,"value":-1e16,"labels":{"host":"a"}}]' \
+'{"op":"query","name":"signal","start":0,"end":4000,"labels":{"host":"a"}}' \
+'[{"name":"huge","timestamp":1,"value":1e308},{"name":"huge","timestamp":2,"value":1e308}]' \
+'{"op":"query","name":"huge","start":1,"end":2}' \
+'[{"name":"near","timestamp":1,"value":1},{"name":"near","timestamp":2,"value":1.0000000000000002}]' \
+'{"op":"query","name":"near","start":1,"end":2}' \
+'{"op":"query","name":"absent","start":1,"end":2}' \
+| go run ./cmd/darksafe ingest
+```
+
+逐行对应输出（写入成功的结果会列出当前全部序列的完整身份与点）：
+
+```json
+{"status":"ok","added":3,"duplicates":0,"series":[{"name":"signal","labels":{"host":"a"},"points":[{"timestamp":1000,"value":10000000000000000},{"timestamp":2000,"value":1},{"timestamp":3000,"value":-10000000000000000}]}]}
+{"status":"ok","op":"query","series":[{"name":"signal","labels":{"host":"a"},"count":3,"average":0.3333333333333333}]}
+{"status":"ok","added":2,"duplicates":0,"series":[{"name":"huge","labels":{},"points":[{"timestamp":1,"value":1e+308},{"timestamp":2,"value":1e+308}]},{"name":"signal","labels":{"host":"a"},"points":[{"timestamp":1000,"value":10000000000000000},{"timestamp":2000,"value":1},{"timestamp":3000,"value":-10000000000000000}]}]}
+{"status":"ok","op":"query","series":[{"name":"huge","labels":{},"count":2,"average":1e+308}]}
+{"status":"ok","added":2,"duplicates":0,"series":[{"name":"huge","labels":{},"points":[{"timestamp":1,"value":1e+308},{"timestamp":2,"value":1e+308}]},{"name":"near","labels":{},"points":[{"timestamp":1,"value":1},{"timestamp":2,"value":1.0000000000000002}]},{"name":"signal","labels":{"host":"a"},"points":[{"timestamp":1000,"value":10000000000000000},{"timestamp":2000,"value":1},{"timestamp":3000,"value":-10000000000000000}]}]}
+{"status":"ok","op":"query","series":[{"name":"near","labels":{},"count":2,"average":1}]}
+{"status":"ok","op":"query","series":[]}
+```
+
+- **大数抵消后仍有很小的平均值**：`signal{host=a}` 三个点的存储值是 10000000000000000、1、-10000000000000000。两个大数都能被 float64 精确表示，精确求和后恰好剩下中间那个 `1`，再除以 3 得到 0.3333…，舍入为 `0.3333333333333333`。中间的 `1` 确实参与了结果：`count` 为 3，平均值不是 0。若用普通 float64 连加，`1e16+1` 会直接等于 `1e16`，这个 `1` 会被大数吞掉；本系统先精确求和、最后只舍入一次，不会发生这种丢失。
+- **总和超出 float64 范围，平均值仍有限**：`huge` 两点之和 2e308 已超过 float64 的上限（约 1.7977e308，普通连加会变成 `+Inf`），但精确平均就是 `1e308`，所以 `average` 仍是有限的 `1e+308`。
+- **中点取偶**：`1` 与 `1.0000000000000002` 是两个相邻的可表示值，它们的精确平均 1.0000000000000001 正好落在两者正中；`1` 的二进制有效数字末位为零，因此结果舍入为 `1`，而不是较大的那一侧。
+- **没有区间内点时 `series` 为空数组**：对从未写入过的 `absent` 的查询返回 `"series":[]`，意思是没有任何序列在该区间内有点。它**不表示平均值为零**——没有点就没有平均值，结果中既不会出现 `count:0` 的序列，也不能把空数组解读成 0。
+
+闭区间之外的点与被忽略的重复采样都不进入平均；平均值按序列各自计算，不跨序列求总平均：
+
+```bash
+printf '%s\n' \
+'[{"name":"signal","timestamp":1000,"value":1e16,"labels":{"host":"a"}},{"name":"signal","timestamp":2000,"value":1,"labels":{"host":"a"}},{"name":"signal","timestamp":3000,"value":-1e16,"labels":{"host":"a"}},{"name":"signal","timestamp":2000,"value":1,"labels":{"host":"a"}},{"name":"signal","timestamp":9000,"value":100,"labels":{"host":"a"}}]' \
+'{"op":"query","name":"signal","start":0,"end":4000,"labels":{"host":"a"}}' \
+'{"op":"query","name":"signal","start":9000,"end":9000,"labels":{"host":"a"}}' \
+'[{"name":"balance","timestamp":1,"value":1},{"name":"balance","timestamp":2,"value":-1}]' \
+'{"op":"query","name":"balance","start":1,"end":2}' \
+| go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":4,"duplicates":1,"series":[{"name":"signal","labels":{"host":"a"},"points":[{"timestamp":1000,"value":10000000000000000},{"timestamp":2000,"value":1},{"timestamp":3000,"value":-10000000000000000},{"timestamp":9000,"value":100}]}]}
+{"status":"ok","op":"query","series":[{"name":"signal","labels":{"host":"a"},"count":3,"average":0.3333333333333333}]}
+{"status":"ok","op":"query","series":[{"name":"signal","labels":{"host":"a"},"count":1,"average":100}]}
+{"status":"ok","added":2,"duplicates":0,"series":[{"name":"balance","labels":{},"points":[{"timestamp":1,"value":1},{"timestamp":2,"value":-1}]},{"name":"signal","labels":{"host":"a"},"points":[{"timestamp":1000,"value":10000000000000000},{"timestamp":2000,"value":1},{"timestamp":3000,"value":-10000000000000000},{"timestamp":9000,"value":100}]}]}
+{"status":"ok","op":"query","series":[{"name":"balance","labels":{},"count":2,"average":0}]}
+```
+
+- 时间戳 2000 的第二个采样与已有值完全相同，按重复采样忽略，只计入 `duplicates`：区间查询的 `count` 仍为 3，平均值不变。
+- 时间戳 9000 的点在区间 `[0,4000]` 之外，不增加 `count`、不改变平均值；它没有丢失，用 `[9000,9000]` 单独查询仍能得到 `count` 为 1、`average` 为 100。
+- `balance` 的 `1` 与 `-1` 精确抵消，平均值精确为零，输出 `"average":0`。
+
+本节只说明数值与结果的含义：公开入口、请求与结果字段、写入/查询/错误处理行为均与上文完全一致，没有兼容性变化。
+
 ## 技术方向
 
 identity, authorization, rbac, audit-log, account-abstraction, zk-identity, wallet-security

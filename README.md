@@ -88,6 +88,89 @@ decide  (subject org mismatch)     : allowed=false reason="organization mismatch
 - 审计材料无损归档：`EncodeAuditArchive(org, records, checkpoint)` 把一次完整导出（截至某历史序号的前缀亦可，只要与检查点对应；无记录组织用序号 0 的根检查点）序列化为可保存到文件的字节；`DecodeAuditArchive(archive, org, checkpoint)` 在原服务实例结束后重新读取，返回可直接交给 `RecheckDecisionOffline` 的记录。格式为手写的长度前缀二进制编码（魔数 + 载荷长度 + 载荷 + SHA-256），所有字符串按原始字节还原——组织名、策略/资源标识、角色、命中列表与理由中的中文、控制字符、空格及非 UTF-8 字节均不替换不规整，单字节 0xFF、0xFE 与真正的 U+FFFD 仍可区分；nil 与非 nil 空列表、不存在的记录载荷均保留原有形态，因此重新读取不会改变指纹。编码与读取都先做整份材料校验：缺组织返回 `ErrMissingOrganization`，记录缺失、乱序、混入其他组织、内容改动、检查点不符返回 `ErrInvalidRange`；无法识别、截断、尾部拼接另一份材料或校验和失败返回 `ErrInvalidArchive`，失败不交付任何记录或字节。即使只复核较早决策，后续记录损坏也整份失败。归档内携带的检查点仅供参考，校验一律以调用方另行保留的检查点为准；读取成功只表示材料与检查点一致，原决策与重算决策的差异仍由离线复核报告。两个入口均只读、结果与输入相互脱离，不改变服务状态、不追加审计记录，仅用 Go 标准库且可离线使用。
 - 新的查询、导出与复核入口缺少组织时一律返回 `ErrMissingOrganization` 且不改变状态。
 
+## 完整示例：把某个主体的决策逐页取完
+
+审计员常见的需求是：从一个组织的审计链里，把**某一个主体**的决策记录（允许与拒绝都算）按原顺序全部取出来。`AuditQuery` + `AuditPage` 就是为此设计的分页视图。完整程序是 [`examples/audit_subject_pagination/main.go`](examples/audit_subject_pagination/main.go)，只依赖本项目公开 API 与 Go 标准库，在本机离线运行、自行生成全部材料：
+
+```bash
+go run ./examples/audit_subject_pagination
+```
+
+示例围绕组织 `acme factory` 里的目标主体 `svc-audit-reader`。程序先用现有公开功能造出一条 10 记录的链：目标主体的允许（序号 2、9）与拒绝（序号 4、7）决策，中间穿插着策略发布（序号 1、5）、回滚（序号 8）和另一主体 `svc-billing` 的决策（序号 3、6、10）。然后演示一次完整的分页过程。
+
+### 用法要点
+
+- **发起查询**：`AuditQuery(org, 1, 2, "", "svc-audit-reader")` —— 从序号 1 开始、每页最多 2 条**匹配**记录、不限类别、按主体筛选。目标主体在链里有 4 条决策，页大小 2 使查询确实需要翻页。
+- **页大小限制的是匹配记录数**，不是扫描过的链位置数：两条匹配记录之间隔着多少策略变更或其他主体的记录都不影响，它们只是被扫过，不会提前占满一页。
+- **记录保留原始序号**：输出中的 `seq` 是记录在组织审计链里的真实序号，按递增顺序出现，不会重新编号成 1、2、3，也不会混入其他主体或策略变更记录。每条记录完整保留请求主体、允许与否、理由、命中策略和实际策略版本。
+- **检查点钉住这次查询**：第一次 `AuditQuery` 返回的 `Checkpoint`（截至序号 + 指纹）把这次查询固定在当时的链尾。后续翻页把**同一个检查点**和上一页返回的 `Next` 一起交给 `AuditPage`，各页显示的截至序号与指纹始终相同。取到第一页后再为同一主体新增决策（示例中的序号 11），它**不会**进入这次查询；只有重新发起 `AuditQuery` 钉住新链尾，才能看到它。
+- **翻页只看 `Next`**：`Next` 为 0 表示这次查询结束。不能靠已显示的条数推算下一位置——匹配记录在链上的间隔是任意的。若最后一条匹配记录之后仍有不匹配记录（示例中序号 10 是另一主体的决策），继续翻页会得到一页**没有记录的结束页**，这是正常结果，不能解释为材料丢失。
+- **两个边界**：指定一个没有决策记录的主体时返回空页并结束（`Next` 为 0），绝不退回成未筛选的完整历史；用改动过指纹的检查点继续翻页时返回 `ErrInvalidRange`，不交付任何部分记录。
+- **这只是查询视图**：按主体分页取出的是链上记录的筛选子集，不能代替离线复核所需的材料。离线复核必须用 `AuditExport` 导出**完整**链并另行保留检查点（见上文离线复核一节与 `examples/offline_review`）；按主体筛选的分页结果无法通过 `VerifyAudit` 的链校验。
+- **查询与翻页是只读的**：不改变任何组织的当前策略版本，也不追加审计记录；决策、归档与命令行复核等现有功能的用法不受影响。
+
+### 预期输出
+
+输出是确定性的，重复运行完全一致。先列出自造的完整链（便于对照哪些记录会被筛掉），再逐页展示两次查询与两个边界：
+
+```text
+audit chain of "acme factory" (10 records):
+  seq=1  policy_change version=1 policies=2 rolled_back=false
+  seq=2  decision     subject=svc-audit-reader action=read allowed=true
+  seq=3  decision     subject=svc-billing action=read allowed=false
+  seq=4  decision     subject=svc-audit-reader action=write allowed=false
+  seq=5  policy_change version=2 policies=0 rolled_back=false
+  seq=6  decision     subject=svc-billing action=read allowed=false
+  seq=7  decision     subject=svc-audit-reader action=read allowed=false
+  seq=8  policy_change version=3 policies=2 rolled_back=true
+  seq=9  decision     subject=svc-audit-reader action=read allowed=true
+  seq=10 decision     subject=svc-billing action=read allowed=false
+
+pinned query: subject="svc-audit-reader" start=1 pageSize=2 (page size counts matching records only)
+page 1 (pinned range 1-10, checkpoint end=10 fingerprint=2fb55d31cd2a598d9f729cb774321aa6b62005e0f7b00f8278dd2ce5f70bd878):
+  seq=2 subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+  seq=4 subject=svc-audit-reader allowed=false reason="matched deny policy" matched=["p-ledger-write-deny"] version=1
+  next=5
+appended after page 1: svc-audit-reader read -> allow (new seq 11)
+page 2 (pinned range 5-10, checkpoint end=10 fingerprint=2fb55d31cd2a598d9f729cb774321aa6b62005e0f7b00f8278dd2ce5f70bd878):
+  seq=7 subject=svc-audit-reader allowed=false reason="no matching allow policy" matched=[] version=2
+  seq=9 subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=3
+  next=10
+page 3 (pinned range 10-10, checkpoint end=10 fingerprint=2fb55d31cd2a598d9f729cb774321aa6b62005e0f7b00f8278dd2ce5f70bd878):
+  (no matching records)
+  next=0
+next=0 ends the walk; the empty last page is normal: non-matching records remained after the last match
+
+fresh query after the append (only a new query pins the new head):
+page 1 (pinned range 1-11, checkpoint end=11 fingerprint=60112f84bdb4b40a531a1635b09ef5fc12a866d360e1bfeb86d6464ce26c0adc):
+  seq=2 subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+  seq=4 subject=svc-audit-reader allowed=false reason="matched deny policy" matched=["p-ledger-write-deny"] version=1
+  next=5
+page 2 (pinned range 5-11, checkpoint end=11 fingerprint=60112f84bdb4b40a531a1635b09ef5fc12a866d360e1bfeb86d6464ce26c0adc):
+  seq=7 subject=svc-audit-reader allowed=false reason="no matching allow policy" matched=[] version=2
+  seq=9 subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=3
+  next=10
+page 3 (pinned range 10-11, checkpoint end=11 fingerprint=60112f84bdb4b40a531a1635b09ef5fc12a866d360e1bfeb86d6464ce26c0adc):
+  seq=11 subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=3
+  next=0
+
+boundary 1: subject with no decisions
+  subject="svc-nobody": records=0 next=0 (empty page ends the walk; the unfiltered history is NOT returned)
+boundary 2: checkpoint with an altered fingerprint
+  AuditPage -> darksafe: invalid audit range: checkpoint fingerprint does not match the chain at sequence 10 (ErrInvalidRange; no partial records delivered)
+
+all querying was read-only: chain still 11 records, current version still 3
+```
+
+对照输出理解这次分页：
+
+1. **第一页**取到序号 2、4：序号 3 是另一主体的决策，被扫过但不占页内名额；`next=5` 是下一段扫描的起始链位置（不是"第几条匹配"）。检查点把这次查询钉在截至序号 10。
+2. **追加序号 11 后继续这次查询**：第二、三页沿用第一页的检查点，截至序号与指纹逐字节相同，新增的序号 11 不出现。第二页取到序号 7（空策略集版本 2 下的默认拒绝）与 9（回滚后版本 3 下的允许）。
+3. **空结束页**：序号 9 之后只剩不匹配的序号 10，第三页没有记录、`next=0`，查询正常结束——4 条目标记录（2、4、7、9）已按原序号递增取完，一条不缺。
+4. **重新发起的查询**钉在截至序号 11（指纹随之不同），这次才在第三页看到序号 11。
+5. **边界**：`svc-nobody` 没有决策记录，返回空页并结束；指纹被改动的检查点报 `ErrInvalidRange`，不交付部分记录。
+6. 全部查询结束后链仍是 11 条记录、当前版本仍是 3：查询与翻页没有追加记录、没有改变策略版本。
+
 ## 命令行离线复核：`darksafe review`
 
 `review` 子命令在原服务实例结束后，仅凭一份保存的审计归档复核其中**一条已有访问决策**，不联系运行中的服务，也不创建或恢复策略存储，更不会把该决策的请求重新提交。它顺序调用 `DecodeAuditArchive` 与 `RecheckDecisionOffline`：先按另行保留的检查点校验整份材料，再用决策记录里保存的请求与其实际使用的历史策略版本重算。

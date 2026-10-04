@@ -486,6 +486,11 @@ func parseSample(raw json.RawMessage) (parsedSample, error) {
 // parseLabels 从 dec 读取一个标签对象并做统一校验：必须是 JSON 对象
 // （否则返回调用方给出的 notObjectMsg，写入与查询措辞不同），键为非空字符串、
 // 值为字符串（空串合法，键值均不做清理），重复键一律拒绝。
+// 键的校验次序与采样点字段一致：先拒绝空键，再按转义还原后的键名判重，
+// 最后才读取并校验值。因此某键第一次以合法字符串值出现后再次出现时，
+// 无论第二次的值是什么（数字、布尔、null、对象、数组，哪怕与第一个值相同），
+// 都报告重复标签键而非值类型错误；只有键第一次出现时值就不是字符串，
+// 才报告那次出现的值类型错误。
 // 返回的集合不含标签时也是非 nil 的空 map，与省略 labels 的语义一致。
 func parseLabels(dec *json.Decoder, notObjectMsg string) (map[string]string, error) {
 	t, err := dec.Token()
@@ -506,6 +511,11 @@ func parseLabels(dec *json.Decoder, notObjectMsg string) (map[string]string, err
 		if labelKey == "" {
 			return nil, fmt.Errorf(`field "labels": label keys must be non-empty strings`)
 		}
+		// 判重先于读取值：labels 中存在该键意味着它第一次出现时已是非空键且
+		// 配有合法字符串值，第二次值的任何类型问题都不能掩盖键重复。
+		if _, dup := labels[labelKey]; dup {
+			return nil, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
+		}
 		valTok, err := dec.Token()
 		if err != nil {
 			return nil, err
@@ -513,9 +523,6 @@ func parseLabels(dec *json.Decoder, notObjectMsg string) (map[string]string, err
 		labelVal, ok := valTok.(string)
 		if !ok {
 			return nil, fmt.Errorf(`field "labels": value of label %q must be a string`, labelKey)
-		}
-		if _, dup := labels[labelKey]; dup {
-			return nil, fmt.Errorf(`field "labels": duplicate label key %q`, labelKey)
 		}
 		labels[labelKey] = labelVal
 	}

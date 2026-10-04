@@ -107,6 +107,87 @@ printf '%s\n' \
 
 以上三次调用都包含失败行，因此命令均以非零退出码结束；用 `go run` 运行时它会在标准错误额外打印一行 `exit status 1`，那是 `go` 工具对非零退出码的转述，不是 ingest 的输出行。
 
+### 查询同时有几个问题时：一次只返回一个原因，按顺序逐步修正
+
+ingest 中的每条查询都是一行独立的 JSON 对象。失败查询只输出一条 error：不带 `index`、不带 `conflict`，也不返回任何统计结果（不会有“部分 `series`”）；只有整行与字段都通过、区间也合法时才执行查询并给出统计。一条查询同时存在多个问题时，返回的是按下面规则选出的**第一个**问题，从来不是错误列表。所以修掉当前原因后，下一次请求仍可能失败——那不是冒出了新错误，而是此前排在后面、当时还没机会报告的问题；照返回的原因逐项修正即可。
+
+原因的选择分三层，前一层不通过就不会进入下一层：
+
+1. **整行解析先于字段校验。** 一行必须是唯一、完整且文本合法的 JSON 值（原始字节为合法 UTF-8、字符串 `\uXXXX` 转义表示真实字符、值完整闭合、该值之后只有空白），且顶层是数组或对象。只要这一层不通过，返回的就是整行解析失败（`invalid JSON: ...`，无 `index`、无 `conflict`）——即使对象前面的字段本身也有错（例如 `name` 已写成数字、未知字段已出现），返回的仍是整行解析失败，因为字段校验此时还没有开始。
+2. **结构完整的对象按字段原始书写次序校验。** 对象能完整解析后，已出现的字段按它们在原文中的先后逐个检查：未知字段、类型错误、重复字段，谁先书写就先报告谁。只交换两个出错字段的书写位置，先返回的原因就可能改变（见下方“对照一”）。
+3. **已出现字段全部合法后，才查缺失的必填项，再查区间。** 缺少必填项与字段类型错误不能混为一谈：只要已出现字段里还有问题，就不会报缺字段；全部已出现字段合法后，缺少的必填项才按 `op`、`name`、`start`、`end` 的固定顺序报告第一个缺项（见下方“对照二”）。必填项齐全且合法后，才可能报告 `start` 大于 `end`，原因中给出两个实际边界。
+
+查询是只读操作：任何失败都不改变存储，此前成功写入的数据原样保留，仍可由后续合法查询读到。
+
+#### 示例：连续修正一条同时含有三个问题的查询
+
+写入与修正放在同一次 ingest 中：第 1 行先向 `cpu{host=a}` 写入三个点；第 2 行故意留空（不产生输出，但占行号）；第 3 行的查询同时含有三个问题——`name` 写成数字、多了未知字段 `bogus`、区间倒置（`start` 3000 大于 `end` 1000）。随后每行只修掉当前原因指出的那一个问题，其余原样保留：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}},{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":3000,"value":6,"labels":{"host":"a"}}]' \
+  '' \
+  '{"op":"query","name":7,"bogus":1,"start":3000,"end":1000}' \
+  '{"op":"query","name":"cpu","bogus":1,"start":3000,"end":1000}' \
+  '{"op":"query","name":"cpu","start":3000,"end":1000}' \
+  '{"op":"query","name":"cpu","start":0,"end":4000,"labels":{"host":"a"}}' \
+  | go run ./cmd/darksafe ingest
+```
+
+逐行输出（每个非空输入行对应一行结果，每条失败查询都只有当前会返回的那一条原因）：
+
+```json
+{"status":"ok","added":3,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2},{"timestamp":2000,"value":4},{"timestamp":3000,"value":6}]}]}
+{"status":"error","line":3,"error":"field \"name\" must be a string"}
+{"status":"error","line":4,"error":"unknown field \"bogus\""}
+{"status":"error","line":5,"error":"invalid range: \"start\" must not be greater than \"end\" (3000 > 1000)"}
+{"status":"ok","op":"query","series":[{"name":"cpu","labels":{"host":"a"},"count":3,"average":4}]}
+```
+
+- 第 3 行：`op` 合法，按书写次序下一个出问题的字段是写成数字的 `name`，于是报它的类型错误；同一行里的未知字段与倒置区间此时都不报告。
+- 第 4 行：只把 `name` 改为 `"cpu"`，`bogus` 与倒置区间原样保留——下一次请求便显示出尚未修正的另一项：未知字段 `bogus`。
+- 第 5 行：只删掉 `bogus`，已出现字段全部合法、必填项齐全，这时才轮到区间检查，原因显示实际边界 `3000 > 1000`。
+- 第 6 行：把区间改为 `0..4000` 后查询成功，统计的正是第 1 行先前写入的三个点：`count` 为 3、`average` 为 4；三次失败查询都没有改动这些数据。
+- 因为第 2 行是空白行，三条失败查询的行号分别是 3、4、5；每行结果都只有 `line` 与 `error`，没有 `index`、没有 `conflict`，也没有任何 `series`。本次 ingest 中出现过失败行，所以即使最后一行（第 6 行）成功，命令仍以非零退出码结束；用 `go run` 运行时标准错误还会出现一行 `exit status 1`，那是 `go` 工具的转述，不是 ingest 的输出行。
+
+#### 对照一：交换两个出错字段的位置，先返回的原因随之改变
+
+同样两个问题（未知字段 `bogus` 与写成数字的 `name`），书写次序不同，先报告的原因就不同。最后一行对象没有闭合：尽管 `name` 的类型错误写在前面，整行不是完整 JSON 值，返回的仍是整行解析失败而不是字段错误：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2}]' \
+  '{"op":"query","bogus":1,"name":7,"start":0,"end":2000}' \
+  '{"op":"query","name":7,"bogus":1,"start":0,"end":2000}' \
+  '{"op":"query","name":7,"start":0' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":2,"error":"unknown field \"bogus\""}
+{"status":"error","line":3,"error":"field \"name\" must be a string"}
+{"status":"error","line":4,"error":"invalid JSON: unexpected EOF"}
+```
+
+#### 对照二：必填字段缺失时，按 op、name、start、end 报告第一个缺项
+
+下面每行已出现的字段都合法，因此进入缺项检查；同时缺多个必填字段时只报告固定顺序中的第一个，逐条补齐会依次看到后续缺项（三条均为查询失败，无 `index`、无 `conflict`）：
+
+```bash
+printf '%s\n' \
+  '{}' \
+  '{"op":"query","end":1}' \
+  '{"op":"query","name":"cpu","end":2000}' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"error","line":1,"error":"missing required field \"op\""}
+{"status":"error","line":2,"error":"missing required field \"name\""}
+{"status":"error","line":3,"error":"missing required field \"start\""}
+```
+
 ## 数值结果的解读
 
 ### 存储与计算的精度约定

@@ -38,8 +38,46 @@ type Policy struct {
 	//
 	// The omitempty tag is load bearing for audit fingerprints: the legacy
 	// JSON fingerprint family never had this field, and an empty value must
-	// keep serializing to exactly the old bytes.
+	// keep serializing to exactly the old bytes. policyFields carries the
+	// matching omitEmptyInFingerprint marker so the raw-byte fingerprint
+	// family stays in sync.
 	ResourceID string `json:",omitempty"`
+}
+
+// policyField describes one content field of Policy: how to read it and
+// how to write it back. policyFields is the single definition of which
+// fields a policy carries and in what order the audit representations
+// visit them — the raw-byte fingerprint encoder, the archive codec and the
+// invalid-UTF-8 scan all derive their per-field handling from it, so
+// changing Policy's content means editing this list once instead of
+// keeping the fingerprint, the archive read/write and the UTF-8 check in
+// sync by hand.
+type policyField struct {
+	name string
+	// str reads a string field and setStr writes it back during archive
+	// decode. Boolean fields use boolean/setBool instead; exactly one pair
+	// is set per entry.
+	str     func(*Policy) string
+	setStr  func(*Policy, string)
+	boolean func(*Policy) bool
+	setBool func(*Policy, bool)
+	// omitEmptyInFingerprint mirrors an omitempty JSON tag: the fingerprint
+	// skips the field when its value is empty, so the legacy JSON and the
+	// raw-byte fingerprint families agree on whether the field participates
+	// at all. The archive always stores the field, empty or not.
+	omitEmptyInFingerprint bool
+}
+
+// policyFields lists Policy's content fields in canonical order: identity,
+// subject, action, scope, effect, recursion flag, resource restriction.
+var policyFields = []policyField{
+	{name: "ID", str: func(p *Policy) string { return p.ID }, setStr: func(p *Policy, v string) { p.ID = v }},
+	{name: "Subject", str: func(p *Policy) string { return p.Subject }, setStr: func(p *Policy, v string) { p.Subject = v }},
+	{name: "Action", str: func(p *Policy) string { return p.Action }, setStr: func(p *Policy, v string) { p.Action = v }},
+	{name: "Scope", str: func(p *Policy) string { return p.Scope }, setStr: func(p *Policy, v string) { p.Scope = v }},
+	{name: "Effect", str: func(p *Policy) string { return string(p.Effect) }, setStr: func(p *Policy, v string) { p.Effect = Effect(v) }},
+	{name: "Recursive", boolean: func(p *Policy) bool { return p.Recursive }, setBool: func(p *Policy, v bool) { p.Recursive = v }},
+	{name: "ResourceID", str: func(p *Policy) string { return p.ResourceID }, setStr: func(p *Policy, v string) { p.ResourceID = v }, omitEmptyInFingerprint: true},
 }
 
 // Sentinel errors so callers can distinguish failure causes with errors.Is.

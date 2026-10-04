@@ -89,6 +89,19 @@ type hashEnvelope struct {
 	PrevFingerprint string          `json:"prev"`
 }
 
+// policyUsesRawBytes reports whether any string field a policy carries
+// holds bytes that are not valid UTF-8. The fields scanned are exactly the
+// string fields of policyFields, so the scan can never drift from the set
+// of strings the fingerprint and the archive actually protect.
+func policyUsesRawBytes(p *Policy) bool {
+	for _, f := range policyFields {
+		if f.str != nil && !utf8.ValidString(f.str(p)) {
+			return true
+		}
+	}
+	return false
+}
+
 // envelopeUsesRawBytes reports whether any string protected by the
 // fingerprint carries bytes that are not valid UTF-8. Such envelopes are
 // hashed through encodeCanonical instead of encoding/json, because JSON
@@ -100,10 +113,8 @@ func envelopeUsesRawBytes(env *hashEnvelope) bool {
 		return true
 	}
 	if env.Change != nil {
-		for _, p := range env.Change.Policies {
-			if !utf8.ValidString(p.ID) || !utf8.ValidString(p.Subject) ||
-				!utf8.ValidString(p.Action) || !utf8.ValidString(p.Scope) ||
-				!utf8.ValidString(string(p.Effect)) || !utf8.ValidString(p.ResourceID) {
+		for i := range env.Change.Policies {
+			if policyUsesRawBytes(&env.Change.Policies[i]) {
 				return true
 			}
 		}
@@ -220,18 +231,21 @@ func (e *fingerprintEncoder) stringList(items []string) {
 
 func (e *fingerprintEncoder) policy(p Policy) {
 	e.tag(tagPolicy)
-	e.rawString(p.ID)
-	e.rawString(p.Subject)
-	e.rawString(p.Action)
-	e.rawString(p.Scope)
-	e.rawString(string(p.Effect))
-	e.boolTag(tagBool, p.Recursive)
-	// ResourceID is appended only when set, so the canonical byte layout
-	// of every legacy (resource-unrestricted) policy is unchanged. It
-	// pairs with the omitempty JSON tag: the two fingerprint families stay
-	// in sync about whether the field participates at all.
-	if p.ResourceID != "" {
-		e.rawString(p.ResourceID)
+	for _, f := range policyFields {
+		if f.str == nil {
+			e.boolTag(tagBool, f.boolean(&p))
+			continue
+		}
+		v := f.str(&p)
+		// A field marked omitEmptyInFingerprint (ResourceID) is appended
+		// only when set, so the canonical byte layout of every legacy
+		// (resource-unrestricted) policy is unchanged. It pairs with the
+		// omitempty JSON tag: the two fingerprint families stay in sync
+		// about whether the field participates at all.
+		if f.omitEmptyInFingerprint && v == "" {
+			continue
+		}
+		e.rawString(v)
 	}
 }
 

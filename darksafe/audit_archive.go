@@ -108,17 +108,18 @@ func (w *archiveWriter) stringList(items []string) {
 	}
 }
 
-// policy mirrors Policy. ResourceID is always written so every field round
-// trips on its own; it participates in the fingerprint regardless, so its
-// placement does not move any fingerprint boundary.
+// policy writes every field of p in the canonical policyFields order.
+// ResourceID is always written so every field round trips on its own; it
+// participates in the fingerprint regardless, so its placement does not
+// move any fingerprint boundary.
 func (w *archiveWriter) policy(p Policy) {
-	w.stringField(p.ID)
-	w.stringField(p.Subject)
-	w.stringField(p.Action)
-	w.stringField(p.Scope)
-	w.stringField(string(p.Effect))
-	w.boolean(p.Recursive)
-	w.stringField(p.ResourceID)
+	for _, f := range policyFields {
+		if f.str != nil {
+			w.stringField(f.str(&p))
+		} else {
+			w.boolean(f.boolean(&p))
+		}
+	}
 }
 
 func (w *archiveWriter) policyList(policies []Policy) {
@@ -341,15 +342,17 @@ func (r *archiveReader) stringList() []string {
 	return items
 }
 
+// policy reads back exactly what archiveWriter.policy wrote: every field
+// of policyFields, in the same canonical order.
 func (r *archiveReader) policy() Policy {
 	var p Policy
-	p.ID = r.stringField()
-	p.Subject = r.stringField()
-	p.Action = r.stringField()
-	p.Scope = r.stringField()
-	p.Effect = Effect(r.stringField())
-	p.Recursive = r.boolean()
-	p.ResourceID = r.stringField()
+	for _, f := range policyFields {
+		if f.setStr != nil {
+			f.setStr(&p, r.stringField())
+		} else {
+			f.setBool(&p, r.boolean())
+		}
+	}
 	return p
 }
 

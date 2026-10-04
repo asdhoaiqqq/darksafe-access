@@ -120,17 +120,7 @@ func (s *Store) Publish(org string, expectedVersion int, policies []Policy) (int
 	if expectedVersion != st.current {
 		return 0, fmt.Errorf("%w: expected %d, current is %d", ErrVersionConflict, expectedVersion, st.current)
 	}
-	st.current++
-	st.versions[st.current] = snapshot
-	// The change and its audit record become visible together; a failed
-	// publish never reaches this point and leaves no record.
-	st.appendAuditLocked(org, AuditPolicyChange, &PolicyChange{
-		Version:       st.current,
-		Policies:      snapshot,
-		SourceVersion: 0,
-		RolledBack:    false,
-	}, nil)
-	return st.current, nil
+	return st.commitVersionLocked(org, snapshot, 0, false), nil
 }
 
 // Rollback republishes the full content of an existing historical version
@@ -149,18 +139,28 @@ func (s *Store) Rollback(org string, expectedVersion, targetVersion int) (int, e
 	if expectedVersion != st.current {
 		return 0, fmt.Errorf("%w: expected %d, current is %d", ErrVersionConflict, expectedVersion, st.current)
 	}
-	st.current++
 	snapshot := append([]Policy(nil), src...)
+	return st.commitVersionLocked(org, snapshot, targetVersion, true), nil
+}
+
+// commitVersionLocked advances the organization to the next version with
+// the given policy snapshot and appends the matching policy-change record
+// to the audit chain. It runs under the store mutex, so the new version
+// and its audit record become visible together; callers must have already
+// validated the input and checked the expected version, so a failed
+// operation never reaches this point and leaves no record. A rollback
+// passes its source version and rolledBack=true; an ordinary publish
+// passes 0 and false.
+func (st *orgState) commitVersionLocked(org string, snapshot []Policy, sourceVersion int, rolledBack bool) int {
+	st.current++
 	st.versions[st.current] = snapshot
-	// A rollback record names the source version in addition to carrying
-	// the full content of the new version.
 	st.appendAuditLocked(org, AuditPolicyChange, &PolicyChange{
 		Version:       st.current,
 		Policies:      snapshot,
-		SourceVersion: targetVersion,
-		RolledBack:    true,
+		SourceVersion: sourceVersion,
+		RolledBack:    rolledBack,
 	}, nil)
-	return st.current, nil
+	return st.current
 }
 
 // Policies returns a copy of the full policy set of one version. Mutating

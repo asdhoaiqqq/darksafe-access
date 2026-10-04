@@ -111,11 +111,14 @@ func (e *duplicateMemberError) Error() string {
 }
 
 // checkDuplicateMembers walks every JSON object in data and rejects objects
-// with duplicate member names. Names are compared after JSON decoding, so
-// "env" and "env" are the same name while "env" and "ENV", or
-// " env" and "env", are different. The first duplicate encountered in file
-// order is reported: the walk is depth-first in document order, so the
-// second occurrence that appears earliest wins, regardless of value type.
+// with duplicate member names, and every JSON string — member names and
+// values, in known or unknown fields at any depth — whose raw bytes are not
+// valid UTF-8 or whose \uXXXX escapes leave an unpaired surrogate. Names are
+// compared after JSON decoding, so "env" and env are the same name
+// while "env" and "ENV", or " env" and "env", are different. Both kinds of
+// structural problem are discovered in one depth-first, document-order walk,
+// so the first occurrence encountered in the file is reported, regardless of
+// value type or which business field it belongs to.
 func checkDuplicateMembers(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// Numbers are only walked past, never interpreted: UseNumber keeps legal
@@ -123,7 +126,7 @@ func checkDuplicateMembers(data []byte) error {
 	// unmarshal-overflow error here. Whether a number is acceptable for a given
 	// field is decided later by business validation.
 	dec.UseNumber()
-	if err := walkJSONValue(dec, "$"); err != nil {
+	if err := walkJSONValue(dec, data, "$"); err != nil {
 		return err
 	}
 	if _, err := dec.Token(); err != io.EOF {
@@ -137,7 +140,8 @@ func checkDuplicateMembers(data []byte) error {
 
 // walkJSONValue reads one complete JSON value whose first token has not been
 // consumed yet.
-func walkJSONValue(dec *json.Decoder, path string) error {
+func walkJSONValue(dec *json.Decoder, data []byte, path string) error {
+	start := dec.InputOffset()
 	tok, err := dec.Token()
 	if err != nil {
 		if err == io.EOF {
@@ -145,27 +149,36 @@ func walkJSONValue(dec *json.Decoder, path string) error {
 		}
 		return fmt.Errorf("JSON 格式错误: %w", err)
 	}
-	return walkJSONValueToken(dec, path, tok)
+	return walkJSONValueToken(dec, data, path, tok, start)
 }
 
 // walkJSONValueToken reads the remainder of a value given its first token.
-func walkJSONValueToken(dec *json.Decoder, path string, tok json.Token) error {
+// tokenStart is the decoder offset immediately before that token, so the
+// token's exact raw bytes can be bounded for the string text checks.
+func walkJSONValueToken(dec *json.Decoder, data []byte, path string, tok json.Token, tokenStart int64) error {
 	if d, ok := tok.(json.Delim); ok {
 		switch d {
 		case '{':
-			return walkJSONObject(dec, path)
+			return walkJSONObject(dec, data, path)
 		case '[':
-			return walkJSONArray(dec, path)
+			return walkJSONArray(dec, data, path)
 		default:
 			return fmt.Errorf("JSON 格式错误: 意外的分隔符 %q", d)
+		}
+	}
+	if s, ok := tok.(string); ok && tokenStart >= 0 {
+		if e := checkJSONStringToken(rawTokenBytes(data, tokenStart, dec.InputOffset()), s); e != nil {
+			e.path = path
+			return e
 		}
 	}
 	return nil // scalar value (string, number, bool, null)
 }
 
-func walkJSONObject(dec *json.Decoder, path string) error {
+func walkJSONObject(dec *json.Decoder, data []byte, path string) error {
 	seen := make(map[string]struct{})
 	for {
+		keyStart := dec.InputOffset()
 		tok, err := dec.Token()
 		if err != nil {
 			if err == io.EOF {
@@ -183,10 +196,17 @@ func walkJSONObject(dec *json.Decoder, path string) error {
 		if !ok {
 			return errors.New("JSON 格式错误: 对象成员名必须是字符串")
 		}
+		// The member name's own bytes are checked before it is compared or
+		// used; a broken name is located at the object that owns it.
+		if e := checkJSONStringToken(rawTokenBytes(data, keyStart, dec.InputOffset()), key); e != nil {
+			e.path = path
+			return e
+		}
 		if _, dup := seen[key]; dup {
 			return &duplicateMemberError{field: key, path: path}
 		}
 		seen[key] = struct{}{}
+		valStart := dec.InputOffset()
 		vtok, err := dec.Token()
 		if err != nil {
 			if err == io.EOF {
@@ -194,7 +214,7 @@ func walkJSONObject(dec *json.Decoder, path string) error {
 			}
 			return fmt.Errorf("JSON 格式错误: %w", err)
 		}
-		if err := walkJSONValueToken(dec, joinMemberPath(path, key), vtok); err != nil {
+		if err := walkJSONValueToken(dec, data, joinMemberPath(path, key), vtok, valStart); err != nil {
 			return err
 		}
 	}
@@ -243,8 +263,9 @@ func jsonEncodePathString(key string) string {
 	return string(bs)
 }
 
-func walkJSONArray(dec *json.Decoder, path string) error {
+func walkJSONArray(dec *json.Decoder, data []byte, path string) error {
 	for i := 0; ; i++ {
+		elemStart := dec.InputOffset()
 		tok, err := dec.Token()
 		if err != nil {
 			if err == io.EOF {
@@ -255,7 +276,7 @@ func walkJSONArray(dec *json.Decoder, path string) error {
 		if d, ok := tok.(json.Delim); ok && d == ']' {
 			return nil
 		}
-		if err := walkJSONValueToken(dec, fmt.Sprintf("%s[%d]", path, i), tok); err != nil {
+		if err := walkJSONValueToken(dec, data, fmt.Sprintf("%s[%d]", path, i), tok, elemStart); err != nil {
 			return err
 		}
 	}

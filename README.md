@@ -12,6 +12,45 @@ go run ./cmd/darksafe version
 go test ./...
 ```
 
+## 从演示到组织级访问决策
+
+演示入口（`go run ./cmd/darksafe demo`，即 `darksafe.Access`）与组织级决策（`Store.Decide`）是**两套不同的授权依据**，同一主体在两边得到不同结论是正常的，不要把其中一边的结论当成另一边的依据：
+
+- `Access` 只看主体携带的**角色**：角色为 `owner` 或 `<作用域>:<动作>` 即允许。它不读取任何已发布策略，不创建策略存储，也不产生组织审计记录；结果中的命中项（`Matched`）是**授予访问的角色名**。
+- `Decide` 只看决策组织**当前已发布的策略**：请求中的主体角色——即使包含 `owner` 或与作用域对应的角色——完全不参与评估，不能代替允许策略；结果中的命中项是**策略标识**。每次指定非空决策组织的 `Decide`，无论允许还是拒绝，都会在该组织的审计链追加一条记录请求与结果的决策记录。
+- 两边的 `Version` 含义一致：实际用于评估的策略版本。`0` 表示**没有使用任何已发布策略**（`Access` 恒为 0；信封检查失败或组织尚未发布策略的 `Decide` 也是 0），不能仅凭版本 0 判断请求是否被允许。
+- 已发布的**空策略集**同样默认拒绝（理由 `no matching allow policy`），但合法请求的结果会标明该空集的版本号——这与"尚未发布任何策略"的版本 0 可以区分。
+- 更改演示主体的角色只影响 `Access` 的结论，不会修改任何组织策略；反之，发布或回滚组织策略也不会改变 `Access` 的结果。
+
+### 完整示例：同一主体、同一账本、两种依据
+
+[`examples/org_decision/main.go`](examples/org_decision/main.go) 可在本机离线运行，只依赖本项目公开 API 与 Go 标准库。一个携带 `owner` 角色的主体 `svc-audit-reader` 读取账本 `ledger-2026`（作用域 `acme/factory/ledger`，决策组织、主体组织、资源组织均为 `acme factory`）：
+
+```bash
+go run ./examples/org_decision
+```
+
+输出（每行依次给出允许与否、理由、命中列表与实际版本）：
+
+```text
+access  (role owner, no policy store): allowed=true reason="role grants read:acme/factory/ledger" matched=["owner"] version=0
+decide  (no published policy)      : allowed=false reason="organization has no published version" matched=[] version=0
+published allow policy p-ledger-read-2026 as version 1
+decide  (allow policy published)   : allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+decide  (subject disabled)         : allowed=false reason="subject is disabled" matched=[] version=0
+decide  (subject org mismatch)     : allowed=false reason="organization mismatch" matched=[] version=0
+```
+
+逐行理解：
+
+1. **`Access` 允许**：`owner` 角色足以通过演示核心，命中项是角色名 `owner`；它从不评估策略，版本恒为 0。
+2. **`Decide` 拒绝（尚未发布策略）**：请求信封完全合法、三个组织一致，但组织级决策只认已发布策略，此时一条都没有，默认拒绝；版本 0 表示没有使用任何已发布策略，命中列表为空。
+3. **发布匹配策略后 `Decide` 允许**：发布的 `p-ledger-read-2026`（主体 `svc-audit-reader`、动作 `read`、作用域 `acme/factory/ledger`、效果 allow）成为版本 1；同一请求再次提交后命中该策略，命中项是策略标识，实际版本为 1。注意允许来自策略而非 `owner` 角色——把请求中的角色全部去掉，结论不变。
+4. **主体停用**：即使版本 1 的允许策略仍然匹配，信封检查先拒绝，理由 `subject is disabled`；未评估任何策略，版本 0、无命中项。
+5. **组织不一致**：主体组织（或资源组织）改为其他组织即与决策组织不一致，信封检查拒绝，理由 `organization mismatch`；同样未评估策略，版本 0、无命中项。
+
+这两条边界（第 4、5 行）说明：组织级请求先过信封检查再谈策略，版本 0 的拒绝与"策略评估后拒绝"是两类情况。示例中的四次 `Decide` 都指定了非空决策组织，因此无论允许还是拒绝，都会在 `acme factory` 的审计链各留下一条决策记录（加上发布记录共 5 条）；而第 1 行的 `Access` 不产生任何审计记录。
+
 ## 按组织的策略发布、回滚与复核
 
 `darksafe.NewStore()` 提供组织级策略管理（纯内存，随服务实例结束而销毁）：

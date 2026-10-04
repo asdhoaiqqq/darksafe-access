@@ -140,17 +140,26 @@ func (w *archiveWriter) policyList(policies []Policy) {
 // change writes the policy-change payload, or a single absence marker:
 // VerifyAudit only ever accepts a change payload on a policy-change record
 // and its absence otherwise, but the distinction is encoded explicitly so
-// decode never has to reconstruct a shape.
+// decode never has to reconstruct a shape. A present payload walks the
+// single policy-change field table, so the archive's field order is the
+// fingerprint's order by construction and every change field round trips.
 func (w *archiveWriter) change(c *PolicyChange) {
 	if c == nil {
 		w.buf = append(w.buf, archiveTagNil)
 		return
 	}
 	w.buf = append(w.buf, archiveTagPresent)
-	w.u32(c.Version)
-	w.policyList(c.Policies)
-	w.u32(c.SourceVersion)
-	w.boolean(c.RolledBack)
+	for i := range changeFields {
+		f := &changeFields[i]
+		switch f.kind {
+		case changeFieldInt:
+			w.u32(f.getInt(c))
+		case changeFieldPolicyList:
+			w.policyList(f.getPolicies(c))
+		case changeFieldBool:
+			w.boolean(f.getBool(c))
+		}
+	}
 }
 
 // decisionRecord writes the decision payload, or a single absence marker:
@@ -391,11 +400,20 @@ func (r *archiveReader) change() *PolicyChange {
 		}
 		return nil
 	}
+	// Read fields in the single table's (write and fingerprint) order, so a
+	// field can never be restored into the wrong member or skipped.
 	c := &PolicyChange{}
-	c.Version = r.u32()
-	c.Policies = r.policyList()
-	c.SourceVersion = r.u32()
-	c.RolledBack = r.boolean()
+	for i := range changeFields {
+		f := &changeFields[i]
+		switch f.kind {
+		case changeFieldInt:
+			f.setInt(c, r.u32())
+		case changeFieldPolicyList:
+			f.setPolicies(c, r.policyList())
+		case changeFieldBool:
+			f.setBool(c, r.boolean())
+		}
+	}
 	return c
 }
 

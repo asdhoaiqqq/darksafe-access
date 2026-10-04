@@ -68,11 +68,18 @@ type ReleasePlan struct {
 }
 
 // ParseReleaseInput reads a release plan document and validates its fields.
-// Every JSON object in the document — including unknown fields and their
-// nested objects — must have distinct member names; a name appearing twice
+// Every string in the document — member names and values, in known fields
+// and in unknown extra fields — must be legal text: invalid UTF-8 bytes and
+// \uXXXX escapes naming an unpaired surrogate are rejected first, before any
+// decoded string can be silently rewritten to "�" and compared. Every JSON
+// object in the document — including unknown fields and their nested
+// objects — must then have distinct member names; a name appearing twice
 // (even with the same value, or via equivalent Unicode escapes) is rejected
 // before any business validation runs.
 func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
+	if err := checkStrictText(data); err != nil {
+		return ReleasePlanInput{}, err
+	}
 	if err := checkDuplicateMembers(data); err != nil {
 		return ReleasePlanInput{}, err
 	}

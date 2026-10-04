@@ -9,6 +9,7 @@
 ```bash
 go run ./cmd/darksafe demo
 go run ./cmd/darksafe version
+go run ./examples/save-decision   # 保存一条真实决策的归档与检查点，供离线复核
 go test ./...
 ```
 
@@ -74,16 +75,195 @@ go test ./...
 
 退出码：`0` 已得到完整复核结果（含不一致）；`1` 归档校验失败（`ErrInvalidArchive`/`ErrInvalidRange`）、目标序号不存在（`ErrAuditNotFound`）、目标不是决策记录（`ErrAuditNotADecision`）或历史策略版本无法取得（`ErrVersionNotFound`），错误信息可区分且只写标准错误；`2` 文件无法读取、必填输入缺失、序号无法解析为整数、目标序号非正或截至序号为负，具体原因写标准错误。
 
-完整示例：
+归档、目标序号与指纹来自哪里、成功与失败输出如何解读，见下一节的端到端示例。
+
+## 端到端示例：保存一条决策并离线复核
+
+下面把前面各节串成一次完整流程，只围绕一个组织（`acme payments`，组织名含空格）、一份账本（资源标识 `ledger-2026-q3`）和一次读取请求：发布一条只允许指定主体读取这份账本的策略，通过组织级 `Decide` 得到允许结果，再把完整审计归档和与它对应的检查点分成两个文件保存。仓库内 `examples/save-decision/main.go` 就是这个可直接运行的程序（`go run ./examples/save-decision`），仅依赖项目公开功能与 Go 标准库，这里完整列出，关键步骤无一省略：
+
+```go
+// Command save-decision is a complete walkthrough of the offline review
+// material flow. Around one organization, one ledger and one read request,
+// it publishes a policy that allows only one subject to read that ledger,
+// takes the allowed decision through the organization-level Decide entry
+// point, then saves the full audit archive and its checkpoint as two
+// separate files. Once the program exits, nothing needs to stay in memory:
+// "darksafe review" recomputes the saved decision from those two files
+// alone, without a Store and without re-submitting the request.
+package main
+
+import (
+	"fmt"
+	"log"
+	"os"
+
+	"github.com/asdhoaiqqq/darksafe-access/darksafe"
+)
+
+const (
+	// The organization name contains a space on purpose: every later call
+	// must repeat it byte for byte, including the space.
+	org = "acme payments"
+	// The policy pins the ledger by its exact resource identifier; the
+	// request below must use the same identifier and scope.
+	ledgerID    = "ledger-2026-q3"
+	ledgerScope = "org/payments/ledger"
+	subjectID   = "u-1001"
+
+	archivePath    = "acme-payments.audit"
+	checkpointPath = "acme-payments.checkpoint"
+)
+
+func main() {
+	log.SetFlags(0)
+	store := darksafe.NewStore()
+
+	// Step 1: publish version 1 — a single policy allowing only subjectID
+	// to read this exact ledger. ResourceID narrows the allow to the one
+	// ledger; it never replaces the subject, action and scope conditions.
+	// A successful publish appends audit record 1 (a policy change record).
+	version, err := store.Publish(org, 0, []darksafe.Policy{{
+		ID:         "allow-u1001-read-ledger",
+		Subject:    subjectID,
+		Action:     "read",
+		Scope:      ledgerScope,
+		Effect:     darksafe.EffectAllow,
+		ResourceID: ledgerID,
+	}})
+	if err != nil {
+		log.Fatalf("publish policy set: %v", err)
+	}
+
+	// Step 2: take one real access decision at the organization level. Both
+	// organizations must equal the decision organization. The allowed
+	// decision appends audit record 2 (a decision record).
+	decision := store.Decide(org, darksafe.OrgRequest{
+		SubjectOrg:  org,
+		ResourceOrg: org,
+		Subject:     darksafe.Subject{ID: subjectID, Kind: "user"},
+		Resource:    darksafe.Resource{ID: ledgerID, Scope: ledgerScope},
+		Action:      "read",
+	})
+	if !decision.Allowed {
+		log.Fatalf("expected an allowed decision, got: %+v", decision)
+	}
+
+	// Step 3: export the complete audit chain together with its checkpoint.
+	// The checkpoint (end sequence + fingerprint) is the independently
+	// retained evidence the offline review validates against.
+	records, cp, err := store.AuditExport(org, 0)
+	if err != nil {
+		log.Fatalf("export audit chain: %v", err)
+	}
+
+	// The review target is the decision record's sequence in the audit
+	// chain — not the policy version, not the number of access requests.
+	// Here record 1 is the publish and record 2 is the decision; locate it
+	// from the export instead of assuming a position.
+	targetSeq := 0
+	for _, r := range records {
+		if r.Kind == darksafe.AuditDecision {
+			targetSeq = r.Seq
+		}
+	}
+	if targetSeq == 0 {
+		log.Fatal("export contains no decision record")
+	}
+
+	// Step 4: serialize the export and save the archive and the checkpoint
+	// as two separate files. The archive carries a copy of the checkpoint
+	// for reference only; the review always validates against the
+	// separately retained one, so the two files must both be kept.
+	archive, err := darksafe.EncodeAuditArchive(org, records, cp)
+	if err != nil {
+		log.Fatalf("encode audit archive: %v", err)
+	}
+	if err := os.WriteFile(archivePath, archive, 0o600); err != nil {
+		log.Fatalf("write %s: %v", archivePath, err)
+	}
+	checkpointLine := fmt.Sprintf("%d %s\n", cp.EndSeq, cp.Fingerprint)
+	if err := os.WriteFile(checkpointPath, []byte(checkpointLine), 0o600); err != nil {
+		log.Fatalf("write %s: %v", checkpointPath, err)
+	}
+
+	fmt.Printf("published policy version %d in organization %q\n", version, org)
+	fmt.Printf("decision: allowed=%v reason=%q matched=%q version=%d\n",
+		decision.Allowed, decision.Reason, decision.Matched, decision.Version)
+	fmt.Printf("saved %d audit records to %s\n", len(records), archivePath)
+	fmt.Printf("saved checkpoint (end seq %d) separately to %s\n", cp.EndSeq, checkpointPath)
+	fmt.Println()
+	fmt.Println("the store can now be discarded; review the saved decision offline with:")
+	fmt.Printf("  darksafe review --archive %s --org '%s' --seq %d --end-seq %d --fingerprint %s\n",
+		archivePath, org, targetSeq, cp.EndSeq, cp.Fingerprint)
+}
+```
+
+程序依次完成四步：
+
+1. `NewStore` 建立内存存储，`Publish` 发布版本 1：唯一一条策略只允许主体 `u-1001` 读取资源标识为 `ledger-2026-q3` 的账本（`ResourceID` 把允许精确限定到这一份账本，主体、动作、作用域条件仍须同时满足）。发布成功在审计链上追加序号 1（策略变更记录）。
+2. `Decide` 按当前版本对一次读取请求决策，得到允许结果，决策记录追加为序号 2。组织名（含空格）、账本资源标识与作用域在策略和请求中逐字节一致，后续每个调用也重复使用同样的值。
+3. `AuditExport` 导出完整审计链，并返回与之对应的检查点（截至序号 + 指纹）。
+4. `EncodeAuditArchive` 把导出序列化，归档写入 `acme-payments.audit`；检查点另行写入 `acme-payments.checkpoint`，两个文件**分开保存**。
+
+运行后程序打印本次材料对应的完整 review 命令，其中的截至序号和指纹就是刚保存的检查点的实际值：
+
+```text
+$ go run ./examples/save-decision
+published policy version 1 in organization "acme payments"
+decision: allowed=true reason="matched allow policy" matched=["allow-u1001-read-ledger"] version=1
+saved 2 audit records to acme-payments.audit
+saved checkpoint (end seq 2) separately to acme-payments.checkpoint
+
+the store can now be discarded; review the saved decision offline with:
+  darksafe review --archive acme-payments.audit --org 'acme payments' --seq 2 --end-seq 2 --fingerprint 873b5fed3e3b27cd0852ddc0a7169238c2e4535f9a066d06ed4b852f92f74845
+```
+
+生成材料之后即可丢弃内存存储，也不需要重新提交访问请求；直接执行打印出的命令即可完成离线复核。示例程序的组织、策略与请求内容固定，因此指纹可以逐字节复现：
 
 ```bash
 darksafe review \
-  --archive payments.audit \
+  --archive acme-payments.audit \
   --org 'acme payments' \
-  --seq 7 \
-  --end-seq 12 \
-  --fingerprint 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+  --seq 2 \
+  --end-seq 2 \
+  --fingerprint 873b5fed3e3b27cd0852ddc0a7169238c2e4535f9a066d06ed4b852f92f74845
 ```
+
+### 目标序号、检查点与输出含义
+
+- `--seq 2` 指向审计链中的**决策记录**。策略发布同样占用序号（本例序号 1 是策略变更记录），所以第一条决策记录的序号是 2；它既不是策略版本号（本例实际版本为 1），也不是第几次访问。
+- `--end-seq 2` 与 `--fingerprint` 取自与归档**分开保存**的 `acme-payments.checkpoint`。归档内部也携带一份检查点，但仅供参考，复核时一律以这份独立保存的值为准，归档内嵌的检查点不能代替它。
+- 成功时退出码为 0，标准输出依次是：
+  - `target sequence`：被复核的决策记录序号；
+  - `original decision`：决策记录里保存的、当时实际返回的决策；
+  - `recomputed decision`：不创建存储、不重新提交请求，仅凭归档材料用该决策实际使用的历史版本重算出的决策；
+  - 每份决策都含 `allowed`（允许与否）、`reason`（理由）、`matched policies`（命中策略标识）与 `policy version`（实际使用的策略版本）；
+  - `consistent: yes/no`：两份决策全字段（允许与否、理由、命中策略、实际版本）比较后的一致性结论。
+- 本例材料完整且未被改动，应得到允许结果与一致结论：
+
+```text
+target sequence: 2
+original decision:
+  allowed: true
+  reason: "matched allow policy"
+  matched policies: ["allow-u1001-read-ledger"]
+  policy version: 1
+recomputed decision:
+  allowed: true
+  reason: "matched allow policy"
+  matched policies: ["allow-u1001-read-ledger"]
+  policy version: 1
+consistent: yes
+```
+
+### 两种容易选错材料的情况
+
+以下两种情况都以退出码 **1** 结束，可区分的原因只写标准错误，且不输出任何部分复核结果：
+
+- **把目标序号指向策略发布记录**：`--seq 1` 命中的是策略变更记录而不是决策记录，标准错误为 `review: darksafe: audit record is not a decision: sequence 1 is policy_change`。
+- **提供与归档不符的外部检查点**：例如把 `--fingerprint` 改动任意一个字符，或 `--end-seq` 与保存的检查点不一致，整份材料校验失败，标准错误为 `review: archive validation failed: darksafe: invalid audit range: embedded checkpoint does not match the retained checkpoint`。
+
+
 
 
 ## 技术方向

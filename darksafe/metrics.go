@@ -828,19 +828,79 @@ func roundScaledRatio(num, den *big.Int, scale int) *big.Int {
 	return q
 }
 
-// String 让冲突原因中的序列身份可读：name{k=v,...}，标签按键排序。
+// String 让冲突原因中的序列身份可读且无歧义：name{k=v,...}，标签按键排序。
+// 名称、标签键和值一律按解析后的真实文本呈现；不含特殊字符时直接书写
+// （cpu{host=a} 保持原样），含有表示自身的边界字符（逗号、等号、花括号、
+// 引号、反斜杠）、首尾空白或控制字符时改用带引号的转义书写，使内容字符与
+// 标签之间的边界永远可以区分：单标签 a="1,b=2" 与两标签 a=1,b=2 渲染不同。
+// 换行、制表符等控制字符呈现为 \n、\t 等可辨认的文字标记，一条身份不会因
+// 内容中的换行而在输出里断成多条记录。无标签（name{}）与存在空字符串值的
+// 标签（name{k=}）仍是可区分的两种形态。
 func (r SeriesRef) String() string {
 	var b strings.Builder
-	b.WriteString(r.Name)
+	writeIdentityText(&b, r.Name)
 	b.WriteByte('{')
 	for i, p := range sortedPairs(r.Labels) {
 		if i > 0 {
 			b.WriteByte(',')
 		}
-		fmt.Fprintf(&b, "%s=%s", p.Key, p.Value)
+		writeIdentityText(&b, p.Key)
+		b.WriteByte('=')
+		writeIdentityText(&b, p.Value)
 	}
 	b.WriteByte('}')
 	return b.String()
+}
+
+// writeIdentityText 把身份的一个组成部分（指标名、标签键或标签值）写入 b：
+// 直接书写不会产生歧义时原样写出，否则写出带引号的转义形式。
+func writeIdentityText(b *strings.Builder, s string) {
+	if identityBareSafe(s) {
+		b.WriteString(s)
+		return
+	}
+	b.WriteByte('"')
+	for _, r := range s {
+		switch r {
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\r':
+			b.WriteString(`\r`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(b, `\u%04x`, r)
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	b.WriteByte('"')
+}
+
+// identityBareSafe 报告直接书写 s 是否会与身份表示的边界混淆。
+// 逗号、等号、花括号是键值与标签之间的边界，引号与反斜杠是转义书写的边界；
+// 控制字符不可读；首尾空白在边界处不可辨认。这些情况都必须加引号转义。
+// 空字符串直接书写（name{k=}），与缺失标签（name{}）天然可区分。
+func identityBareSafe(s string) bool {
+	if s != strings.TrimSpace(s) {
+		return false
+	}
+	for _, r := range s {
+		switch r {
+		case ',', '=', '{', '}', '"', '\\':
+			return false
+		}
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // organizedSeries 是一次结果整理中的一条序列：携带已存序列指针，

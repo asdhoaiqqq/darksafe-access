@@ -299,10 +299,10 @@ func TestDelimiterIdentityDuplicateAcrossOrderAndEscapes(t *testing.T) {
 		c.Timestamp != 5 || c.Existing != 4 || c.Submitted != 40 {
 		t.Fatalf("conflict must name real identity/values, got %+v", c)
 	}
-	// 冲突原因文本里的序列按 name{k=v,...} 呈现；该表示对含分隔字符的数据有歧义
-	// （单标签 a=b=2 与两标签 a=1,b=2 的渲染相同），因此冲突的权威归属以结构化
-	// conflict.series 为准。这里锁定现有文本格式不被意外改动。
-	if !strings.HasPrefix(lerr.Error, "conflict: series m:x{a:1=x;y,b={z}} at timestamp 5 already has value 4, submitted 40") {
+	// 冲突原因文本里的序列按 name{k=v,...} 呈现，含边界字符的组成部分以带引号的
+	// 转义形式书写（这里值 "{z}" 含花括号，渲染为 "{z}"），因此该表示本身无歧义，
+	// 与结构化 conflict.series 指向同一条真实序列。这里锁定该文本格式不被意外改动。
+	if !strings.HasPrefix(lerr.Error, `conflict: series m:x{a:1=x;y,b="{z}"} at timestamp 5 already has value 4, submitted 40`) {
 		t.Fatalf("conflict message = %q", lerr.Error)
 	}
 	// 原采样点保持不变。

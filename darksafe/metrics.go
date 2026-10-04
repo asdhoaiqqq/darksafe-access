@@ -707,48 +707,26 @@ func labelsMatch(want, stored map[string]string) bool {
 }
 
 // runQuery 只读扫描已成功提交的数据：name 精确、标签子集、[start,end] 闭区间。
-// 结果沿用 snapshot 的序列排序；无区间内点的序列不列出。
+// 序列次序与写入快照共用 organizeSeries 的整理结果：过滤掉其他序列后，
+// 保留的序列仍是同一排序中的一个子序列，不另换排序；无区间内点的序列不列出。
 func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
-	matched := make([]*storedSeries, 0)
-	for _, sr := range s.series {
-		if sr.ref.Name != q.name || !labelsMatch(q.labels, sr.ref.Labels) {
+	inRange := func(ts int64) bool { return ts >= q.start && ts <= q.end }
+	out := make([]QuerySeries, 0)
+	for _, os := range s.organizeSeries() {
+		if os.ref.Name != q.name || !labelsMatch(q.labels, os.ref.Labels) {
 			continue
 		}
-		has := false
-		for ts := range sr.points {
-			if ts >= q.start && ts <= q.end {
-				has = true
-				break
-			}
+		points := sortedSeriesPoints(os.sr, inRange)
+		if len(points) == 0 {
+			continue
 		}
-		if has {
-			matched = append(matched, sr)
+		values := make([]float64, len(points))
+		for i, p := range points {
+			values[i] = p.Value
 		}
-	}
-	sort.Slice(matched, func(i, j int) bool {
-		if matched[i].ref.Name != matched[j].ref.Name {
-			return matched[i].ref.Name < matched[j].ref.Name
-		}
-		return compareLabelPairs(sortedPairs(matched[i].ref.Labels), sortedPairs(matched[j].ref.Labels)) < 0
-	})
-
-	out := make([]QuerySeries, 0, len(matched))
-	for _, sr := range matched {
-		tsList := make([]int64, 0, len(sr.points))
-		for ts := range sr.points {
-			if ts >= q.start && ts <= q.end {
-				tsList = append(tsList, ts)
-			}
-		}
-		sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
-		values := make([]float64, len(tsList))
-		for i, ts := range tsList {
-			values[i] = sr.points[ts]
-		}
-		labels := cloneLabels(sr.ref.Labels)
 		out = append(out, QuerySeries{
-			Name:    sr.ref.Name,
-			Labels:  labels,
+			Name:    os.ref.Name,
+			Labels:  os.ref.Labels,
 			Count:   len(values),
 			Average: finiteMean(values),
 		})
@@ -865,27 +843,70 @@ func (r SeriesRef) String() string {
 	return b.String()
 }
 
-// snapshot 生成按规范排序的全部序列视图：先按指标名，再按标签键值对字典序，
-// 序列内按时间戳升序。
-func (s *MetricStore) snapshot(added, duplicates int) *BatchResult {
-	views := make([]SeriesView, 0, len(s.series))
+// organizedSeries 是一次结果整理中的一条序列：携带已存序列指针，
+// 以及供结果直接使用的独立标签副本（标签书写顺序不影响身份，
+// 副本使调用方对结果的修改不能回写存储）。
+type organizedSeries struct {
+	sr  *storedSeries
+	ref SeriesRef
+}
+
+// organizeSeries 是写入快照与区间查询共用的数据整理逻辑：
+// 遍历全部已提交序列，复制各自的序列身份，并按唯一的顺序约定排列——
+// 先按指标名字符串字典序，再按标签键升序后的键值对逐对比较
+// （先比键再比值，前一对相同才比下一对；较短集合是完整前缀时排前，
+// 无标签序列因此排在最前）。标签值按字符串比较（"10" 在 "2" 之前）。
+// 整理结果不复制采样点；采样点的选取与升序排列由 sortedSeriesPoints 完成。
+func (s *MetricStore) organizeSeries() []organizedSeries {
+	out := make([]organizedSeries, 0, len(s.series))
 	for _, sr := range s.series {
-		tsList := make([]int64, 0, len(sr.points))
-		for ts := range sr.points {
+		// 标签必须复制：成功结果是当次操作的独立记录，
+		// 调用方修改结果标签不能改动已存序列的身份。
+		out = append(out, organizedSeries{
+			sr:  sr,
+			ref: SeriesRef{Name: sr.ref.Name, Labels: cloneLabels(sr.ref.Labels)},
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].ref.Name != out[j].ref.Name {
+			return out[i].ref.Name < out[j].ref.Name
+		}
+		return compareLabelPairs(sortedPairs(out[i].ref.Labels), sortedPairs(out[j].ref.Labels)) < 0
+	})
+	return out
+}
+
+// sortedSeriesPoints 按 timestamp 升序返回一条已存序列中满足 keep 的采样点，
+// 数值与时间戳一一对应。keep 为 nil 时返回全部点（写入快照）；
+// 区间查询传入闭区间判定，查询只选取区间内的点。
+// 返回的是新建切片与新建 Point，调用方对采样点的修改不影响存储，
+// 也不影响此前或此后取得的其他成功结果。
+func sortedSeriesPoints(sr *storedSeries, keep func(ts int64) bool) []Point {
+	tsList := make([]int64, 0, len(sr.points))
+	for ts := range sr.points {
+		if keep == nil || keep(ts) {
 			tsList = append(tsList, ts)
 		}
-		sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
-		points := make([]Point, len(tsList))
-		for i, ts := range tsList {
-			points[i] = Point{Timestamp: ts, Value: sr.points[ts]}
-		}
-		views = append(views, SeriesView{Name: sr.ref.Name, Labels: cloneLabels(sr.ref.Labels), Points: points})
 	}
-	sort.Slice(views, func(i, j int) bool {
-		if views[i].Name != views[j].Name {
-			return views[i].Name < views[j].Name
-		}
-		return compareLabelPairs(sortedPairs(views[i].Labels), sortedPairs(views[j].Labels)) < 0
-	})
+	sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
+	points := make([]Point, len(tsList))
+	for i, ts := range tsList {
+		points[i] = Point{Timestamp: ts, Value: sr.points[ts]}
+	}
+	return points
+}
+
+// snapshot 生成按规范排序的全部序列视图：序列次序与点排列均来自
+// organizeSeries/sortedSeriesPoints 这套与查询共用的整理逻辑。
+func (s *MetricStore) snapshot(added, duplicates int) *BatchResult {
+	organized := s.organizeSeries()
+	views := make([]SeriesView, 0, len(organized))
+	for _, os := range organized {
+		views = append(views, SeriesView{
+			Name:   os.ref.Name,
+			Labels: os.ref.Labels,
+			Points: sortedSeriesPoints(os.sr, nil),
+		})
+	}
 	return &BatchResult{Status: "ok", Added: added, Duplicates: duplicates, Series: views}
 }

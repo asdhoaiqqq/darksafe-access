@@ -101,9 +101,10 @@ func envelopeUsesRawBytes(env *hashEnvelope) bool {
 	}
 	if env.Change != nil {
 		for _, p := range env.Change.Policies {
-			if !utf8.ValidString(p.ID) || !utf8.ValidString(p.Subject) ||
-				!utf8.ValidString(p.Action) || !utf8.ValidString(p.Scope) ||
-				!utf8.ValidString(string(p.Effect)) || !utf8.ValidString(p.ResourceID) {
+			// Which policy strings are protected is decided by the single
+			// policy field table (policy_fields.go), shared with the encoder
+			// and the archive, rather than named here a second time.
+			if policyHasNonUTF8(p) {
 				return true
 			}
 		}
@@ -220,18 +221,24 @@ func (e *fingerprintEncoder) stringList(items []string) {
 
 func (e *fingerprintEncoder) policy(p Policy) {
 	e.tag(tagPolicy)
-	e.rawString(p.ID)
-	e.rawString(p.Subject)
-	e.rawString(p.Action)
-	e.rawString(p.Scope)
-	e.rawString(string(p.Effect))
-	e.boolTag(tagBool, p.Recursive)
-	// ResourceID is appended only when set, so the canonical byte layout
-	// of every legacy (resource-unrestricted) policy is unchanged. It
-	// pairs with the omitempty JSON tag: the two fingerprint families stay
-	// in sync about whether the field participates at all.
-	if p.ResourceID != "" {
-		e.rawString(p.ResourceID)
+	// Field order, the Recursive boolean's position, and ResourceID being
+	// appended only when set all come from the single policy field table, so
+	// the fingerprint and the archive enumerate fields in exactly one place.
+	for i := range policyFields {
+		f := &policyFields[i]
+		switch f.kind {
+		case policyFieldString:
+			e.rawString(f.getString(p))
+		case policyFieldOptionalString:
+			// ResourceID participates only when set, pairing with its
+			// omitempty JSON tag, so the legacy fingerprint bytes are
+			// unchanged for resource-unrestricted policies.
+			if v := f.getString(p); v != "" {
+				e.rawString(v)
+			}
+		case policyFieldBool:
+			e.boolTag(tagBool, f.getBool(p))
+		}
 	}
 }
 

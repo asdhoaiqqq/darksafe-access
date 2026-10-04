@@ -108,17 +108,21 @@ func (w *archiveWriter) stringList(items []string) {
 	}
 }
 
-// policy mirrors Policy. ResourceID is always written so every field round
-// trips on its own; it participates in the fingerprint regardless, so its
-// placement does not move any fingerprint boundary.
+// policy writes one Policy by walking the single policy field table, so the
+// archive's field order is the fingerprint's order by construction. Even the
+// fingerprint-optional ResourceID is always written here (empty included),
+// so every field round trips on its own; its placement is fixed by the
+// table and therefore cannot move a fingerprint boundary.
 func (w *archiveWriter) policy(p Policy) {
-	w.stringField(p.ID)
-	w.stringField(p.Subject)
-	w.stringField(p.Action)
-	w.stringField(p.Scope)
-	w.stringField(string(p.Effect))
-	w.boolean(p.Recursive)
-	w.stringField(p.ResourceID)
+	for i := range policyFields {
+		f := &policyFields[i]
+		switch f.kind {
+		case policyFieldString, policyFieldOptionalString:
+			w.stringField(f.getString(p))
+		case policyFieldBool:
+			w.boolean(f.getBool(p))
+		}
+	}
 }
 
 func (w *archiveWriter) policyList(policies []Policy) {
@@ -342,14 +346,19 @@ func (r *archiveReader) stringList() []string {
 }
 
 func (r *archiveReader) policy() Policy {
+	// Read fields in the single table's (write and fingerprint) order. The
+	// fingerprint-optional ResourceID is still a mandatory, fixed field on
+	// the archive, so it is read for every policy including the empty one.
 	var p Policy
-	p.ID = r.stringField()
-	p.Subject = r.stringField()
-	p.Action = r.stringField()
-	p.Scope = r.stringField()
-	p.Effect = Effect(r.stringField())
-	p.Recursive = r.boolean()
-	p.ResourceID = r.stringField()
+	for i := range policyFields {
+		f := &policyFields[i]
+		switch f.kind {
+		case policyFieldString, policyFieldOptionalString:
+			f.setString(&p, r.stringField())
+		case policyFieldBool:
+			f.setBool(&p, r.boolean())
+		}
+	}
 	return p
 }
 

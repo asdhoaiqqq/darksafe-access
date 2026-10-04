@@ -100,13 +100,12 @@ func envelopeUsesRawBytes(env *hashEnvelope) bool {
 		return true
 	}
 	if env.Change != nil {
-		for _, p := range env.Change.Policies {
-			// Which policy strings are protected is decided by the single
-			// policy field table (policy_fields.go), shared with the encoder
-			// and the archive, rather than named here a second time.
-			if policyHasNonUTF8(p) {
-				return true
-			}
+		// Which change fields (and, through them, which policy strings) are
+		// protected is decided by the single change field table
+		// (change_fields.go), shared with the encoder and the archive,
+		// rather than named here a second time.
+		if changeHasNonUTF8(env.Change) {
+			return true
 		}
 	}
 	if env.Decision != nil {
@@ -249,10 +248,20 @@ func (e *fingerprintEncoder) change(c *PolicyChange) {
 	if c == nil {
 		return
 	}
-	e.int64Tag(tagSeq, int64(c.Version))
-	e.policyList(c.Policies)
-	e.int64Tag(tagSeq, int64(c.SourceVersion))
-	e.boolTag(tagBool, c.RolledBack)
+	// Field order — new version, full policy list, source version, rollback
+	// marker — comes from the single change field table, so the fingerprint
+	// and the archive enumerate the change's fields in exactly one place.
+	for i := range changeFields {
+		f := &changeFields[i]
+		switch f.kind {
+		case changeFieldInt:
+			e.int64Tag(tagSeq, int64(f.getInt(c)))
+		case changeFieldPolicyList:
+			e.policyList(f.getPolicies(c))
+		case changeFieldBool:
+			e.boolTag(tagBool, f.getBool(c))
+		}
+	}
 }
 
 func (e *fingerprintEncoder) decisionRecord(d *DecisionRecord) {
@@ -351,7 +360,9 @@ func cloneChange(c *PolicyChange) *PolicyChange {
 		return nil
 	}
 	cp := *c
-	cp.Policies = clonePolicies(c.Policies)
+	// Detach every list the single change field table carries; nil lists
+	// stay nil.
+	cloneChangeLists(&cp, c)
 	return &cp
 }
 

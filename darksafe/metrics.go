@@ -707,7 +707,8 @@ func labelsMatch(want, stored map[string]string) bool {
 }
 
 // runQuery 只读扫描已成功提交的数据：name 精确、标签子集、[start,end] 闭区间。
-// 结果沿用 snapshot 的序列排序；无区间内点的序列不列出。
+// 先过滤出区间内至少有一个点的序列，再沿用 snapshot 共用的整理逻辑排序，
+// 因此过滤后留下的序列与快照中的相对次序完全一致；无区间内点的序列不列出。
 func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
 	matched := make([]*storedSeries, 0)
 	for _, sr := range s.series {
@@ -725,30 +726,18 @@ func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
 			matched = append(matched, sr)
 		}
 	}
-	sort.Slice(matched, func(i, j int) bool {
-		if matched[i].ref.Name != matched[j].ref.Name {
-			return matched[i].ref.Name < matched[j].ref.Name
-		}
-		return compareLabelPairs(sortedPairs(matched[i].ref.Labels), sortedPairs(matched[j].ref.Labels)) < 0
-	})
 
 	out := make([]QuerySeries, 0, len(matched))
-	for _, sr := range matched {
-		tsList := make([]int64, 0, len(sr.points))
-		for ts := range sr.points {
+	for _, o := range organizeSeries(matched) {
+		values := make([]float64, 0, len(o.stamps))
+		for _, ts := range o.stamps {
 			if ts >= q.start && ts <= q.end {
-				tsList = append(tsList, ts)
+				values = append(values, o.sr.points[ts])
 			}
 		}
-		sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
-		values := make([]float64, len(tsList))
-		for i, ts := range tsList {
-			values[i] = sr.points[ts]
-		}
-		labels := cloneLabels(sr.ref.Labels)
 		out = append(out, QuerySeries{
-			Name:    sr.ref.Name,
-			Labels:  labels,
+			Name:    o.sr.ref.Name,
+			Labels:  cloneLabels(o.sr.ref.Labels),
 			Count:   len(values),
 			Average: finiteMean(values),
 		})
@@ -865,27 +854,62 @@ func (r SeriesRef) String() string {
 	return b.String()
 }
 
+// organizedSeries 把一条已存序列与按时间戳升序整理好的时间戳列表配对，
+// 是写入快照与区间查询在各自构造结果前共用的中间整理结果。
+// 它只引用存储数据，调用方构造输出时仍须复制标签与采样值。
+type organizedSeries struct {
+	sr     *storedSeries
+	stamps []int64
+}
+
+// lessSeriesRef 是写入快照与查询结果共用的序列次序：先按指标名字符串字典序；
+// 名称相同时按标签键升序后的键值对逐对比较（先比键再比值，前一对相同才比下一对），
+// 较短的标签集合若是另一集合的完整前缀则排前，无标签序列同理。
+func lessSeriesRef(a, b SeriesRef) bool {
+	if a.Name != b.Name {
+		return a.Name < b.Name
+	}
+	return compareLabelPairs(sortedPairs(a.Labels), sortedPairs(b.Labels)) < 0
+}
+
+// organizeSeries 按写入快照与区间查询共用的顺序约定整理给定序列：
+// 序列按 lessSeriesRef 排列，每条序列的时间戳统一按从小到大排列。
+// 两种结果由此遵循同一套排序规则，过滤只决定哪些序列进入列表，不另立次序。
+func organizeSeries(list []*storedSeries) []organizedSeries {
+	sort.Slice(list, func(i, j int) bool {
+		return lessSeriesRef(list[i].ref, list[j].ref)
+	})
+	out := make([]organizedSeries, 0, len(list))
+	for _, sr := range list {
+		stamps := make([]int64, 0, len(sr.points))
+		for ts := range sr.points {
+			stamps = append(stamps, ts)
+		}
+		sort.Slice(stamps, func(i, j int) bool { return stamps[i] < stamps[j] })
+		out = append(out, organizedSeries{sr: sr, stamps: stamps})
+	}
+	return out
+}
+
 // snapshot 生成按规范排序的全部序列视图：先按指标名，再按标签键值对字典序，
 // 序列内按时间戳升序。
 func (s *MetricStore) snapshot(added, duplicates int) *BatchResult {
-	views := make([]SeriesView, 0, len(s.series))
+	list := make([]*storedSeries, 0, len(s.series))
 	for _, sr := range s.series {
-		tsList := make([]int64, 0, len(sr.points))
-		for ts := range sr.points {
-			tsList = append(tsList, ts)
-		}
-		sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
-		points := make([]Point, len(tsList))
-		for i, ts := range tsList {
-			points[i] = Point{Timestamp: ts, Value: sr.points[ts]}
-		}
-		views = append(views, SeriesView{Name: sr.ref.Name, Labels: cloneLabels(sr.ref.Labels), Points: points})
+		list = append(list, sr)
 	}
-	sort.Slice(views, func(i, j int) bool {
-		if views[i].Name != views[j].Name {
-			return views[i].Name < views[j].Name
+	organized := organizeSeries(list)
+	views := make([]SeriesView, 0, len(organized))
+	for _, o := range organized {
+		points := make([]Point, len(o.stamps))
+		for i, ts := range o.stamps {
+			points[i] = Point{Timestamp: ts, Value: o.sr.points[ts]}
 		}
-		return compareLabelPairs(sortedPairs(views[i].Labels), sortedPairs(views[j].Labels)) < 0
-	})
+		views = append(views, SeriesView{
+			Name:   o.sr.ref.Name,
+			Labels: cloneLabels(o.sr.ref.Labels),
+			Points: points,
+		})
+	}
 	return &BatchResult{Status: "ok", Added: added, Duplicates: duplicates, Series: views}
 }

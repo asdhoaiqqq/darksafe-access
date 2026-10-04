@@ -109,28 +109,11 @@ func envelopeUsesRawBytes(env *hashEnvelope) bool {
 			}
 		}
 	}
-	if env.Decision != nil {
-		req := env.Decision.Request
-		d := env.Decision.Decision
-		for _, s := range []string{
-			req.SubjectOrg, req.ResourceOrg,
-			req.Subject.ID, req.Subject.Kind, req.Resource.ID, req.Resource.Scope,
-			req.Action, d.Reason,
-		} {
-			if !utf8.ValidString(s) {
-				return true
-			}
-		}
-		for _, s := range req.Subject.Roles {
-			if !utf8.ValidString(s) {
-				return true
-			}
-		}
-		for _, s := range d.Matched {
-			if !utf8.ValidString(s) {
-				return true
-			}
-		}
+	// Which decision strings are protected is decided by the single
+	// decision field table (decision_fields.go), shared with the encoder
+	// and the archive, rather than named here a second time.
+	if env.Decision != nil && decisionRecordHasNonUTF8(env.Decision) {
+		return true
 	}
 	return false
 }
@@ -270,41 +253,34 @@ func (e *fingerprintEncoder) change(c *PolicyChange) {
 	e.boolTag(tagBool, c.RolledBack)
 }
 
-func (e *fingerprintEncoder) subject(su Subject) {
-	e.tag(tagSubject)
-	e.rawString(su.ID)
-	e.rawString(su.Kind)
-	e.stringList(su.Roles)
-	e.boolTag(tagBool, su.Disabled)
-}
-
-func (e *fingerprintEncoder) resource(r Resource) {
-	e.tag(tagResource)
-	e.rawString(r.ID)
-	e.rawString(r.Scope)
-}
-
-func (e *fingerprintEncoder) decision(d Decision) {
-	e.tag(tagDecision)
-	e.boolTag(tagBool, d.Allowed)
-	e.rawString(d.Reason)
-	e.stringList(d.Matched)
-	e.int64Tag(tagSeq, int64(d.Version))
-}
-
 func (e *fingerprintEncoder) decisionRecord(d *DecisionRecord) {
 	e.tag(tagDecisionRecord)
+	// A nil pointer is encoded as tagDecisionRecord alone; a present
+	// value's fields follow immediately.
 	if d == nil {
 		return
 	}
-	// OrgRequest fields are written inline at the same nesting depth the
-	// request occupies in the envelope; no field is skipped.
-	e.rawString(d.Request.SubjectOrg)
-	e.rawString(d.Request.ResourceOrg)
-	e.subject(d.Request.Subject)
-	e.resource(d.Request.Resource)
-	e.rawString(d.Request.Action)
-	e.decision(d.Decision)
+	// Field order and the grouping tags opening the subject, resource and
+	// decision groups all come from the single decision field table, so the
+	// fingerprint and the archive enumerate fields in exactly one place. No
+	// request or decision field is skipped: roles ride along even though
+	// they play no part in organization policy authorization.
+	for i := range decisionRecordFields {
+		f := &decisionRecordFields[i]
+		if f.groupTag != 0 {
+			e.tag(f.groupTag)
+		}
+		switch f.kind {
+		case decisionFieldString:
+			e.rawString(f.getString(d))
+		case decisionFieldStringList:
+			e.stringList(f.getList(d))
+		case decisionFieldBool:
+			e.boolTag(tagBool, f.getBool(d))
+		case decisionFieldInt:
+			e.int64Tag(tagSeq, int64(f.getInt(d)))
+		}
+	}
 }
 
 // encodeCanonical returns the raw bytes fingerprinted for an envelope

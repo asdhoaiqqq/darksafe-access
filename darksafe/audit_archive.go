@@ -153,37 +153,32 @@ func (w *archiveWriter) change(c *PolicyChange) {
 	w.boolean(c.RolledBack)
 }
 
-func (w *archiveWriter) subject(su Subject) {
-	w.stringField(su.ID)
-	w.stringField(su.Kind)
-	w.stringList(su.Roles)
-	w.boolean(su.Disabled)
-}
-
-func (w *archiveWriter) resource(r Resource) {
-	w.stringField(r.ID)
-	w.stringField(r.Scope)
-}
-
-func (w *archiveWriter) decision(d Decision) {
-	w.boolean(d.Allowed)
-	w.stringField(d.Reason)
-	w.stringList(d.Matched)
-	w.u32(d.Version)
-}
-
+// decisionRecord writes the decision payload, or a single absence marker:
+// VerifyAudit only ever accepts a decision payload on a decision record and
+// its absence otherwise, but the distinction is encoded explicitly so decode
+// never has to reconstruct a shape. A present payload walks the single
+// decision field table, so the archive's field order is the fingerprint's
+// order by construction; the fingerprint-only grouping tags have no archive
+// counterpart.
 func (w *archiveWriter) decisionRecord(d *DecisionRecord) {
 	if d == nil {
 		w.buf = append(w.buf, archiveTagNil)
 		return
 	}
 	w.buf = append(w.buf, archiveTagPresent)
-	w.stringField(d.Request.SubjectOrg)
-	w.stringField(d.Request.ResourceOrg)
-	w.subject(d.Request.Subject)
-	w.resource(d.Request.Resource)
-	w.stringField(d.Request.Action)
-	w.decision(d.Decision)
+	for i := range decisionRecordFields {
+		f := &decisionRecordFields[i]
+		switch f.kind {
+		case decisionFieldString:
+			w.stringField(f.getString(d))
+		case decisionFieldStringList:
+			w.stringList(f.getList(d))
+		case decisionFieldBool:
+			w.boolean(f.getBool(d))
+		case decisionFieldInt:
+			w.u32(f.getInt(d))
+		}
+	}
 }
 
 // EncodeAuditArchive serializes one complete audit export into savable
@@ -405,31 +400,6 @@ func (r *archiveReader) change() *PolicyChange {
 	return c
 }
 
-func (r *archiveReader) subject() Subject {
-	var su Subject
-	su.ID = r.stringField()
-	su.Kind = r.stringField()
-	su.Roles = r.stringList()
-	su.Disabled = r.boolean()
-	return su
-}
-
-func (r *archiveReader) resource() Resource {
-	var res Resource
-	res.ID = r.stringField()
-	res.Scope = r.stringField()
-	return res
-}
-
-func (r *archiveReader) decision() Decision {
-	var d Decision
-	d.Allowed = r.boolean()
-	d.Reason = r.stringField()
-	d.Matched = r.stringList()
-	d.Version = r.u32()
-	return d
-}
-
 func (r *archiveReader) decisionRecord() *DecisionRecord {
 	switch r.marker() {
 	case archiveTagNil:
@@ -441,13 +411,23 @@ func (r *archiveReader) decisionRecord() *DecisionRecord {
 		}
 		return nil
 	}
+	// Read fields in the single table's (write and fingerprint) order, so a
+	// record comes back with exactly the request and decision that were
+	// saved, no field dropped or reordered.
 	d := &DecisionRecord{}
-	d.Request.SubjectOrg = r.stringField()
-	d.Request.ResourceOrg = r.stringField()
-	d.Request.Subject = r.subject()
-	d.Request.Resource = r.resource()
-	d.Request.Action = r.stringField()
-	d.Decision = r.decision()
+	for i := range decisionRecordFields {
+		f := &decisionRecordFields[i]
+		switch f.kind {
+		case decisionFieldString:
+			f.setString(d, r.stringField())
+		case decisionFieldStringList:
+			f.setList(d, r.stringList())
+		case decisionFieldBool:
+			f.setBool(d, r.boolean())
+		case decisionFieldInt:
+			f.setInt(d, r.u32())
+		}
+	}
 	return d
 }
 

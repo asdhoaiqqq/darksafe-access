@@ -360,16 +360,25 @@ func checkSpreadBy(s string) error {
 	return nil
 }
 
-// ValidateReleaseInput checks that a release configuration is well-formed:
-// app/revision/image are non-empty, batchSize is a positive integer, spreadBy
-// is empty or a usable tag key (not whitespace-only), cluster
-// IDs are unique across every candidate (including disabled and filtered-out
-// clusters), and tag/condition keys are non-empty. Errors name the field and
-// the position in its list; within a cluster the ID is checked before its
-// tags, and tag keys are examined in ascending order so repeated calls report
-// the same error. The input is never mutated. MakeReleasePlan calls this
-// automatically; library callers may use it to validate without planning.
+// ValidateReleaseInput checks that a release configuration is well-formed.
+// Text comes first, exactly as for the JSON entry: every string — app,
+// revision, image, spreadBy, every candidate ID and all tag/condition keys
+// and values, on disabled and filtered-out candidates alike — must hold
+// valid UTF-8, so a directly constructed config can never feed bytes that
+// marshaling would silently rewrite to "�" into identity comparison, label
+// matching, or batching. After that app/revision/image are non-empty,
+// batchSize is a positive integer, spreadBy is empty or a usable tag key
+// (not whitespace-only), cluster IDs are unique across every candidate
+// (including disabled and filtered-out clusters), and tag/condition keys are
+// non-empty. Errors name the field and the position in its list; within a
+// cluster the ID is checked before its tags, and tag keys are examined in
+// ascending order so repeated calls report the same error. The input is
+// never mutated. MakeReleasePlan calls this automatically; library callers
+// may use it to validate without planning.
 func ValidateReleaseInput(in ReleasePlanInput) error {
+	if err := validateConfigText(in); err != nil {
+		return err
+	}
 	if strings.TrimSpace(in.App) == "" {
 		return errors.New(`字段 "app" 不能为空或只含空白`)
 	}

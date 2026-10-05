@@ -256,6 +256,129 @@ func TestZeroDedupSubnormalConflictsWithZero(t *testing.T) {
 	}
 }
 
+// TestZeroDedupConflictAfterIgnoredZeroDuplicate 覆盖缺陷场景：
+// 同一位置先已写入零，新批次内先提交等值的异号零（被忽略的重复采样），
+// 再提交非零值触发冲突时，conflict 的 existing 与文字原因必须如实指向
+// 首次接受的那个零（保留其正负号），不能被本批忽略的重复采样替换；
+// 该位置在内的整批新增数据都不提交，随后查询仍只有原来的一个点。
+// 先正后负与先负后正两个方向都覆盖，且重复可采用任意零值写法、
+// 可重复出现多次。
+func TestZeroDedupConflictAfterIgnoredZeroDuplicate(t *testing.T) {
+	cases := []struct {
+		name      string
+		firstZero string // 首次成功写入的零值写法
+		firstNeg  bool
+		dupZeros  []string // 冲突前在本批内提交的等值零（重复）
+	}{
+		{"stored plus zero then minus zero", "0", false, []string{"-0"}},
+		{"stored plus zero then many zero spellings", "0.0", false,
+			[]string{"-0", "-0.0", "0", "1e-400", "-1e-400"}},
+		{"stored minus zero then plus zero", "-0", true, []string{"0"}},
+		{"stored minus zero then many zero spellings", "-1e-400", true,
+			[]string{"0", "-0", "0.0", "-0.0", "1e-400"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMetricStore()
+			mustOK(t, store, `[
+				{"name":"cpu","timestamp":1000,"value":`+tc.firstZero+`,"labels":{"host":"a"}}
+			]`)
+
+			// 批内顺序：另一时间戳的新增点在前、同位置的若干等值零重复居中、
+			// 可区分的最小次正规非零值在最后触发冲突（位置 index = 2+len(dup)）。
+			parts := []string{`{"name":"cpu","timestamp":2000,"value":7,"labels":{"host":"a"}}`}
+			for _, z := range tc.dupZeros {
+				parts = append(parts,
+					`{"name":"cpu","timestamp":1000,"value":`+z+`,"labels":{"host":"a"}}`)
+			}
+			parts = append(parts,
+				`{"name":"cpu","timestamp":1000,"value":5e-324,"labels":{"host":"a"}}`)
+			line := `[` + strings.Join(parts, ",") + `]`
+
+			lerr := mustFail(t, store, line)
+			conflictIndex := len(tc.dupZeros) + 2
+			if lerr.Index != conflictIndex || lerr.Conflict == nil {
+				t.Fatalf("expected conflict at index %d without other errors, got %+v",
+					conflictIndex, lerr)
+			}
+			c := lerr.Conflict
+			if c.Series.Name != "cpu" || len(c.Series.Labels) != 1 ||
+				c.Series.Labels["host"] != "a" || c.Timestamp != 1000 {
+				t.Fatalf("conflict identity = %+v, want cpu{host=a} ts=1000", c.Series)
+			}
+			if c.Existing != 0 || math.Signbit(c.Existing) != tc.firstNeg {
+				t.Fatalf("existing = %v (neg=%v), want the first-accepted zero (neg=%v)",
+					c.Existing, math.Signbit(c.Existing), tc.firstNeg)
+			}
+			if c.Submitted != 5e-324 {
+				t.Fatalf("submitted = %v, want 5e-324", c.Submitted)
+			}
+			wantZeroText := "0"
+			if tc.firstNeg {
+				wantZeroText = "-0"
+			}
+			if !strings.Contains(lerr.Error, "already has value "+wantZeroText) ||
+				!strings.Contains(lerr.Error, "submitted 5e-324") {
+				t.Fatalf("error text must name first-accepted %s and 5e-324, got %q",
+					wantZeroText, lerr.Error)
+			}
+
+			// 整批回滚：ts=2000 的新增点不留下，ts=1000 仍是首次接受的零。
+			q := mustQuery(t, store,
+				`{"op":"query","name":"cpu","start":0,"end":3000,"labels":{"host":"a"}}`)
+			if len(q.Series) != 1 || q.Series[0].Count != 1 || q.Series[0].Average != 0 {
+				t.Fatalf("query after conflict = %+v, want only the original zero point", q.Series)
+			}
+			p := mustOK(t, store, `[]`).Series[0].Points[0]
+			if p.Timestamp != 1000 || p.Value != 0 || math.Signbit(p.Value) != tc.firstNeg {
+				t.Fatalf("stored zero = %+v, want ts=1000 zero with first-accepted sign (neg=%v)",
+					p, tc.firstNeg)
+			}
+		})
+	}
+}
+
+// TestZeroDedupConflictAfterInBatchZeroDuplicates 覆盖该位置此前尚未写入、
+// 首次接受值来自本批的情况：本批先提交一个零，随后任意写法的等值零都是重复，
+// 再提交非零值冲突时 existing 必须是本批首次接受的零；冲突后整批不提交，
+// 存储保持为空。
+func TestZeroDedupConflictAfterInBatchZeroDuplicates(t *testing.T) {
+	cases := []struct {
+		name     string
+		first    string
+		firstNeg bool
+		dups     []string
+	}{
+		{"plus zero first", "0", false, []string{"-0", "0.0", "-0.0", "1e-400", "-1e-400"}},
+		{"minus zero first", "-0.0", true, []string{"0", "1e-400", "-1e-400"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := NewMetricStore()
+			parts := []string{`{"name":"m","timestamp":1,"value":` + tc.first + `}`}
+			for _, z := range tc.dups {
+				parts = append(parts, `{"name":"m","timestamp":1,"value":`+z+`}`)
+			}
+			parts = append(parts, `{"name":"m","timestamp":1,"value":5e-324}`)
+
+			lerr := mustFail(t, store, `[`+strings.Join(parts, ",")+`]`)
+			wantIndex := len(tc.dups) + 2
+			if lerr.Index != wantIndex || lerr.Conflict == nil {
+				t.Fatalf("expected conflict at index %d, got %+v", wantIndex, lerr)
+			}
+			if lerr.Conflict.Existing != 0 ||
+				math.Signbit(lerr.Conflict.Existing) != tc.firstNeg ||
+				lerr.Conflict.Submitted != 5e-324 {
+				t.Fatalf("conflict = %+v, want first-in-batch zero (neg=%v) vs 5e-324",
+					lerr.Conflict, tc.firstNeg)
+			}
+			if got := len(mustOK(t, store, `[]`).Series); got != 0 {
+				t.Fatalf("rejected batch must leave no points, series count = %d", got)
+			}
+		})
+	}
+}
+
 // TestZeroDedupDistinctTimestampsAndZeroAverages 覆盖写入后的区间查询：
 // 同一位置被忽略的重复不增加 count；零值出现在不同时间戳时是不同采样点，
 // 每个已成功提交的点都参与计数；精确均值为零（含正负零混合、+1/-1 抵消）

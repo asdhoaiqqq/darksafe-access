@@ -30,6 +30,28 @@ printf '%s\n' \
 
 查询对 `[start,end]` 闭区间内的点按序列返回 `count` 与算术平均 `average`；`labels` 省略或为 `{}` 时匹配该指标的全部序列，否则按子集匹配。详见 `go run ./cmd/darksafe help`。
 
+## 采样明细查询：query_points
+
+均值异常时往往还需要看清原始数据：哪个时间戳存了什么值。把查询对象里的 `op` 写成 `query_points`，沿用与 `query` 完全相同的条件（`name`、`start`、`end` 与可选的 `labels`，起止为包含两个端点的 int64 毫秒，`start == end` 时只取该时间戳上的采样），即可取得区间内的原始采样明细。该操作只读，不改变采样值或写入计数。
+
+成功结果为 `status` 为 `ok`、`op` 为 `query_points` 的逐行 JSON：`series` 中每条记录保留完整指标名与完整标签集合（不会缩减成查询条件），`points` 按时间戳升序列出 `timestamp` 与实际存储的 float64 `value`，不附加 `count` 或 `average`。序列次序与 `query` 成功结果一致；只列出区间内有点的序列——指标不存在、标签条件未命中或区间内没有点，都成功返回空的 `series` 数组。输入校验与失败原因的选择沿用查询约定（倒置区间报错并指出实际边界，失败结果没有 `series`、`index` 或 `conflict`）。
+
+例如 `cpu`、`host=a` 在时间戳 1000、2000、3000 上分别存有 2、4、9，查询 `[1000,2000]` 只列出前两个点：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}},{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":3000,"value":9,"labels":{"host":"a"}}]' \
+  '{"op":"query_points","name":"cpu","start":1000,"end":2000,"labels":{"host":"a"}}' \
+  '{"op":"query_points","name":"cpu","start":3000,"end":3000}' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":3,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2},{"timestamp":2000,"value":4},{"timestamp":3000,"value":9}]}]}
+{"status":"ok","op":"query_points","series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2},{"timestamp":2000,"value":4}]}]}
+{"status":"ok","op":"query_points","series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":3000,"value":9}]}]}
+```
+
 ## 重复与冲突：同一序列、同一时间戳的再次提交
 
 一条序列由指标名加完整标签集合唯一确定；标签的书写顺序不影响身份，`{"host":"a","dc":"x"}` 与 `{"dc":"x","host":"a"}` 是同一条序列。对同一序列的同一时间戳再次提交时：

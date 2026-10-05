@@ -142,11 +142,17 @@ func (e *fingerprintEncoder) rawString(s string) {
 	e.buf = append(e.buf, s...)
 }
 
-// stringList preserves nil-vs-empty explicitly: in the JSON envelope a
-// nil slice is "null" and a non-nil empty slice is "[]", so the raw
-// encoding must keep the two shapes apart as well.
-func (e *fingerprintEncoder) stringList(items []string) {
-	e.tag(tagStringList)
+// writeRawList frames every length-counted list in the raw canonical
+// encoding, whatever its item type: the subject-role and matched-policy
+// string lists and the policy-change policy list all share this one shape.
+// The tag identifies the list kind, then nil is one marker and a non-nil
+// list is a presence marker, a count and one encoded item each, so nil,
+// non-nil empty and populated lists stay distinct and element order is
+// whatever the caller supplied. Keeping the framing here — rather than
+// copied per item type — means a list-format change is made once instead of
+// mirrored between the two list kinds.
+func writeRawList[T any](e *fingerprintEncoder, t fingerprintTag, items []T, writeItem func(T)) {
+	e.tag(t)
 	if items == nil {
 		e.buf = append(e.buf, 0)
 		return
@@ -155,9 +161,16 @@ func (e *fingerprintEncoder) stringList(items []string) {
 	var b [4]byte
 	binary.BigEndian.PutUint32(b[:], uint32(len(items)))
 	e.buf = append(e.buf, b[:]...)
-	for _, s := range items {
-		e.rawString(s)
+	for i := range items {
+		writeItem(items[i])
 	}
+}
+
+// stringList preserves nil-vs-empty explicitly: in the JSON envelope a
+// nil slice is "null" and a non-nil empty slice is "[]", so the raw
+// encoding must keep the two shapes apart as well.
+func (e *fingerprintEncoder) stringList(items []string) {
+	writeRawList(e, tagStringList, items, e.rawString)
 }
 
 func (e *fingerprintEncoder) policy(p Policy) {
@@ -183,19 +196,11 @@ func (e *fingerprintEncoder) policy(p Policy) {
 	}
 }
 
+// policyList frames the full policy set with the shared list shape, under
+// the policy-list tag so a policy set can never collide with a string list
+// whose concatenated bytes happen to match.
 func (e *fingerprintEncoder) policyList(policies []Policy) {
-	e.tag(tagPolicyList)
-	if policies == nil {
-		e.buf = append(e.buf, 0)
-		return
-	}
-	e.buf = append(e.buf, 1)
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], uint32(len(policies)))
-	e.buf = append(e.buf, b[:]...)
-	for _, p := range policies {
-		e.policy(p)
-	}
+	writeRawList(e, tagPolicyList, policies, e.policy)
 }
 
 func (e *fingerprintEncoder) change(c *PolicyChange) {

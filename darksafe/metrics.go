@@ -565,6 +565,24 @@ func parseFiniteFloat(n json.Number) (float64, error) {
 	return v, nil
 }
 
+// acceptedValue 返回采样位置（序列身份 + 时间戳）当前已接受的值：
+// 此前批次已写入存储的值优先，其次是本批最先接受的新增值（记录在 seen 中）。
+// 同一位置只认首次接受的值——被忽略的等值重复（如已存 -0 后提交的 0）
+// 不会改写它，因此后续冲突报告始终如实给出首次接受的值（含零值符号）。
+func (s *MetricStore) acceptedValue(seen map[seriesID]map[int64]float64, id seriesID, ts int64) (float64, bool) {
+	if sr, ok := s.series[id]; ok {
+		if old, ok := sr.points[ts]; ok {
+			return old, true
+		}
+	}
+	if byTS, ok := seen[id]; ok {
+		if old, ok := byTS[ts]; ok {
+			return old, true
+		}
+	}
+	return 0, false
+}
+
 // ingestItems 完成全部采样点校验与冲突检测后再统一提交，保证整批原子性。
 func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineError) {
 	type pending struct {
@@ -575,7 +593,8 @@ func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineE
 	}
 
 	added := 0
-	// 本批已确定身份的点（含与已写入数据重复的点），用于批内去重与冲突检测。
+	// 本批已接受的新增点（按序列身份与时间戳记录首次接受的值），
+	// 与已写入存储的数据一起参与去重与冲突检测。
 	seen := make(map[seriesID]map[int64]float64)
 	// 仅记录需要落盘的新增点；校验全部通过后才提交。
 	commits := make([]pending, 0, len(items))
@@ -610,31 +629,14 @@ func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineE
 		id := makeSeriesID(p.name, p.labels)
 		ref := SeriesRef{Name: p.name, Labels: p.labels}
 
-		if byTS, ok := seen[id]; ok {
-			if old, ok := byTS[p.ts]; ok {
-				if old != p.value {
-					return nil, conflictAt(pos, ref, p.ts, old, p.value)
-				}
-				// 同批内重复出现且数值相同：重复，成功忽略。
-				continue
+		// 同一采样位置只判定一次：无论已接受的值来自此前批次还是本批，
+		// 等值（转换后的有限 float64 相等，含 +0/-0）即重复、成功忽略，
+		// 不同值即冲突、整批拒绝。
+		if old, ok := s.acceptedValue(seen, id, p.ts); ok {
+			if old != p.value {
+				return nil, conflictAt(pos, ref, p.ts, old, p.value)
 			}
-		}
-		if sr, ok := s.series[id]; ok {
-			if old, ok := sr.points[p.ts]; ok {
-				if old != p.value {
-					return nil, conflictAt(pos, sr.ref, p.ts, old, p.value)
-				}
-				// 与此前批次已写入的值相同：重复，成功忽略。
-				// seen 记录的是已存值 old 而不是本次提交的 p.value：
-				// 数值相等但表示不同（如已存 +0、本次提交 -0）时，
-				// 本批后续在同位置的冲突必须如实报告首次接受的已存值，
-				// 不能被这条被忽略的重复改写。
-				if seen[id] == nil {
-					seen[id] = map[int64]float64{}
-				}
-				seen[id][p.ts] = old
-				continue
-			}
+			continue
 		}
 
 		added++

@@ -610,31 +610,22 @@ func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineE
 		id := makeSeriesID(p.name, p.labels)
 		ref := SeriesRef{Name: p.name, Labels: p.labels}
 
-		if byTS, ok := seen[id]; ok {
-			if old, ok := byTS[p.ts]; ok {
-				if old != p.value {
-					return nil, conflictAt(pos, ref, p.ts, old, p.value)
-				}
-				// 同批内重复出现且数值相同：重复，成功忽略。
-				continue
+		// 同一采样位置无论值来自本批较早接受的点还是此前批次已写入的点，
+		// 都走同一条判定：转换后的 float64 相等即重复、成功忽略，不同即冲突、
+		// 整批拒绝。existing 是该位置当前生效的值，两种来源下语义一致。
+		if existing, ok := s.positionValue(seen, id, p.ts); ok {
+			if existing != p.value {
+				return nil, conflictAt(pos, ref, p.ts, existing, p.value)
 			}
-		}
-		if sr, ok := s.series[id]; ok {
-			if old, ok := sr.points[p.ts]; ok {
-				if old != p.value {
-					return nil, conflictAt(pos, sr.ref, p.ts, old, p.value)
-				}
-				// 与此前批次已写入的值相同：重复，成功忽略。
-				// seen 记录的是已存值 old 而不是本次提交的 p.value：
-				// 数值相等但表示不同（如已存 +0、本次提交 -0）时，
-				// 本批后续在同位置的冲突必须如实报告首次接受的已存值，
-				// 不能被这条被忽略的重复改写。
-				if seen[id] == nil {
-					seen[id] = map[int64]float64{}
-				}
-				seen[id][p.ts] = old
-				continue
+			// 等值重复：成功忽略。seen 记录的是生效值 existing 而不是本次
+			// 提交的 p.value：数值相等但表示不同（如已存 -0、本次提交 +0）时，
+			// 本批后续在同位置的冲突必须如实报告最先接受的值，
+			// 不能被这条被忽略的重复改写。
+			if seen[id] == nil {
+				seen[id] = map[int64]float64{}
 			}
+			seen[id][p.ts] = existing
+			continue
 		}
 
 		added++
@@ -656,6 +647,24 @@ func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineE
 	}
 
 	return s.snapshot(added, len(items)-added), nil
+}
+
+// positionValue 解析一个采样位置（序列身份 + 时间戳）当前生效的值：
+// 本批已接受的值优先（含与已写入数据等值而被忽略的重复所登记的生效值），
+// 其次是此前批次已成功写入的值；该位置没有任何数据时 ok 为 false。
+// 重复与冲突判定只看这里返回的值，不再区分两种来源。
+func (s *MetricStore) positionValue(seen map[seriesID]map[int64]float64, id seriesID, ts int64) (value float64, ok bool) {
+	if byTS, found := seen[id]; found {
+		if v, hit := byTS[ts]; hit {
+			return v, true
+		}
+	}
+	if sr, found := s.series[id]; found {
+		if v, hit := sr.points[ts]; hit {
+			return v, true
+		}
+	}
+	return 0, false
 }
 
 // formatFloat 以 JSON 数值风格格式化 float64：1 与 1.0 均显示为 1。

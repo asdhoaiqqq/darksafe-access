@@ -583,6 +583,14 @@ func parseConditions(doc map[string]any, field string) ([]LabelCondition, error)
 // them into batches. When SpreadBy names a tag, each batch holds at most one
 // cluster per value of that tag (its fault domain) and every selected cluster
 // must carry the tag. It validates the input first and never mutates it.
+//
+// When every candidate is filtered out, the returned error lists each
+// candidate's rejection reason on its own line, ascending by the original
+// ID. An ID containing a double quote, backslash, control character or
+// U+2028/U+2029 is displayed as a quoted JSON string with those characters
+// escaped (see rejectreport.go), so one candidate always occupies exactly
+// one line and the original ID can be recovered from the display; this is
+// only a display spelling — the ID itself is never altered or re-compared.
 func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 	if err := ValidateReleaseInput(in); err != nil {
 		return ReleasePlan{}, err
@@ -614,7 +622,7 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 		b.WriteString("没有符合规则的可用集群，各候选集群未入选原因：")
 		for _, e := range excluded {
 			b.WriteString("\n  ")
-			b.WriteString(e.ID)
+			b.WriteString(reportClusterID(e.ID))
 			b.WriteString("：")
 			b.WriteString(e.Reason)
 		}

@@ -142,11 +142,24 @@ func (e *fingerprintEncoder) rawString(s string) {
 	e.buf = append(e.buf, s...)
 }
 
-// stringList preserves nil-vs-empty explicitly: in the JSON envelope a
-// nil slice is "null" and a non-nil empty slice is "[]", so the raw
-// encoding must keep the two shapes apart as well.
-func (e *fingerprintEncoder) stringList(items []string) {
-	e.tag(tagStringList)
+// list frames every length-counted list in the raw canonical encoding,
+// whatever its item type: the subject-role and matched-policy string lists
+// and the policy-change policy list all share this one shape, mirroring
+// writeList/readList in the archive. The list's own type tag
+// (tagStringList or tagPolicyList) is still supplied by the caller before
+// each item opens with its own tag, so the two list kinds keep their
+// distinct type markers while the structural rules live in one place: a
+// nil list is the tag plus a zero presence byte; a non-nil list is the
+// tag, a presence byte, a big-endian count and one encoded item each.
+// nil, non-nil empty and populated lists therefore stay distinct, element
+// order and duplicates are kept exactly as supplied (nothing here sorts,
+// deduplicates or drops empty elements), and two lists whose concatenated
+// item bytes coincide but whose element boundaries differ cannot collapse,
+// because every item carries its own tag and length prefix. The element
+// contents themselves are written by writeItem, so string items and policy
+// items each keep their existing encoding byte-for-byte.
+func list[T any](e *fingerprintEncoder, t fingerprintTag, items []T, writeItem func(T)) {
+	e.tag(t)
 	if items == nil {
 		e.buf = append(e.buf, 0)
 		return
@@ -155,8 +168,8 @@ func (e *fingerprintEncoder) stringList(items []string) {
 	var b [4]byte
 	binary.BigEndian.PutUint32(b[:], uint32(len(items)))
 	e.buf = append(e.buf, b[:]...)
-	for _, s := range items {
-		e.rawString(s)
+	for i := range items {
+		writeItem(items[i])
 	}
 }
 
@@ -183,21 +196,6 @@ func (e *fingerprintEncoder) policy(p Policy) {
 	}
 }
 
-func (e *fingerprintEncoder) policyList(policies []Policy) {
-	e.tag(tagPolicyList)
-	if policies == nil {
-		e.buf = append(e.buf, 0)
-		return
-	}
-	e.buf = append(e.buf, 1)
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], uint32(len(policies)))
-	e.buf = append(e.buf, b[:]...)
-	for _, p := range policies {
-		e.policy(p)
-	}
-}
-
 func (e *fingerprintEncoder) change(c *PolicyChange) {
 	e.tag(tagChange)
 	// A nil pointer is encoded as tagChange alone; a present value's
@@ -214,7 +212,7 @@ func (e *fingerprintEncoder) change(c *PolicyChange) {
 		case changeFieldInt:
 			e.int64Tag(tagSeq, int64(f.getInt(c)))
 		case changeFieldPolicyList:
-			e.policyList(f.getPolicies(c))
+			list(e, tagPolicyList, f.getPolicies(c), e.policy)
 		case changeFieldBool:
 			e.boolTag(tagBool, f.getBool(c))
 		}
@@ -239,7 +237,7 @@ func (e *fingerprintEncoder) decisionRecord(d *DecisionRecord) {
 		case decisionFieldString:
 			e.rawString(f.getString(d))
 		case decisionFieldStringList:
-			e.stringList(f.getList(d))
+			list(e, tagStringList, f.getList(d), e.rawString)
 		case decisionFieldBool:
 			e.boolTag(tagBool, f.getBool(d))
 		case decisionFieldInt:

@@ -123,7 +123,66 @@ func (e *duplicateMemberError) Error() string {
 // " env" and "env", are different. The first duplicate encountered in file
 // order is reported: the walk is depth-first in document order, so the
 // second occurrence that appears earliest wins, regardless of value type.
+//
+// The check is a policy over the shared structural walk (jsonwalk.go): the
+// walker recognizes the nesting, decodes the member names and tracks each
+// object's location; this check only keeps the seen-name set of each object.
+// A document the walk cannot fully vouch for — an unrecognized structure,
+// trailing content, or a loosely scanned number only the decoder judges —
+// is handed to the encoding/json walk, which reports the established format
+// error (and any duplicate preceding the malformation) with the existing
+// wording.
 func checkDuplicateMembers(data []byte) error {
+	dup, recognized := scanDuplicateMembers(data)
+	// json.Valid confirms the whole document — including the numbers the
+	// walk skipped loosely and any trailing content — is one well-formed
+	// JSON value, so a completed walk's verdict can be trusted directly.
+	// Legal numbers beyond float64 range (e.g. 1e400) are valid JSON and
+	// pass; whether a number is acceptable for a given field is decided
+	// later by business validation.
+	if recognized && json.Valid(data) {
+		return dup
+	}
+	return checkJSONFormatAndDuplicates(data)
+}
+
+// scanDuplicateMembers runs the duplicate-member policy over the shared
+// structural walk. It reports the first duplicate in file order — the walk
+// is depth-first in document order, so the second occurrence that appears
+// earliest wins — and whether the walk recognized the document's structure
+// (no errUndecided and no text problem, both of which leave the verdict to
+// the decoder walk). recognized does not by itself mean the document is
+// well-formed JSON: the caller confirms that with json.Valid.
+func scanDuplicateMembers(data []byte) (dup error, recognized bool) {
+	// Each object's location in the document is unique, so the seen-name
+	// sets are keyed by the owning object's path; the walk needs no
+	// enter/exit events for them.
+	seen := make(map[string]map[string]struct{})
+	w := &jsonWalker{data: data, onMember: func(ownerPath, name string) error {
+		set := seen[ownerPath]
+		if set == nil {
+			set = make(map[string]struct{})
+			seen[ownerPath] = set
+		}
+		if _, ok := set[name]; ok {
+			dup = &duplicateMemberError{field: name, path: ownerPath}
+			return dup
+		}
+		set[name] = struct{}{}
+		return nil
+	}}
+	if err := w.value("$"); err != nil && dup == nil {
+		return nil, false
+	}
+	return dup, true
+}
+
+// checkJSONFormatAndDuplicates is the encoding/json walk that documents the
+// raw structural walk cannot recognize are handed to. It reports the JSON
+// format error with the established wording — and a duplicate member when
+// its second occurrence precedes the malformation — exactly as the duplicate
+// check always has for such documents.
+func checkJSONFormatAndDuplicates(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// Numbers are only walked past, never interpreted: UseNumber keeps legal
 	// JSON numbers beyond float64 range (e.g. 1e400) from being turned into an
@@ -143,7 +202,10 @@ func checkDuplicateMembers(data []byte) error {
 }
 
 // walkJSONValue reads one complete JSON value whose first token has not been
-// consumed yet.
+// consumed yet. Together with walkJSONObject and walkJSONArray it is the
+// decoding half of checkJSONFormatAndDuplicates: it only runs for documents
+// the shared structural walk could not recognize, to report the format error
+// (or an earlier duplicate) with the established wording.
 func walkJSONValue(dec *json.Decoder, path string) error {
 	tok, err := dec.Token()
 	if err != nil {
@@ -207,49 +269,6 @@ func walkJSONObject(dec *json.Decoder, path string) error {
 	}
 }
 
-// isSimpleMemberName reports whether key may be written with dot notation:
-// it must start with an ASCII letter or underscore and contain only ASCII
-// letters, digits, and underscores afterward.
-func isSimpleMemberName(key string) bool {
-	if key == "" {
-		return false
-	}
-	for i, r := range key {
-		switch {
-		case r == '_' || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z'):
-		case i > 0 && ('0' <= r && r <= '9'):
-		default:
-			return false
-		}
-	}
-	return true
-}
-
-// joinMemberPath extends an object location with one member name. Simple
-// identifier names keep the existing dot spelling ("$.clusters[0].tags");
-// every other name is rendered as brackets around a JSON-encoded string, so
-// the text decodes back to exactly the real member name and none of its
-// characters can be mistaken for a path separator or array index.
-func joinMemberPath(path, key string) string {
-	if isSimpleMemberName(key) {
-		return path + "." + key
-	}
-	return path + "[" + jsonEncodePathString(key) + "]"
-}
-
-// jsonEncodePathString renders key as a legal JSON string (including the
-// surrounding quotes); decoding the result restores key exactly, including
-// empty names and names containing quotes, backslashes, newlines or other
-// control characters.
-func jsonEncodePathString(key string) string {
-	bs, err := json.Marshal(key)
-	if err != nil {
-		// json.Marshal cannot fail for a Go string.
-		panic(fmt.Sprintf("json.Marshal(%q): %v", key, err))
-	}
-	return string(bs)
-}
-
 func walkJSONArray(dec *json.Decoder, path string) error {
 	for i := 0; ; i++ {
 		tok, err := dec.Token()
@@ -262,7 +281,7 @@ func walkJSONArray(dec *json.Decoder, path string) error {
 		if d, ok := tok.(json.Delim); ok && d == ']' {
 			return nil
 		}
-		if err := walkJSONValueToken(dec, fmt.Sprintf("%s[%d]", path, i), tok); err != nil {
+		if err := walkJSONValueToken(dec, joinIndexPath(path, i), tok); err != nil {
 			return err
 		}
 	}

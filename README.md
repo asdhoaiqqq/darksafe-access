@@ -72,6 +72,73 @@ decide  (subject org mismatch)     : allowed=false reason="organization mismatch
 - 请求缺少资源 ID、主体停用或组织不一致时，仍按既有信封规则拒绝，资源限定不能绕过任何检查。
 - 限定作为策略内容随版本保存：历史查询、回滚、`Review`、`RecheckDecision` 与离线复核都使用当时的限定；事后把策略从甲改到乙不影响旧决策的复核结论。限定字段纳入审计指纹（为空时沿用历史指纹编码，旧记录与旧导出的指纹、检查点不变），修改导出材料中的限定而保留原指纹与检查点会导致校验失败；含非 UTF-8 字节时按原始字节保存与校验。
 
+### 完整示例：上级递归拒绝为什么压过下级精确允许
+
+发布规则里写着"拒绝优先"，但只看一句话容易误解成"更具体的允许应当覆盖上级拒绝"。完整程序 [`examples/scope_parent_deny/main.go`](examples/scope_parent_deny/main.go) 用同一份取值把跨层级冲突、`Recursive` 的覆盖范围和斜杠分段边界一次性对照清楚。它只依赖本项目公开 API 与 Go 标准库，自行 `NewStore()` 创建内存存储并发布策略，可在本机离线运行、不写文件：
+
+```bash
+go run ./examples/scope_parent_deny
+```
+
+**评估规则**（这是组织级**已发布策略**的判断规则，只适用于 `Store.Decide`/`Review`）：评估器遍历请求**实际使用版本**的整套策略，把主体、动作、作用域（含 `Recursive` 子作用域）与资源限定全部满足的策略都收集为命中；只要命中集合里存在**任意一条**拒绝，结果就是拒绝（理由 `matched deny policy`），允许与拒绝之间**不比较谁更具体、也不看发布或提交顺序**。这是刻意的设计：上级作用域表达的是组织范围约束（如合规封锁），若下级更精确的允许能反过来覆盖它，任何一个下级授权点都能架空全组织禁令。命中列表保留**所有**命中策略的标识（去重后按标识升序），而不是只留下最终拍板的那条——被压过的允许正是"这条拒绝是一次冲突裁决"的证据，事后复核（含审计记录与离线复核）都要看到它。
+
+**固定取值**：组织 `acme`，主体 `u1`（`Kind=user`、处于启用状态、**不带任何角色**——`Decide` 根本不读角色，演示入口 `Access` 中角色带来的允许不能作为这里的授权依据，见上文"从演示到组织级访问决策"），动作 `read`，资源 ID 恒为 `doc-1`，决策组织、主体组织、资源组织三者都是 `acme`。所有策略都不限定 `ResourceID`（即匹配该作用域下任意资源标识），因此三个场景之间只有作用域与 `Recursive` 在变。
+
+**主场景**：一次发布同一套两条策略——`a-child-allow` 在 `org/a/b` 精确允许 `u1` 的 `read`（不递归），`z-parent-deny` 在 `org/a` 拒绝 `u1` 的 `read` 且 `Recursive=true`。读取位于 `org/a/b` 的 `doc-1` 时两条都命中：拒绝压过允许，返回拒绝、理由 `matched deny policy`，命中列表按标识升序同时包含 `a-child-allow` 和 `z-parent-deny`，版本是这次实际评估的已发布版本。
+
+**两个对照**说明覆盖范围而不是否定拒绝优先：
+
+1. **上级拒绝改为不递归**：`z-parent-deny` 的 `Recursive=false` 后只管 `org/a` 自己；同一个 `org/a/b` 读取只命中 `a-child-allow` 并通过。程序同时对正好位于 `org/a` 的 `doc-1` 再读一次——仍被这条不递归拒绝命中，证明下级通过是作用域语义的结果，拒绝本身没有被削弱。
+2. **`org/ab` 不是 `org/a` 的下级**：作用域按**斜杠分隔的段**匹配，递归覆盖只认 `<作用域>/` 前缀，绝不按名称前缀理解。程序先在版本 1 只发布 `org/a` 的递归拒绝：读取位于 `org/ab` 的 `doc-1` 时拒绝够不到，且没有任何允许，结果是 `no matching allow policy` 的默认拒绝（命中列表为空）——**未命中拒绝不等于自动允许**；随后发布版本 2 补上 `org/ab` 的精确允许 `ab-exact-allow`，同一请求才只命中这条允许并通过。
+
+#### 预期输出
+
+输出是确定性的，重复运行完全一致。场景 1、2 各自使用全新内存存储，所以首个版本都是 1；场景 3 在同一存储内连续发布两次，分别成为版本 1 和 2。每个决策都打印允许与否、理由、命中策略与实际版本：
+
+```text
+scenario 1/3: recursive deny on org/a overrides the more specific exact allow on org/a/b
+published version 1 for org "acme" with 2 policies:
+  policy "a-child-allow": subject=u1 action=read scope=org/a/b effect=allow recursive=false resource=(any resource id)
+  policy "z-parent-deny": subject=u1 action=read scope=org/a effect=deny recursive=true resource=(any resource id)
+request: read doc-1 located in the child scope org/a/b
+  Decide(org="acme"): subject id=u1 kind=user disabled=false roles=[] (subject org "acme"); resource id=doc-1 scope=org/a/b (resource org "acme"); action=read
+  decision: allowed=false reason="matched deny policy" matched=["a-child-allow" "z-parent-deny"] version=1
+
+scenario 2/3: the same parent deny without Recursive stays on org/a; the child read passes
+published version 1 for org "acme" with 2 policies:
+  policy "a-child-allow": subject=u1 action=read scope=org/a/b effect=allow recursive=false resource=(any resource id)
+  policy "z-parent-deny": subject=u1 action=read scope=org/a effect=deny recursive=false resource=(any resource id)
+request A: read doc-1 located in the child scope org/a/b (deny out of reach, child allow matches)
+  Decide(org="acme"): subject id=u1 kind=user disabled=false roles=[] (subject org "acme"); resource id=doc-1 scope=org/a/b (resource org "acme"); action=read
+  decision: allowed=true reason="matched allow policy" matched=["a-child-allow"] version=1
+request B: read doc-1 exactly at org/a (the non-recursive deny still guards its own scope)
+  Decide(org="acme"): subject id=u1 kind=user disabled=false roles=[] (subject org "acme"); resource id=doc-1 scope=org/a (resource org "acme"); action=read
+  decision: allowed=false reason="matched deny policy" matched=["z-parent-deny"] version=1
+
+scenario 3/3: org/ab is not a child of org/a; scopes match by slash segments, not name prefix
+published version 1 for org "acme" with 1 policies:
+  policy "z-parent-deny": subject=u1 action=read scope=org/a effect=deny recursive=true resource=(any resource id)
+request A (version 1): read doc-1 located in org/ab — the recursive deny cannot match, and no allow exists
+  Decide(org="acme"): subject id=u1 kind=user disabled=false roles=[] (subject org "acme"); resource id=doc-1 scope=org/ab (resource org "acme"); action=read
+  decision: allowed=false reason="no matching allow policy" matched=[] version=1
+published version 2 for org "acme" with 2 policies:
+  policy "z-parent-deny": subject=u1 action=read scope=org/a effect=deny recursive=true resource=(any resource id)
+  policy "ab-exact-allow": subject=u1 action=read scope=org/ab effect=allow recursive=false resource=(any resource id)
+request B (version 2): the same org/ab read after an exact allow on org/ab is added
+  Decide(org="acme"): subject id=u1 kind=user disabled=false roles=[] (subject org "acme"); resource id=doc-1 scope=org/ab (resource org "acme"); action=read
+  decision: allowed=true reason="matched allow policy" matched=["ab-exact-allow"] version=2
+```
+
+逐结果对照：
+
+1. **场景 1（拒绝，`version=1`）**：`org/a` 的递归拒绝覆盖子孙作用域 `org/a/b`，与下级精确允许同时命中。`allowed=false`、`matched deny policy`；命中列表是 `["a-child-allow" "z-parent-deny"]`（标识升序），被压过的允许没有被抹掉。把两条策略在发布时的先后顺序调换，四个字段逐字节不变。
+2. **场景 2 请求 A（允许，`version=1`）**：不递归拒绝的作用域只有 `org/a` 本身，`org/a/b` 读取只命中 `a-child-allow`。
+3. **场景 2 请求 B（拒绝，`version=1`）**：同一套策略下，资源位于 `org/a` 本层时只命中 `z-parent-deny`——对照 A 的通过不是允许"更强"，而是拒绝够不到子层。
+4. **场景 3 请求 A（默认拒绝，`version=1`）**：`org/ab` 与 `org/a` 只是字符串前缀相近、在段结构上是平级分支，递归拒绝不命中；没有允许策略，于是按默认规则以 `no matching allow policy` 拒绝、命中列表为空。"拒绝没命中"推不出允许。
+5. **场景 3 请求 B（允许，`version=2`）**：版本 2 增加 `org/ab` 的精确允许后，同一请求只命中 `ab-exact-allow`；`z-parent-deny` 仍在该版本中，却始终不会出现在 `org/ab` 请求的命中列表里。版本号从 1 变为 2，正是"实际评估的已发布版本"的含义。
+
+以上五次 `Decide` 都指定了非空决策组织且信封合法，因此每次都会在对应存储的 `acme` 审计链留下一条决策记录（含命中列表与实际版本）；示例没有使用 `Access`，主体也没有携带角色——这里的每个结论都只能由已发布策略推出。
+
 ## 组织审计链
 
 每次成功的发布、回滚，以及每次指定了非空决策组织的 `Decide`，都会在该组织追加一条不可变记录。失败的发布/回滚不改变策略状态、版本号与审计记录；缺少决策组织的 `Decide`、以及 `Review` 和按审计记录复核均为只读，不产生记录。

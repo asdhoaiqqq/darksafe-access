@@ -94,17 +94,23 @@ func (w *archiveWriter) stringField(s string) {
 	w.buf = append(w.buf, s...)
 }
 
-// stringList preserves the slice shape explicitly: nil is one marker, a
-// non-nil list is a marker, a count and the raw strings.
-func (w *archiveWriter) stringList(items []string) {
+// writeList frames every length-counted list in the archive, whatever its
+// item type: the subject-role and matched-policy string lists and the
+// policy-change policy list all share this one shape. nil is one marker, a
+// non-nil list is a presence marker, a count and one encoded item each, so
+// nil, non-nil empty and populated lists stay distinct and element order is
+// whatever the caller supplied. Keeping the framing here — rather than
+// copied per item type — means a list-format change is made once instead of
+// mirrored between the two list kinds.
+func writeList[T any](w *archiveWriter, items []T, writeItem func(T)) {
 	if items == nil {
 		w.buf = append(w.buf, archiveTagNil)
 		return
 	}
 	w.buf = append(w.buf, archiveTagPresent)
 	w.u32(len(items))
-	for _, s := range items {
-		w.stringField(s)
+	for i := range items {
+		writeItem(items[i])
 	}
 }
 
@@ -122,18 +128,6 @@ func (w *archiveWriter) policy(p Policy) {
 		case policyFieldBool:
 			w.boolean(f.getBool(p))
 		}
-	}
-}
-
-func (w *archiveWriter) policyList(policies []Policy) {
-	if policies == nil {
-		w.buf = append(w.buf, archiveTagNil)
-		return
-	}
-	w.buf = append(w.buf, archiveTagPresent)
-	w.u32(len(policies))
-	for _, p := range policies {
-		w.policy(p)
 	}
 }
 
@@ -155,7 +149,7 @@ func (w *archiveWriter) change(c *PolicyChange) {
 		case changeFieldInt:
 			w.u32(f.getInt(c))
 		case changeFieldPolicyList:
-			w.policyList(f.getPolicies(c))
+			writeList(w, f.getPolicies(c), w.policy)
 		case changeFieldBool:
 			w.boolean(f.getBool(c))
 		}
@@ -180,7 +174,7 @@ func (w *archiveWriter) decisionRecord(d *DecisionRecord) {
 		case decisionFieldString:
 			w.stringField(f.getString(d))
 		case decisionFieldStringList:
-			w.stringList(f.getList(d))
+			writeList(w, f.getList(d), w.stringField)
 		case decisionFieldBool:
 			w.boolean(f.getBool(d))
 		case decisionFieldInt:
@@ -337,7 +331,18 @@ func (r *archiveReader) stringField() string {
 	return s
 }
 
-func (r *archiveReader) stringList() []string {
+// readList reads one length-counted list framed by writeList, whatever its
+// item type: both string lists and the policy list decode here. Every list
+// kind gets the exact same framing checks — the nil/presence marker, the
+// per-item byte floor before any allocation, and each item's own
+// truncation/structure errors — so a hostile count can neither drive a
+// disproportionate allocation nor deliver a partial list: once an item
+// fails, the reader's sticky error fails the whole read.
+// minBytesPerItem is the minimum an item could occupy (each string item
+// carries one length word; a policy item carries six length words and a
+// bool), and is used only to reject counts the remaining bytes could never
+// satisfy.
+func readList[T any](r *archiveReader, minBytesPerItem int, readItem func() T) []T {
 	switch r.marker() {
 	case archiveTagNil:
 		return nil
@@ -348,13 +353,13 @@ func (r *archiveReader) stringList() []string {
 		}
 		return nil
 	}
-	n := r.boundedCount(4) // each item carries at least one length word
+	n := r.boundedCount(minBytesPerItem)
 	if r.err != nil {
 		return nil
 	}
-	items := make([]string, n)
+	items := make([]T, n)
 	for i := range items {
-		items[i] = r.stringField()
+		items[i] = readItem()
 	}
 	return items
 }
@@ -374,30 +379,6 @@ func (r *archiveReader) policy() Policy {
 		}
 	}
 	return p
-}
-
-func (r *archiveReader) policyList() []Policy {
-	switch r.marker() {
-	case archiveTagNil:
-		return nil
-	case archiveTagPresent:
-	default:
-		if r.err == nil {
-			r.err = fmt.Errorf("%w: invalid policy list marker", ErrInvalidArchive)
-		}
-		return nil
-	}
-	// A policy writes six length words (five strings plus ResourceID) and
-	// one bool byte at minimum.
-	n := r.boundedCount(6*4 + 1)
-	if r.err != nil {
-		return nil
-	}
-	policies := make([]Policy, n)
-	for i := range policies {
-		policies[i] = r.policy()
-	}
-	return policies
 }
 
 func (r *archiveReader) change() *PolicyChange {
@@ -420,7 +401,9 @@ func (r *archiveReader) change() *PolicyChange {
 		case changeFieldInt:
 			f.setInt(c, r.u32())
 		case changeFieldPolicyList:
-			f.setPolicies(c, r.policyList())
+			// A policy writes six length words (five strings plus
+			// ResourceID) and one bool byte at minimum.
+			f.setPolicies(c, readList(r, 6*4+1, r.policy))
 		case changeFieldBool:
 			f.setBool(c, r.boolean())
 		}
@@ -448,7 +431,8 @@ func (r *archiveReader) decisionRecord() *DecisionRecord {
 		case decisionFieldString:
 			f.setString(d, r.stringField())
 		case decisionFieldStringList:
-			f.setList(d, r.stringList())
+			// Each string item carries at least one length word.
+			f.setList(d, readList(r, 4, r.stringField))
 		case decisionFieldBool:
 			f.setBool(d, r.boolean())
 		case decisionFieldInt:

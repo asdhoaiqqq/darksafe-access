@@ -728,48 +728,63 @@ func labelsMatch(want, stored map[string]string) bool {
 	return true
 }
 
-// runQuery 只读扫描已成功提交的数据：name 精确、标签子集、[start,end] 闭区间。
-// 序列次序与写入快照共用 organizeSeries 的整理结果：过滤掉其他序列后，
-// 保留的序列仍是同一排序中的一个子序列，不另换排序；无区间内点的序列不列出。
+// runQuery 只读统计已成功提交的数据：name 精确、标签子集、[start,end] 闭区间。
+// 查询只返回每条序列的点数与均值，因此不借用写入快照的全量展示准备：既不整理
+// 无关指标的序列，也不把区间内采样点按时间排成完整 Point 列表——单次遍历点表
+// 只做计数与精确有理数求和（计数与均值都与点的排列次序无关）。
+// 命中序列的相对次序仍与写入快照一致：仅对通过名称与标签筛选的序列套用同一套
+// 排序约定（指标名字典序，再按标签键升序后的键值对逐对比较），排好的序列是
+// 全量排序中的一个子序列；区间内没有点的序列不列出，不补零值条目。
 func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
-	inRange := func(ts int64) bool { return ts >= q.start && ts <= q.end }
-	out := make([]QuerySeries, 0)
-	for _, os := range s.organizeSeries() {
-		if os.ref.Name != q.name || !labelsMatch(q.labels, os.ref.Labels) {
+	matched := make([]organizedSeries, 0)
+	for _, sr := range s.series {
+		if sr.ref.Name != q.name || !labelsMatch(q.labels, sr.ref.Labels) {
 			continue
 		}
-		points := sortedSeriesPoints(os.sr, inRange)
-		if len(points) == 0 {
+		// 标签必须复制：查询结果是当次操作的独立记录，
+		// 调用方修改结果标签不能改动已存序列的身份。
+		labels := cloneLabels(sr.ref.Labels)
+		matched = append(matched, organizedSeries{
+			sr:    sr,
+			ref:   SeriesRef{Name: sr.ref.Name, Labels: labels},
+			pairs: sortedPairs(labels),
+		})
+	}
+	// 命中序列名称都相同，只需逐对比较排序后的标签；无标签（空前缀）排最前。
+	sort.Slice(matched, func(i, j int) bool {
+		return compareLabelPairs(matched[i].pairs, matched[j].pairs) < 0
+	})
+
+	out := make([]QuerySeries, 0, len(matched))
+	for _, entry := range matched {
+		// 一次遍历直接统计：区间内点的个数与精确总和。不构造值切片、
+		// 不排序时间戳，避免为只返回 count/average 的查询承担采样明细展示。
+		// 求和在有理数上精确完成：与写入顺序、批次划分无关，正负大数抵消后的
+		// 小余量不会丢失，总和超出 float64 范围时均值仍然有限。
+		count := 0
+		sum := new(big.Rat)
+		r := new(big.Rat)
+		for ts, v := range entry.sr.points {
+			if ts < q.start || ts > q.end {
+				continue
+			}
+			count++
+			// 写入侧已保证 v 有限，SetFloat64 对有限值是精确的。
+			sum.Add(sum, r.SetFloat64(v))
+		}
+		if count == 0 {
 			continue
 		}
-		values := make([]float64, len(points))
-		for i, p := range points {
-			values[i] = p.Value
-		}
+		sum.Quo(sum, r.SetInt64(int64(count)))
 		out = append(out, QuerySeries{
-			Name:    os.ref.Name,
-			Labels:  os.ref.Labels,
-			Count:   len(values),
-			Average: finiteMean(values),
+			Name:   entry.ref.Name,
+			Labels: entry.ref.Labels,
+			Count:  count,
+			// 精确平均舍入到最近可表示 float64（正中取偶）；精确为零时返回 +0。
+			Average: ratToFloat64NearestEven(sum),
 		})
 	}
 	return &QueryResult{Status: "ok", Op: "query", Series: out}
-}
-
-// finiteMean 返回已存储 float64 值的精确算术平均所对应的最近 float64，
-// 恰好在两个相邻可表示值中间时按最近偶数舍入。
-// 求和用有理数精确完成：与点的顺序、批次划分无关，正负大数抵消后的小余量
-// 不会丢失，总和超出 float64 范围时结果仍然有限。精确平均为零时返回 +0；
-// 只有一个点时结果就是该点的值。
-func finiteMean(values []float64) float64 {
-	sum := new(big.Rat)
-	r := new(big.Rat)
-	for _, v := range values {
-		// 写入侧已保证 v 有限，SetFloat64 对有限值是精确的。
-		sum.Add(sum, r.SetFloat64(v))
-	}
-	sum.Quo(sum, r.SetInt64(int64(len(values))))
-	return ratToFloat64NearestEven(sum)
 }
 
 // ratToFloat64NearestEven 把有理数 x 舍入到最近的 float64，半数取偶。
@@ -891,25 +906,26 @@ func identityText(s string) string {
 	return s
 }
 
-// organizedSeries 是一次结果整理中的一条序列：携带已存序列指针、
+// organizedSeries 是结果整理中的一条序列：携带已存序列指针、
 // 供结果直接使用的独立标签副本（标签书写顺序不影响身份，
 // 副本使调用方对结果的修改不能回写存储），以及该副本按键升序
-// 整理好的键值对，供排序比较直接复用。
+// 整理好的键值对，供排序比较直接复用。写入快照对全部已存序列整理；
+// 区间查询只对名称与标签命中的序列整理同一份排序依据。
 type organizedSeries struct {
 	sr    *storedSeries
 	ref   SeriesRef
 	pairs []labelPair
 }
 
-// organizeSeries 是写入快照与区间查询共用的数据整理逻辑：
-// 遍历全部已提交序列，复制各自的序列身份，并按唯一的顺序约定排列——
-// 先按指标名字符串字典序，再按标签键升序后的键值对逐对比较
-// （先比键再比值，前一对相同才比下一对；较短集合是完整前缀时排前，
-// 无标签序列因此排在最前）。标签值按字符串比较（"10" 在 "2" 之前）。
-// 每条序列的标签只在遍历时整理一次：排序后的键值对随条目保留，
-// sort 的反复比较直接复用同一份结果，不会因一条序列参与多次比较
-// 而反复整理同一套标签。整理结果不复制采样点；采样点的选取与升序
-// 排列由 sortedSeriesPoints 完成。
+// organizeSeries 是写入快照的全量数据整理：遍历全部已提交序列，
+// 复制各自的序列身份，并按唯一的顺序约定排列——先按指标名字符串字典序，
+// 再按标签键升序后的键值对逐对比较（先比键再比值，前一对相同才比下一对；
+// 较短集合是完整前缀时排前，无标签序列因此排在最前）。标签值按字符串比较
+// （"10" 在 "2" 之前）。每条序列的标签只在遍历时整理一次：排序后的键值对
+// 随条目保留，sort 的反复比较直接复用同一份结果，不会因一条序列参与多次
+// 比较而反复整理同一套标签。整理结果不复制采样点；采样点的完整选取与升序
+// 排列由 allSeriesPoints 完成。只返回统计结果的区间查询不经过这里，
+// 不会为无关指标与区间外采样点承担这套展示准备。
 func (s *MetricStore) organizeSeries() []organizedSeries {
 	out := make([]organizedSeries, 0, len(s.series))
 	for _, sr := range s.series {
@@ -931,17 +947,14 @@ func (s *MetricStore) organizeSeries() []organizedSeries {
 	return out
 }
 
-// sortedSeriesPoints 按 timestamp 升序返回一条已存序列中满足 keep 的采样点，
-// 数值与时间戳一一对应。keep 为 nil 时返回全部点（写入快照）；
-// 区间查询传入闭区间判定，查询只选取区间内的点。
-// 返回的是新建切片与新建 Point，调用方对采样点的修改不影响存储，
-// 也不影响此前或此后取得的其他成功结果。
-func sortedSeriesPoints(sr *storedSeries, keep func(ts int64) bool) []Point {
+// allSeriesPoints 按 timestamp 升序返回一条已存序列的全部采样点，数值与
+// 时间戳一一对应，供写入快照展示。返回的是新建切片与新建 Point，调用方对
+// 采样点的修改不影响存储，也不影响此前或此后取得的其他成功结果。区间查询
+// 不构造这样的明细列表，只在点表上计数与求和。
+func allSeriesPoints(sr *storedSeries) []Point {
 	tsList := make([]int64, 0, len(sr.points))
 	for ts := range sr.points {
-		if keep == nil || keep(ts) {
-			tsList = append(tsList, ts)
-		}
+		tsList = append(tsList, ts)
 	}
 	sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
 	points := make([]Point, len(tsList))
@@ -951,8 +964,9 @@ func sortedSeriesPoints(sr *storedSeries, keep func(ts int64) bool) []Point {
 	return points
 }
 
-// snapshot 生成按规范排序的全部序列视图：序列次序与点排列均来自
-// organizeSeries/sortedSeriesPoints 这套与查询共用的整理逻辑。
+// snapshot 生成按规范排序的全部序列视图：序列次序来自 organizeSeries，
+// 点排列来自 allSeriesPoints，这是写入侧的全量展示准备；区间查询不经过
+// 这套整理，只针对命中序列直接统计点数与精确均值。
 func (s *MetricStore) snapshot(added, duplicates int) *BatchResult {
 	organized := s.organizeSeries()
 	views := make([]SeriesView, 0, len(organized))
@@ -960,7 +974,7 @@ func (s *MetricStore) snapshot(added, duplicates int) *BatchResult {
 		views = append(views, SeriesView{
 			Name:   os.ref.Name,
 			Labels: os.ref.Labels,
-			Points: sortedSeriesPoints(os.sr, nil),
+			Points: allSeriesPoints(os.sr),
 		})
 	}
 	return &BatchResult{Status: "ok", Added: added, Duplicates: duplicates, Series: views}

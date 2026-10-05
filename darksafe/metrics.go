@@ -44,6 +44,22 @@ type QueryResult struct {
 	Series []QuerySeries `json:"series"`
 }
 
+// QueryPointsSeries 是采样明细查询结果中的一条序列：完整身份与区间内
+// 按时间戳升序排列的采样点，不附带点数或平均值。
+type QueryPointsSeries struct {
+	Name   string            `json:"name"`
+	Labels map[string]string `json:"labels"`
+	Points []Point           `json:"points"`
+}
+
+// QueryPointsResult 是一次区间采样明细查询（op 为 query_points）成功后的结果，
+// 只读，不改变存储。
+type QueryPointsResult struct {
+	Status string              `json:"status"`
+	Op     string              `json:"op"`
+	Series []QueryPointsSeries `json:"series"`
+}
+
 // BatchResult 是一批采样点写入成功后的结果。
 type BatchResult struct {
 	Status     string       `json:"status"`
@@ -170,9 +186,10 @@ var (
 )
 
 // ProcessLine 处理一行非空输入：JSON 数组为写入批次，JSON 对象为查询/操作。
-// 成功时返回非 nil 的 *BatchResult 或 *QueryResult 且错误为 nil；任何失败都返回
-// 真正的 nil 结果与 *LineError，调用方直接比较 result == nil 即可判定失败，
-// 无须先区分结果类型。空写入数组与无命中的查询仍是成功，结果不为 nil。
+// 成功时返回非 nil 的 *BatchResult、*QueryResult 或 *QueryPointsResult 且错误为
+// nil；任何失败都返回真正的 nil 结果与 *LineError，调用方直接比较
+// result == nil 即可判定失败，无须先区分结果类型。空写入数组与无命中的查询
+// 仍是成功，结果不为 nil。
 func (s *MetricStore) ProcessLine(line string) (any, *LineError) {
 	top, ok, lerr := decodeTopValue(line)
 	if lerr != nil {
@@ -192,12 +209,8 @@ func (s *MetricStore) ProcessLine(line string) (any, *LineError) {
 		}
 		return batch, nil
 	case '{':
-		// 同上：失败时不能把带类型 nil 的 *QueryResult 装进 any。
-		query, lerr := s.queryFromObject(top)
-		if lerr != nil {
-			return nil, lerr
-		}
-		return query, nil
+		// 同上：失败时不能把带类型 nil 的结果指针装进 any。
+		return s.queryFromObject(top)
 	default:
 		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a JSON array of samples or a query object"}
 	}
@@ -220,7 +233,8 @@ func (s *MetricStore) IngestLine(line string) (*BatchResult, *LineError) {
 	return s.ingestItems(items)
 }
 
-// QueryLine 解析并执行一行查询对象。成功返回 QueryResult；查询只读，不改变存储。
+// QueryLine 解析并执行一行 op 为 "query" 的区间均值查询对象。成功返回 QueryResult；
+// 查询只读，不改变存储。op 为 "query_points" 的采样明细查询由 QueryPointsLine 执行。
 func (s *MetricStore) QueryLine(line string) (*QueryResult, *LineError) {
 	top, ok, lerr := decodeTopValue(line)
 	if lerr != nil {
@@ -229,7 +243,36 @@ func (s *MetricStore) QueryLine(line string) (*QueryResult, *LineError) {
 	if ok != '{' {
 		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a query object"}
 	}
-	return s.queryFromObject(top)
+	res, lerr := s.queryFromObject(top)
+	if lerr != nil {
+		return nil, lerr
+	}
+	qr, isQuery := res.(*QueryResult)
+	if !isQuery {
+		return nil, &LineError{Status: "error", Error: `op "query_points" lists sample points; use QueryPointsLine`}
+	}
+	return qr, nil
+}
+
+// QueryPointsLine 解析并执行一行 op 为 "query_points" 的区间采样明细查询对象。
+// 成功返回 QueryPointsResult；查询只读，不改变存储。
+func (s *MetricStore) QueryPointsLine(line string) (*QueryPointsResult, *LineError) {
+	top, ok, lerr := decodeTopValue(line)
+	if lerr != nil {
+		return nil, lerr
+	}
+	if ok != '{' {
+		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a query object"}
+	}
+	res, lerr := s.queryFromObject(top)
+	if lerr != nil {
+		return nil, lerr
+	}
+	qp, isPoints := res.(*QueryPointsResult)
+	if !isPoints {
+		return nil, &LineError{Status: "error", Error: `op "query" computes range statistics; use QueryLine`}
+	}
+	return qp, nil
 }
 
 // validateLineText 在 JSON 解析之前强制整行文本合法：原始字节必须是合法
@@ -673,14 +716,17 @@ func formatFloat(v float64) string {
 }
 
 type parsedQuery struct {
+	op     string
 	name   string
 	start  int64
 	end    int64
 	labels map[string]string
 }
 
-// queryFromObject 严格解析查询对象并执行只读区间均值查询。
-func (s *MetricStore) queryFromObject(raw json.RawMessage) (*QueryResult, *LineError) {
+// queryFromObject 严格解析查询对象并执行对应的只读操作：op 为 "query" 时
+// 统计区间内点数与均值，为 "query_points" 时列出区间内采样明细。
+// 成功返回非 nil 的 *QueryResult 或 *QueryPointsResult；失败返回 nil 与 *LineError。
+func (s *MetricStore) queryFromObject(raw json.RawMessage) (any, *LineError) {
 	q, err := parseQuery(raw)
 	if err != nil {
 		return nil, &LineError{Status: "error", Error: err.Error()}
@@ -689,11 +735,16 @@ func (s *MetricStore) queryFromObject(raw json.RawMessage) (*QueryResult, *LineE
 		return nil, &LineError{Status: "error", Error: fmt.Sprintf(
 			`invalid range: "start" must not be greater than "end" (%d > %d)`, q.start, q.end)}
 	}
+	if q.op == "query_points" {
+		return s.runQueryPoints(q), nil
+	}
 	return s.runQuery(q), nil
 }
 
 // parseQuery 对查询对象做严格校验：仅允许 op/name/start/end/labels，
 // 拒绝重复键与未知字段；标量必须是精确的 JSON 类型，start/end 为 int64 毫秒。
+// op 只接受 "query"（区间点数与均值）与 "query_points"（区间采样明细），
+// 两种操作共用同一套字段校验与区间规则。
 func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 	var q parsedQuery
 	err := parseStrictObject(raw,
@@ -710,9 +761,10 @@ func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 				if !ok {
 					return fmt.Errorf(`field "op" must be a string`)
 				}
-				if op != "query" {
-					return fmt.Errorf(`unknown op %q (only "query" is supported)`, op)
+				if op != "query" && op != "query_points" {
+					return fmt.Errorf(`unknown op %q (only "query" and "query_points" are supported)`, op)
 				}
+				q.op = op
 				return nil
 			},
 			"name":  func(dec *json.Decoder) error { return readNameField(dec, &q.name) },
@@ -737,14 +789,9 @@ func labelsMatch(want, stored map[string]string) bool {
 	return true
 }
 
-// runQuery 只读统计已成功提交的数据：name 精确、标签子集、[start,end] 闭区间。
-// 序列身份的整理（标签副本、排序键值对、排列次序）与写入快照共用同一套
-// organizeSeries 规则，只是入选范围不同：这里先按名称与标签条件筛出命中序列
-// 再整理，不为无关指标承担展示准备；筛后剩余序列的相对次序因此与写入全量
-// 结果一致。查询只返回每条序列的点数与均值，不把区间内采样点按时间排成完整
-// Point 列表——单次遍历点表只做计数与精确有理数求和（计数与均值都与点的
-// 排列次序无关）。区间内没有点的序列不列出，不补零值条目。
-func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
+// matchSeries 筛出名称精确匹配且标签子集命中的已存序列，供两种查询操作各自整理；
+// 只读，不改变存储。
+func (s *MetricStore) matchSeries(q parsedQuery) []*storedSeries {
 	matched := make([]*storedSeries, 0)
 	for _, sr := range s.series {
 		if sr.ref.Name != q.name || !labelsMatch(q.labels, sr.ref.Labels) {
@@ -752,7 +799,18 @@ func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
 		}
 		matched = append(matched, sr)
 	}
-	organized := organizeSeries(matched)
+	return matched
+}
+
+// runQuery 只读统计已成功提交的数据：name 精确、标签子集、[start,end] 闭区间。
+// 序列身份的整理（标签副本、排序键值对、排列次序）与写入快照共用同一套
+// organizeSeries 规则，只是入选范围不同：这里先按名称与标签条件筛出命中序列
+// 再整理，不为无关指标承担展示准备；筛后剩余序列的相对次序因此与写入全量
+// 结果一致。查询只返回每条序列的点数与均值，不构造采样明细列表（明细由
+// query_points 操作提供）——单次遍历点表只做计数与精确有理数求和（计数与
+// 均值都与点的排列次序无关）。区间内没有点的序列不列出，不补零值条目。
+func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
+	organized := organizeSeries(s.matchSeries(q))
 
 	out := make([]QuerySeries, 0, len(organized))
 	for _, entry := range organized {
@@ -784,6 +842,50 @@ func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
 		})
 	}
 	return &QueryResult{Status: "ok", Op: "query", Series: out}
+}
+
+// runQueryPoints 只读列出已成功提交的采样明细：name 精确、标签子集、
+// [start,end] 闭区间，与 runQuery 共用同一套序列筛选与 organizeSeries 整理
+// 规则，因此序列排列次序与均值查询一致。每条命中序列保留完整指标名与完整
+// 标签集合，points 按时间戳升序列出区间内的 timestamp 与 value，不附加
+// count 或 average；区间内没有点的序列不列出，没有任何命中时 series 为
+// 空数组。时间戳以 int64 比较与输出，保留整数精度；value 是实际存储的
+// float64。查询只读，不改变采样值或写入计数。
+func (s *MetricStore) runQueryPoints(q parsedQuery) *QueryPointsResult {
+	organized := organizeSeries(s.matchSeries(q))
+
+	out := make([]QueryPointsSeries, 0, len(organized))
+	for _, entry := range organized {
+		points := seriesPointsInRange(entry.sr, q.start, q.end)
+		if len(points) == 0 {
+			continue
+		}
+		out = append(out, QueryPointsSeries{
+			Name:   entry.ref.Name,
+			Labels: entry.ref.Labels,
+			Points: points,
+		})
+	}
+	return &QueryPointsResult{Status: "ok", Op: "query_points", Series: out}
+}
+
+// seriesPointsInRange 按 timestamp 升序返回一条已存序列在 [start,end] 闭区间
+// 内的采样点，供采样明细查询展示。与 allSeriesPoints 一样返回新建切片与新建
+// Point，调用方对结果的修改不影响存储；区别只在这里按区间过滤时间戳。
+func seriesPointsInRange(sr *storedSeries, start, end int64) []Point {
+	tsList := make([]int64, 0, len(sr.points))
+	for ts := range sr.points {
+		if ts < start || ts > end {
+			continue
+		}
+		tsList = append(tsList, ts)
+	}
+	sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
+	points := make([]Point, len(tsList))
+	for i, ts := range tsList {
+		points[i] = Point{Timestamp: ts, Value: sr.points[ts]}
+	}
+	return points
 }
 
 // ratToFloat64NearestEven 把有理数 x 舍入到最近的 float64，半数取偶。
@@ -930,12 +1032,13 @@ func seriesLess(a, b organizedSeries) bool {
 
 // organizeSeries 是两种成功结果共用的序列身份整理：对入选的每条已存序列
 // 复制独立的标签副本、预整理按键升序的键值对，并按 seriesLess 的统一次序
-// 排列。入选范围由调用方决定：写入快照传入全部已提交序列，区间查询只传入
-// 名称与标签条件命中的序列；两者因此遵循同一套整理规则而各自保留数据范围。
-// 每条序列的标签只在入选时整理一次：排序后的键值对随条目保留，sort 的反复
-// 比较直接复用同一份结果，不会因一条序列参与多次比较而反复整理同一套标签。
-// 整理结果不复制采样点；写入快照的采样点选取与升序排列由 allSeriesPoints
-// 完成，区间查询只在点表上计数与求和。
+// 排列。入选范围由调用方决定：写入快照传入全部已提交序列，两种区间查询只
+// 传入名称与标签条件命中的序列；它们因此遵循同一套整理规则而各自保留数据
+// 范围。每条序列的标签只在入选时整理一次：排序后的键值对随条目保留，sort
+// 的反复比较直接复用同一份结果，不会因一条序列参与多次比较而反复整理同一
+// 套标签。整理结果不复制采样点；写入快照的采样点选取与升序排列由
+// allSeriesPoints 完成，均值查询只在点表上计数与求和，采样明细查询由
+// seriesPointsInRange 按区间选取并升序排列。
 func organizeSeries(selected []*storedSeries) []organizedSeries {
 	out := make([]organizedSeries, 0, len(selected))
 	for _, sr := range selected {
@@ -954,8 +1057,9 @@ func organizeSeries(selected []*storedSeries) []organizedSeries {
 
 // allSeriesPoints 按 timestamp 升序返回一条已存序列的全部采样点，数值与
 // 时间戳一一对应，供写入快照展示。返回的是新建切片与新建 Point，调用方对
-// 采样点的修改不影响存储，也不影响此前或此后取得的其他成功结果。区间查询
-// 不构造这样的明细列表，只在点表上计数与求和。
+// 采样点的修改不影响存储，也不影响此前或此后取得的其他成功结果。均值查询
+// 不构造这样的明细列表，只在点表上计数与求和；采样明细查询的区间版本由
+// seriesPointsInRange 提供。
 func allSeriesPoints(sr *storedSeries) []Point {
 	tsList := make([]int64, 0, len(sr.points))
 	for ts := range sr.points {
@@ -971,7 +1075,7 @@ func allSeriesPoints(sr *storedSeries) []Point {
 
 // snapshot 生成按规范排序的全部序列视图：入选范围是全部已提交序列，
 // 身份整理与次序来自 organizeSeries，点排列来自 allSeriesPoints；
-// 区间查询共用同一套身份整理，但只对命中序列统计点数与精确均值。
+// 两种区间查询共用同一套身份整理，各自只对命中序列统计均值或列出明细。
 func (s *MetricStore) snapshot(added, duplicates int) *BatchResult {
 	all := make([]*storedSeries, 0, len(s.series))
 	for _, sr := range s.series {

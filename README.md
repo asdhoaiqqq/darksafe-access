@@ -28,7 +28,7 @@ printf '%s\n' \
 
 同一对象内不允许重复键，且字段名是否重复以 JSON 转义还原后的字符为准：采样点同时直接书写 `name`、又把首字母 n 写成十六进制转义（`\u006eame`），还原后两个键都是 name，即重复指标名字段；`labels` 内的 `host` 与 `\u0068ost` 同理为重复标签键。两个值完全相同也必须失败，值不同也不会静默选用其中一个或解释成两个标签/采样值冲突。标签键的判重先于第二次值的类型校验：某个非空标签键第一次出现且值为合法字符串后再次出现，无论第二次的值是字符串、数字、布尔、null、对象还是数组，都报告重复标签键（原因指出转义还原后的键名），第二次值的类型不会把它掩盖成“标签值必须是字符串”；若该键第一次出现时值就不是字符串，仍报告那次值的类型错误。写入批次里出错采样点按数组中从 1 开始的位置给出 `index`，错误原因指出重复字段或标签键且不附带 `conflict`，该批次前面的合法新增点同样不提交，此前成功写入的数据仍可查询到原来的数量与均值；查询对象或其标签条件出现重复键时返回查询错误，不带 `index` 与 `conflict`，也不返回查询结果。判重只在同一个对象内进行：不同采样点各自携带同名字段、采样点的字段名与其标签键同名都合法；两个合法采样点表示同一序列、同一时间戳且值相等时仍按既有重复采样点规则忽略并计入 duplicates。字段名只以转义形式出现一次时与直接书写同名同义，可照常写入与查询。
 
-查询对 `[start,end]` 闭区间内的点按序列返回 `count` 与算术平均 `average`；`labels` 省略或为 `{}` 时匹配该指标的全部序列，否则按子集匹配。详见 `go run ./cmd/darksafe help`。
+查询对 `[start,end]` 闭区间内的点按序列返回 `count` 与算术平均 `average`；`labels` 省略或为 `{}` 时匹配该指标的全部序列，否则按子集匹配。需要查看区间内的原始采样点时，把对象行的 `op` 写为 `query_points`，沿用相同的查询条件取得采样明细（见下文「查看区间内原始采样点」）。详见 `go run ./cmd/darksafe help`。
 
 ## 重复与冲突：同一序列、同一时间戳的再次提交
 
@@ -275,6 +275,28 @@ printf '%s\n' \
 ```
 
 第二行写入是同值重复采样，被忽略（`duplicates` 计 1），不影响后续统计；第一条查询只覆盖时间戳 1000，`count` 为 1、`average` 为 2，区间外的 100 不参与；第二条查询的区间内没有任何点，返回空 `series` 数组。
+
+## 查看区间内原始采样点：query_points
+
+`query` 只返回每条序列的点数与平均值。发现均值异常时，往往还需要知道哪个时间戳存了什么值：把对象行的 `op` 写为 `query_points`，沿用与 `query` 完全相同的查询条件（`name` 精确匹配、`start`/`end` 为包含两个端点的 int64 毫秒整数、`labels` 可选的子集匹配），即可取得区间内的采样明细。`start` 与 `end` 相等时也允许查询，只返回该时间戳上的采样。
+
+成功结果为 `status` 为 `ok`、`op` 为 `query_points` 的逐行 JSON：`series` 中每条记录保留完整指标名与完整标签集合（不会缩减成查询条件），`points` 按时间戳升序列出区间内的 `timestamp` 与 `value`，不附加 `count` 或 `average`；`value` 是实际存储的 float64 值，时间戳保留 int64 整数精度。序列之间的排列次序与 `query` 成功结果一致；只列出区间内有点的序列——指标不存在、标签条件未命中或区间内没有点，都成功返回空的 `series` 数组。该操作只读取此前成功提交的数据，不改变采样值或写入计数；输入校验与失败原因的选择与 `query` 一致（倒置区间报错并指出实际边界，失败结果没有 `series`、`index` 或 `conflict`）。
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}},{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":3000,"value":9,"labels":{"host":"a"}}]' \
+  '{"op":"query_points","name":"cpu","start":1000,"end":2000,"labels":{"host":"a"}}' \
+  '{"op":"query_points","name":"cpu","start":3000,"end":3000,"labels":{"host":"a"}}' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":3,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2},{"timestamp":2000,"value":4},{"timestamp":3000,"value":9}]}]}
+{"status":"ok","op":"query_points","series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2},{"timestamp":2000,"value":4}]}]}
+{"status":"ok","op":"query_points","series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":3000,"value":9}]}]}
+```
+
+第一条明细查询的区间 `[1000,2000]` 包含两个端点，列出前两个点，3000 上的点不出现；第二条的起止时间相等，只返回 3000 上的采样。
 
 ## 技术方向
 

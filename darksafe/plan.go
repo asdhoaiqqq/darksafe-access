@@ -640,6 +640,10 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 }
 
 // chunkBatches splits the ascending IDs into batches of at most batchSize.
+// Each batch owns a private copy of its members with no spare capacity: a
+// slice expression over selected would leave later batches' slots inside the
+// earlier batch's capacity, so a caller appending a note to one batch could
+// overwrite another batch's clusters.
 func chunkBatches(selected []string, batchSize int) []Batch {
 	batches := []Batch{}
 	for i := 0; i < len(selected); i += batchSize {
@@ -647,7 +651,8 @@ func chunkBatches(selected []string, batchSize int) []Batch {
 		if end > len(selected) {
 			end = len(selected)
 		}
-		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: selected[i:end]})
+		members := append([]string(nil), selected[i:end]...)
+		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: members})
 	}
 	return batches
 }

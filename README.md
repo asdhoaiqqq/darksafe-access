@@ -216,6 +216,8 @@ go run ./cmd/darksafe plan plan.json
 - `darksafe.MakeReleasePlan(in)`：校验配置并计算计划，成功返回 `darksafe.ReleasePlan`（含 `App`、`Batches`、`Excluded`）和 `nil` 错误；失败返回**零值计划**和非空错误。它不会修改传入的 `in`。
 - `darksafe.ValidateReleaseInput(in)`：只检查配置是否合法，不做规划；`MakeReleasePlan` 在计算前会自动调用它，库调用方也可以单独调用（例如提前校验表单输入）。
 
+内存配置里的每个字符串都必须是**合法 UTF-8**：`App`、`Revision`、`Image`、`SpreadBy`，以及**全部候选集群**（即使已停用或注定被筛掉）的标识、标签键和值，还有每条包含/排除条件的键和值。Go 字符串可以携带非法 UTF-8 字节；若放过，两个不同的非法标识在把计划写成 JSON 时会被编码层一起改写成“�”而变成同一身份，非法标签值也会悄悄参与匹配与分批。因此这类配置在任何业务校验、筛选和分批**之前**就会被拒绝：`ValidateReleaseInput` 返回明确错误，`MakeReleasePlan` 返回非空错误和**零值计划**（不会修补原字符串、删除问题候选，也不会修改调用方的配置）。错误会说明是非法 UTF-8 并定位到字段（候选与条件位置从 0 开始；标签或条件值出错时指出对应键，键本身出错时指出所属的标签映射或条件对象）；多处同时有问题时只报告一个固定的问题，结果与 map 遍历顺序无关。合法文本一律按原字符串使用：中文、补充平面字符（如 😀）、用户真正输入的“�”都保持原样，普通文字里的反斜线与 `uD800` 也不是非法 UTF-8；标签空值仍可精确匹配，大小写与首尾空白仍不做归一化。
+
 下面是一个**完整、可独立运行**的示例（一个应用、一个修订、一份镜像配置），展示应用信息、候选集群、筛选条件与分批参数的传入方式，以及成功后如何读取批次和未入选原因：
 
 ```go
@@ -330,7 +332,7 @@ clusters[1]: 重复的集群标识 "c-a"
 
 | | 命令行 `plan <JSON文件>` | Go 库 `MakeReleasePlan` |
 |---|---|---|
-| 配置来源 | JSON 文件（经 `ParseReleaseInput` 解析，含无效 UTF-8 或未配对 Unicode 转义的字符串、重复 JSON 成员名都会被拒绝） | 内存中的 `ReleasePlanInput` 结构体 |
+| 配置来源 | JSON 文件（经 `ParseReleaseInput` 解析，含无效 UTF-8 或未配对 Unicode 转义的字符串、重复 JSON 成员名都会被拒绝） | 内存中的 `ReleasePlanInput` 结构体（应用信息、`spreadBy`、全部候选集群的标识与标签键值、包含/排除条件的键值都必须是合法 UTF-8，否则在筛选与分批之前被拒绝） |
 | 成功 | 退出码 0，完整计划写到标准输出 | 返回 `ReleasePlan, nil`，由调用方读取 `App`/`Batches`/`Excluded` |
 | 失败 | 非零退出，原因写到标准错误，标准输出为空 | 返回零值 `ReleasePlan` 和非空 `error`，错误说明具体原因 |
 | 可选的预校验 | — | `ValidateReleaseInput` 只校验合法性，不保证有集群可发布 |

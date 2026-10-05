@@ -360,16 +360,29 @@ func checkSpreadBy(s string) error {
 	return nil
 }
 
-// ValidateReleaseInput checks that a release configuration is well-formed:
-// app/revision/image are non-empty, batchSize is a positive integer, spreadBy
-// is empty or a usable tag key (not whitespace-only), cluster
-// IDs are unique across every candidate (including disabled and filtered-out
-// clusters), and tag/condition keys are non-empty. Errors name the field and
-// the position in its list; within a cluster the ID is checked before its
-// tags, and tag keys are examined in ascending order so repeated calls report
-// the same error. The input is never mutated. MakeReleasePlan calls this
-// automatically; library callers may use it to validate without planning.
+// ValidateReleaseInput checks that a release configuration is well-formed.
+// Every string is first required to be legal UTF-8 — app, revision, image,
+// spreadBy, every candidate's ID and tag keys/values (disabled and
+// filtered-out candidates included), and every include/exclude condition's
+// keys and values — because invalid bytes would later be rewritten to "�"
+// while the plan is written as JSON and could merge two distinct identities
+// or take part in label matching as an ordinary value. That text check runs
+// before any business rule, in a fixed order (field order, then candidate
+// and condition positions from zero, then keys in ascending order), so the
+// one problem it reports never depends on map iteration. Business
+// validation then runs as before: app/revision/image are non-empty,
+// batchSize is a positive integer, spreadBy is empty or a usable tag key
+// (not whitespace-only), cluster IDs are unique across every candidate
+// (including disabled and filtered-out clusters), and tag/condition keys
+// are non-empty. Errors name the field and the position in its list; within
+// a cluster the ID is checked before its tags, and tag keys are examined in
+// ascending order so repeated calls report the same error. The input is
+// never mutated. MakeReleasePlan calls this automatically; library callers
+// may use it to validate without planning.
 func ValidateReleaseInput(in ReleasePlanInput) error {
+	if err := validateStrictText(in); err != nil {
+		return err
+	}
 	if strings.TrimSpace(in.App) == "" {
 		return errors.New(`字段 "app" 不能为空或只含空白`)
 	}

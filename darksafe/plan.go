@@ -613,8 +613,12 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 		var b strings.Builder
 		b.WriteString("没有符合规则的可用集群，各候选集群未入选原因：")
 		for _, e := range excluded {
+			// excluded is sorted by the original ID; the ID is rendered for
+			// display only (clusterIDForReport) so a legal ID carrying
+			// newlines, carriage returns or other control characters still
+			// occupies exactly one record that decodes back to that ID.
 			b.WriteString("\n  ")
-			b.WriteString(e.ID)
+			b.WriteString(clusterIDForReport(e.ID))
 			b.WriteString("：")
 			b.WriteString(e.Reason)
 		}

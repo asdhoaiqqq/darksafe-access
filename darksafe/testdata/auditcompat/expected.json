@@ -1,0 +1,42 @@
+{
+  "org": "acme",
+  "checkpoint": {
+    "endSeq": 4,
+    "fingerprint": "9c05da4b1ed796123a663a92bb06755762fc5d04d98977d627ec02fa147bb775"
+  },
+  "records": [
+    {
+      "seq": 1,
+      "kind": "policy_change",
+      "fingerprint": "7afffb7a25c008e9c881bc43ea6bcd2214b07ff66151deaa47fbf54eb7c983aa",
+      "prevFingerprint": "7eb86f4d4949c004d90f09cee40af1029342326b3df0d39cb2e028b535ed5ca0"
+    },
+    {
+      "seq": 2,
+      "kind": "decision",
+      "fingerprint": "fc4e9fa3c92ba5716dd92bf0d677a8296e0ae9d61dee5bf07fbcedf62cbd4495",
+      "prevFingerprint": "7afffb7a25c008e9c881bc43ea6bcd2214b07ff66151deaa47fbf54eb7c983aa"
+    },
+    {
+      "seq": 3,
+      "kind": "decision",
+      "fingerprint": "f016dedd7a00711997dda3b32c00da16b0ecbf7f785692561dbb9b276f6cf4e0",
+      "prevFingerprint": "fc4e9fa3c92ba5716dd92bf0d677a8296e0ae9d61dee5bf07fbcedf62cbd4495"
+    },
+    {
+      "seq": 4,
+      "kind": "decision",
+      "fingerprint": "9c05da4b1ed796123a663a92bb06755762fc5d04d98977d627ec02fa147bb775",
+      "prevFingerprint": "f016dedd7a00711997dda3b32c00da16b0ecbf7f785692561dbb9b276f6cf4e0"
+    }
+  ],
+  "targetSeq": 2,
+  "target": {
+    "allowed": true,
+    "reason": "matched allow policy",
+    "matched": [
+      "p1"
+    ],
+    "version": 1
+  }
+}

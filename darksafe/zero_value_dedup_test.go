@@ -256,6 +256,75 @@ func TestZeroDedupSubnormalConflictsWithZero(t *testing.T) {
 	}
 }
 
+// TestZeroDedupDuplicateDoesNotRewriteConflictExisting 回归保障：同一批内先遇到
+// 等值重复、随后在同一位置发生冲突时，冲突报告的 existing 与文字原因必须如实
+// 对应首次接受的已存值，不能被本批被忽略的重复采样改写。
+//
+//   - 已存正零时，本批先提交负零（重复、忽略）再提交 5e-324（冲突）：
+//     existing 是正零，文字原因显示 "already has value 0" 而不是 -0。
+//   - 已存负零时，本批先提交正零再提交非零值：existing 与文字原因都保留负零符号。
+//   - 该位置此前未写入时，existing 取本批首次接受的值（含零值符号），
+//     后续等值重复（无论重复几次、用哪种零写法）都不替换它。
+//   - 发生冲突后整批（含前面的合法新增点）都不提交，已存原值保持原样。
+func TestZeroDedupDuplicateDoesNotRewriteConflictExisting(t *testing.T) {
+	// 已存正零：批内先重复 -0 再冲突 5e-324，existing 仍是正零。
+	store := NewMetricStore()
+	mustOK(t, store, `[{"name":"cpu","labels":{"host":"a"},"timestamp":1000,"value":0}]`)
+	lerr := mustFail(t, store, `[
+		{"name":"cpu","labels":{"host":"a"},"timestamp":2000,"value":7},
+		{"name":"cpu","labels":{"host":"a"},"timestamp":1000,"value":-0},
+		{"name":"cpu","labels":{"host":"a"},"timestamp":1000,"value":5e-324}
+	]`)
+	assertConflictDetail(t, lerr, 3,
+		`conflict: series cpu{host=a} at timestamp 1000 already has value 0, submitted 5e-324`,
+		"cpu", map[string]string{"host": "a"}, 1000, 0, 5e-324)
+	if math.Signbit(lerr.Conflict.Existing) {
+		t.Fatalf("existing = %v, want +0 (stored sign), not the ignored duplicate -0",
+			lerr.Conflict.Existing)
+	}
+	// 整批回滚：ts=2000 的新增点不留下，只剩原来的正零点。
+	q := mustQuery(t, store, `{"op":"query","name":"cpu","start":0,"end":3000}`)
+	if len(q.Series) != 1 || q.Series[0].Count != 1 || q.Series[0].Average != 0 {
+		t.Fatalf("query after conflict = %+v, want only the original zero point", q.Series)
+	}
+
+	// 已存负零：批内先重复 +0 再冲突，existing 与文字原因保留负号。
+	store = NewMetricStore()
+	mustOK(t, store, `[{"name":"cpu","labels":{"host":"a"},"timestamp":1000,"value":-0.0}]`)
+	lerr = mustFail(t, store, `[
+		{"name":"cpu","labels":{"host":"a"},"timestamp":1000,"value":0},
+		{"name":"cpu","labels":{"host":"a"},"timestamp":1000,"value":5e-324}
+	]`)
+	assertConflictDetail(t, lerr, 2,
+		`conflict: series cpu{host=a} at timestamp 1000 already has value -0, submitted 5e-324`,
+		"cpu", map[string]string{"host": "a"}, 1000, 0, 5e-324)
+	if !math.Signbit(lerr.Conflict.Existing) {
+		t.Fatalf("existing = %v, want -0 (stored sign)", lerr.Conflict.Existing)
+	}
+
+	// 位置此前未写入：本批首次接受 -0，随后各种零写法重复多次，
+	// existing 仍取首次接受的 -0；冲突后该位置（连同整批）不留下任何点。
+	store = NewMetricStore()
+	lerr = mustFail(t, store, `[
+		{"name":"m","timestamp":1000,"value":-0},
+		{"name":"m","timestamp":1000,"value":0},
+		{"name":"m","timestamp":1000,"value":0.0},
+		{"name":"m","timestamp":1000,"value":1e-400},
+		{"name":"m","timestamp":1000,"value":-1e-400},
+		{"name":"m","timestamp":1000,"value":5e-324}
+	]`)
+	assertConflictDetail(t, lerr, 6,
+		`conflict: series m{} at timestamp 1000 already has value -0, submitted 5e-324`,
+		"m", map[string]string{}, 1000, 0, 5e-324)
+	if !math.Signbit(lerr.Conflict.Existing) {
+		t.Fatalf("existing = %v, want -0 (first accepted in batch)", lerr.Conflict.Existing)
+	}
+	q = mustQuery(t, store, `{"op":"query","name":"m","start":0,"end":3000}`)
+	if len(q.Series) != 0 {
+		t.Fatalf("query after conflict = %+v, want no committed points", q.Series)
+	}
+}
+
 // TestZeroDedupDistinctTimestampsAndZeroAverages 覆盖写入后的区间查询：
 // 同一位置被忽略的重复不增加 count；零值出现在不同时间戳时是不同采样点，
 // 每个已成功提交的点都参与计数；精确均值为零（含正负零混合、+1/-1 抵消）

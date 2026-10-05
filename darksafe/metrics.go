@@ -625,10 +625,14 @@ func (s *MetricStore) ingestItems(items []json.RawMessage) (*BatchResult, *LineE
 					return nil, conflictAt(pos, sr.ref, p.ts, old, p.value)
 				}
 				// 与此前批次已写入的值相同：重复，成功忽略。
+				// seen 记录的是已存值 old 而不是本次提交的 p.value：
+				// 数值相等但表示不同（如已存 +0、本次提交 -0）时，
+				// 本批后续在同位置的冲突必须如实报告首次接受的已存值，
+				// 不能被这条被忽略的重复改写。
 				if seen[id] == nil {
 					seen[id] = map[int64]float64{}
 				}
-				seen[id][p.ts] = p.value
+				seen[id][p.ts] = old
 				continue
 			}
 		}

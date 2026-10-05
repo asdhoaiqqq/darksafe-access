@@ -72,6 +72,56 @@ decide  (subject org mismatch)     : allowed=false reason="organization mismatch
 - 请求缺少资源 ID、主体停用或组织不一致时，仍按既有信封规则拒绝，资源限定不能绕过任何检查。
 - 限定作为策略内容随版本保存：历史查询、回滚、`Review`、`RecheckDecision` 与离线复核都使用当时的限定；事后把策略从甲改到乙不影响旧决策的复核结论。限定字段纳入审计指纹（为空时沿用历史指纹编码，旧记录与旧导出的指纹、检查点不变），修改导出材料中的限定而保留原指纹与检查点会导致校验失败；含非 UTF-8 字节时按原始字节保存与校验。
 
+### 跨作用域示例：上级递归拒绝为什么压过下级精确允许
+
+`Decide` 的冲突规则不是"更具体者胜"，而是**拒绝优先（deny-overrides）**：先按主体、动作、作用域（含 `Recursive` 子作用域）与可选资源限定找出**全部**命中策略；只要其中有一条拒绝，结果就是拒绝（理由 `matched deny policy`），作用域更精确的允许不会把它"覆盖"掉。命中列表保留**所有**命中策略的标识并按标识升序排列——包括被压过的那条允许，它是冲突可复核的证据，而不是被最终决定抹掉。完整跨层级示例是 [`examples/scope_deny_override/main.go`](examples/scope_deny_override/main.go)，只依赖本项目公开 API 与 Go 标准库，自行创建内存存储并真实发布策略：
+
+```bash
+go run ./examples/scope_deny_override
+```
+
+这里描述的是**组织级已发布策略**对 `Store.Decide` 的判断规则；演示入口 `Access` 的主体角色（包括 `owner`）在这里完全不参与评估，示例主体因此不带任何角色。
+
+场景固定为一个组织、一个启用主体、一份资源的读取操作：决策组织、主体组织、资源组织均为 `acme`；主体 `u1`（启用）、资源 `doc-1`、动作 `read`。同一程序连续发布三个完整策略集（版本 1、2、3），每个结果都打印允许与否、理由、命中策略与**此次实际评估的已发布版本**。
+
+**情形 1（版本 1，拒绝）**：同一次发布包含两条策略，都针对主体 `u1`、动作 `read`，均不限定具体资源标识（`resource-id=""`）：
+
+- `a-child-allow`：作用域 `org/a/b`、效果 allow、`Recursive=false`（精确允许下级读取）；
+- `z-parent-deny`：作用域 `org/a`、效果 deny、`Recursive=true`（递归拒绝覆盖整个子树）。
+
+请求资源位于 `org/a/b`。子作用域精确命中允许，递归的上级拒绝也命中该子作用域——拒绝优先，`Decide` 返回拒绝；命中列表按标识升序同时包含两条策略（`a-child-allow` 在 `z-parent-deny` 之前是按标识排序，与发布顺序无关），版本为实际评估的 1。
+
+**情形 2（版本 2，对照一：上级拒绝改为不递归）**：把上级拒绝重新发布为 `Recursive=false`，下级允许不变，请求完全相同。不递归策略只覆盖自身作用域 `org/a`，对 `org/a/b` 的读取它**不命中**；结果只命中下级允许 `a-child-allow` 并通过，版本 2。注意：起作用的是这条命中的允许——拒绝未命中**不等于自动允许**，若此时没有任何允许策略命中，结果仍是默认拒绝（理由 `no matching allow policy`）。
+
+**情形 3（版本 3，对照二：`org/ab` 不是 `org/a` 的下级）**：恢复 `org/a` 的递归拒绝，另为 `org/ab` 配置一条精确允许 `ab-exact-allow`，请求读取 `org/ab` 下的 `doc-1`。作用域层级按**斜杠分隔的段**匹配：递归覆盖要求请求作用域等于策略作用域或以"策略作用域 + `/`"开头，所以 `org/ab` 与 `org/a` 只是名称前缀相近的**同级**，不是后代；递归拒绝不能命中，读取只命中 `org/ab` 上这条精确允许并通过，版本 3。不能把作用域当字符串前缀理解（否则会误以为 `org/a` 管到 `org/ab`），也不能把未命中拒绝当作放行依据。
+
+预期输出（确定性，重复运行逐字节一致；策略集与请求紧邻决策打印，可直接对照）：
+
+```text
+case 1: recursive parent deny vs more specific child allow
+  published as version 1 (2 policies):
+    policy id="a-child-allow" subject="u1" action="read" scope="org/a/b" effect="allow" recursive=false resource-id=""
+    policy id="z-parent-deny" subject="u1" action="read" scope="org/a" effect="deny" recursive=true resource-id=""
+  request: decision-org="acme" subject-org="acme" resource-org="acme" subject="u1" disabled=false resource="doc-1" scope="org/a/b" action="read"
+  decide : allowed=false reason="matched deny policy" matched=["a-child-allow" "z-parent-deny"] version=1
+
+case 2: parent deny made non-recursive, same child read
+  published as version 2 (2 policies):
+    policy id="a-child-allow" subject="u1" action="read" scope="org/a/b" effect="allow" recursive=false resource-id=""
+    policy id="z-parent-deny" subject="u1" action="read" scope="org/a" effect="deny" recursive=false resource-id=""
+  request: decision-org="acme" subject-org="acme" resource-org="acme" subject="u1" disabled=false resource="doc-1" scope="org/a/b" action="read"
+  decide : allowed=true reason="matched allow policy" matched=["a-child-allow"] version=2
+
+case 3: recursive deny on org/a cannot reach the sibling scope org/ab
+  published as version 3 (2 policies):
+    policy id="z-parent-deny" subject="u1" action="read" scope="org/a" effect="deny" recursive=true resource-id=""
+    policy id="ab-exact-allow" subject="u1" action="read" scope="org/ab" effect="allow" recursive=false resource-id=""
+  request: decision-org="acme" subject-org="acme" resource-org="acme" subject="u1" disabled=false resource="doc-1" scope="org/ab" action="read"
+  decide : allowed=true reason="matched allow policy" matched=["ab-exact-allow"] version=3
+```
+
+归纳：拒绝优先是**命中集合内**的效果裁决，不按作用域深浅或发布顺序比较；`Recursive` 决定一条策略的作用域是否覆盖斜杠分段意义上的后代；命中列表始终是全部命中策略标识的升序去重列表；`version` 是这次评估实际使用的已发布版本（三个情形分别为 1、2、3）。
+
 ## 组织审计链
 
 每次成功的发布、回滚，以及每次指定了非空决策组织的 `Decide`，都会在该组织追加一条不可变记录。失败的发布/回滚不改变策略状态、版本号与审计记录；缺少决策组织的 `Decide`、以及 `Review` 和按审计记录复核均为只读，不产生记录。

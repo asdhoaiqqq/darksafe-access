@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strings"
 )
@@ -451,6 +452,14 @@ func requiredString(doc map[string]any, field string) (string, error) {
 	return s, nil
 }
 
+// positiveInt reads a required field as a positive integer. The literal must
+// be an integral JSON number whose value is representable in full by the Go
+// int of the running environment: a value beyond math.MaxInt is rejected here
+// rather than narrowed by an int() conversion, which on a 32-bit environment
+// could turn 4294967297 into 1 (or a larger value into zero or a negative
+// number). No truncation, rounding, default substitution or clamping to the
+// maximum ever happens — such a value is a configuration error regardless of
+// what int it would collapse into.
 func positiveInt(doc map[string]any, field string) (int, error) {
 	v, ok := doc[field]
 	if !ok {
@@ -461,7 +470,7 @@ func positiveInt(doc map[string]any, field string) (int, error) {
 		return 0, fmt.Errorf("字段 %q 必须是正整数", field)
 	}
 	i, err := n.Int64()
-	if err != nil || i <= 0 {
+	if err != nil || i <= 0 || i > math.MaxInt {
 		return 0, fmt.Errorf("字段 %q 必须是正整数", field)
 	}
 	return int(i), nil

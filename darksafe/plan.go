@@ -312,11 +312,11 @@ func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {
 	if err != nil {
 		return ReleasePlanInput{}, err
 	}
-	include, err := parseConditions(doc["include"], "include")
+	include, err := parseConditions(doc, "include")
 	if err != nil {
 		return ReleasePlanInput{}, err
 	}
-	exclude, err := parseConditions(doc["exclude"], "exclude")
+	exclude, err := parseConditions(doc, "exclude")
 	if err != nil {
 		return ReleasePlanInput{}, err
 	}
@@ -535,8 +535,14 @@ func clusterIDFromJSON(obj map[string]any, index int, ids *clusterIDSet) (string
 	return id, nil
 }
 
-func parseConditions(v any, field string) ([]LabelCondition, error) {
-	if v == nil {
+// parseConditions reads the optional include/exclude field from the decoded
+// document. An absent field means "no conditions" (the same as an explicit
+// empty array); a field that is present must be an array of condition
+// objects. An explicit JSON null is a field type error — it must not be read
+// as "no conditions", which would silently drop the filter the author wrote.
+func parseConditions(doc map[string]any, field string) ([]LabelCondition, error) {
+	v, ok := doc[field]
+	if !ok {
 		return []LabelCondition{}, nil
 	}
 	raw, ok := v.([]any)

@@ -72,6 +72,90 @@ decide  (subject org mismatch)     : allowed=false reason="organization mismatch
 - 请求缺少资源 ID、主体停用或组织不一致时，仍按既有信封规则拒绝，资源限定不能绕过任何检查。
 - 限定作为策略内容随版本保存：历史查询、回滚、`Review`、`RecheckDecision` 与离线复核都使用当时的限定；事后把策略从甲改到乙不影响旧决策的复核结论。限定字段纳入审计指纹（为空时沿用历史指纹编码，旧记录与旧导出的指纹、检查点不变），修改导出材料中的限定而保留原指纹与检查点会导致校验失败；含非 UTF-8 字节时按原始字节保存与校验。
 
+### 完整示例：失败的替换提交为什么没有改变已有授权
+
+`Publish` 是**整套替换 + 乐观版本**：每次提交必须给出"我以为当前是哪个版本"（`expectedVersion`，首次发布为 0），提交内容是**完整的新策略集**而不是对旧集的增量；集内任意一条策略非法，整次提交失败。完整程序是 [`examples/publish_atomic_failure/main.go`](examples/publish_atomic_failure/main.go)，只依赖本项目公开 API 与 Go 标准库，自行建立内存存储与请求，本机离线即可复现：
+
+```bash
+go run ./examples/publish_atomic_failure
+```
+
+场景始终围绕**同一组织、同一启用主体对同一资源的读取**：决策组织、主体组织、资源组织均为 `acme factory`，主体 `svc-audit-reader` 启用，资源 `ledger-2026` 位于合法作用域 `acme/factory/ledger`，动作 `read`。请求信封完全合法，因此访问结论只由该组织**当前已发布策略**决定（组织级默认拒绝、拒绝策略优先，主体角色完全不参与）。程序依次做五件事：
+
+1. **发布一组允许读取的策略（版本 1）**：一条 `p-ledger-read-allow`（allow）。同一读取立即被允许，理由 `matched allow policy`，命中该策略，实际版本 1。
+2. **提交打算改为拒绝读取的新策略集**：集内有一条合法的拒绝策略 `p-ledger-read-deny`、一条作用域无关的合法允许，以及一条作用域带**连续斜杠**（`acme//bad`）的非法策略。这次必须整体报 `ErrInvalidPolicySet`——集内那条合法的拒绝策略**不能先被应用**；当前版本仍是 1。
+3. **失败之后再发起一次完全相同的读取来观察效果**：仍然允许，理由、命中标识与实际版本全部来自**原策略集版本 1**。注意区分：**失败的发布本身不增加任何审计记录**，原有检查点也不动；这次读取是之后为观察效果而发起的**决策**，按既有规则它会留下一条决策记录——这条记录不能算作失败发布产生的变更。
+4. **把非法策略修正后，以未变的当前版本 1 重新提交整组策略**：生成紧接原版本的**新版本 2**，同一读取转为明确拒绝（理由 `matched deny policy`，命中 `p-ledger-read-deny`，实际版本 2）。发布是**替换整组内容**而非追加：版本 2 恰好包含提交的 3 条策略，旧的 `p-ledger-read-allow` 已不在版本 2 中；但历史不可改写，`Policies(org, 1)` 仍能查到版本 1 的原内容。策略变更记录（序号 4）保存的是**完整新策略集**。
+5. **版本边界**：策略内容合法但预期版本已经过期（当前已是 2，仍按 1 提交）时返回 `ErrVersionConflict`：不覆盖当前策略、不占用版本号、不留下变更记录；读取仍由版本 2 拒绝。使用者需要先依据当前版本（`CurrentVersion` 或重新读取）决定是否再次提交。
+
+预期输出（确定性，重复运行逐字节一致）。输出刻意把三个不同的编号空间分开标注——**发布返回的版本**（`returned-version` / `published-version`）、**访问实际使用的版本**（`actually-used-version` / `used-version`）与**审计记录序号**（`seq`）是三个各自独立的数字，不能当成同一个数：
+
+```text
+step 1: publish allow-read policies as version 1
+publish: ok returned-version=1
+audit: 1 record(s), checkpoint end-seq=1
+  seq=1 policy_change published-version=1 policies=1
+decide : allowed=true reason="matched allow policy" matched=["p-ledger-read-allow"] actually-used-version=1
+
+step 2: submit deny-read set containing an invalid policy (consecutive slashes)
+submitted set (3 policies; publish replaces the whole set, not appends):
+  policy id="p-ledger-read-deny" subject="svc-audit-reader" action="read" scope="acme/factory/ledger" effect="deny"
+  policy id="p-other-scope-allow" subject="svc-other" action="read" scope="acme/other/scope" effect="allow"
+  policy id="p-bad-scope" subject="svc-audit-reader" action="read" scope="acme//bad" effect="allow"
+publish: failed returned-version=0 err=darksafe: invalid policy set: policy "p-bad-scope" has invalid scope: scope "acme//bad" contains consecutive slashes
+current version still 1; no version consumed, no policy-change record appended
+audit: 2 record(s), checkpoint end-seq=2
+  seq=1 policy_change published-version=1 policies=1
+  seq=2 decision     subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-allow"] used-version=1
+
+step 3: re-decide the same read to observe the effect (this is a new decision, not the failed publish)
+decide : allowed=true reason="matched allow policy" matched=["p-ledger-read-allow"] actually-used-version=1
+the read is still decided by v1: same reason, matched id and actually-used version
+audit: 3 record(s), checkpoint end-seq=3
+  seq=1 policy_change published-version=1 policies=1
+  seq=2 decision     subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-allow"] used-version=1
+  seq=3 decision     subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-allow"] used-version=1
+
+step 4: correct the bad policy and resubmit the whole set against current version 1
+submitted set (3 policies; publish replaces the whole set, not appends):
+  policy id="p-ledger-read-deny" subject="svc-audit-reader" action="read" scope="acme/factory/ledger" effect="deny"
+  policy id="p-other-scope-allow" subject="svc-other" action="read" scope="acme/other/scope" effect="allow"
+  policy id="p-bad-scope" subject="svc-audit-reader" action="read" scope="acme/legal/scope" effect="allow"
+publish: ok returned-version=2 (immediate next version after the failed attempt)
+decide : allowed=false reason="matched deny policy" matched=["p-ledger-read-deny"] actually-used-version=2
+deny-overrides: the valid allow on a different scope does not match; only the deny hits
+audit: 5 record(s), checkpoint end-seq=5
+  seq=1 policy_change published-version=1 policies=1
+  seq=2 decision     subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-allow"] used-version=1
+  seq=3 decision     subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-allow"] used-version=1
+  seq=4 policy_change published-version=2 policies=3
+  seq=5 decision     subject=svc-audit-reader allowed=false reason="matched deny policy" matched=["p-ledger-read-deny"] used-version=2
+replacement proven: version 2 holds the 3 submitted policies (no "p-ledger-read-allow"), version 1 still has it
+
+step 5: resubmit valid content with a stale expected version
+submitted set (1 policies; publish replaces the whole set, not appends):
+  policy id="p-stale-allow" subject="svc-audit-reader" action="read" scope="acme/factory/ledger" effect="allow"
+publish: failed returned-version=0 err=darksafe: version conflict: expected 1, current is 2
+current version still 2; no override, no change record; retry against current version
+decide : allowed=false reason="matched deny policy" matched=["p-ledger-read-deny"] actually-used-version=2
+
+audit: 6 record(s), checkpoint end-seq=6
+  seq=1 policy_change published-version=1 policies=1
+  seq=2 decision     subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-allow"] used-version=1
+  seq=3 decision     subject=svc-audit-reader allowed=true reason="matched allow policy" matched=["p-ledger-read-allow"] used-version=1
+  seq=4 policy_change published-version=2 policies=3
+  seq=5 decision     subject=svc-audit-reader allowed=false reason="matched deny policy" matched=["p-ledger-read-deny"] used-version=2
+  seq=6 decision     subject=svc-audit-reader allowed=false reason="matched deny policy" matched=["p-ledger-read-deny"] used-version=2
+```
+
+对照输出可以看清三个编号空间：
+
+- **发布返回的版本**：步骤 1 成功返回 1；步骤 2、5 失败时返回 0（没有可用的新版本，也不占用版本号）；步骤 4 成功返回 2——失败的提交不占号，所以修正后直接紧接 1 成为 2。
+- **访问实际使用的版本**：每条决策末尾的 `used-version`。步骤 2 之后（序号 2、3）读取仍用版本 1，所以理由与命中都是旧策略；步骤 4 之后（序号 5）与步骤 5 之后（序号 6）用版本 2，拒绝理由与命中来自新集。
+- **审计记录序号**：`seq` 是组织内从 1 连续递增的链位置。序号 2、3、5、6 是四次 `Decide` 各自留下的决策记录；步骤 2 的失败发布在序号 1 与序号 3 之间**没有插入任何记录**（链从 2 条直接到 3 条，新增的那条是步骤 3 的观察决策），序号 4 才是成功发布版本 2 的策略变更记录——`seq=4` 与 `published-version=2` 同时出现在一条记录上，正说明序号与版本不是同一个数。
+
+失败的提交（无论 `ErrInvalidPolicySet` 还是 `ErrVersionConflict`）都是"什么都没发生"：当前版本、各历史版本内容、审计记录与检查点指纹全部保持提交前的状态；之后发起的决策才会按当时的当前版本评估并照常留痕。已有的演示（`Access`）、发布、回滚（`Rollback`）与复核（`Review`、`RecheckDecision`、离线复核）用法均不受影响。
+
 ### 跨作用域示例：上级递归拒绝为什么压过下级精确允许
 
 `Decide` 的冲突规则不是"更具体者胜"，而是**拒绝优先（deny-overrides）**：先按主体、动作、作用域（含 `Recursive` 子作用域）与可选资源限定找出**全部**命中策略；只要其中有一条拒绝，结果就是拒绝（理由 `matched deny policy`），作用域更精确的允许不会把它"覆盖"掉。命中列表保留**所有**命中策略的标识并按标识升序排列——包括被压过的那条允许，它是冲突可复核的证据，而不是被最终决定抹掉。完整跨层级示例是 [`examples/scope_deny_override/main.go`](examples/scope_deny_override/main.go)，只依赖本项目公开 API 与 Go 标准库，自行创建内存存储并真实发布策略：

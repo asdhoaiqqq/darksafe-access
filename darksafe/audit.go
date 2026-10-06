@@ -471,8 +471,10 @@ type AuditPage struct {
 	Checkpoint Checkpoint
 }
 
-// recordMatches reports whether a record survives the query filters.
-func recordMatches(r *AuditRecord, kind, subjectID string) bool {
+// recordMatches reports whether a record survives the query filters. Every
+// set filter is a conjunction: kind, subject and resource conditions must
+// all hold. Empty filter values mean "not set".
+func recordMatches(r *AuditRecord, kind, subjectID, resourceID string) bool {
 	if kind != "" && r.Kind != kind {
 		return false
 	}
@@ -483,7 +485,35 @@ func recordMatches(r *AuditRecord, kind, subjectID string) bool {
 			return false
 		}
 	}
+	if resourceID != "" {
+		// A resource filter selects decision records whose request named
+		// exactly this resource. Policy-change records never match, even when
+		// a published policy carries the identical ResourceID: the condition
+		// reads the requested resource, not policy content. The comparison is
+		// Go string equality over the stored raw bytes, so case, surrounding
+		// and internal spaces, control bytes and invalid UTF-8 are all
+		// significant, and no path or wildcard is interpreted.
+		if r.Kind != AuditDecision || r.Decision == nil ||
+			r.Decision.Request.Resource.ID != resourceID {
+			return false
+		}
+	}
 	return true
+}
+
+// optionalResourceCondition extracts the optional resource condition passed
+// as the trailing variadic argument. An absent argument or an empty string
+// means "no resource filter"; supplying more than one condition is a caller
+// error rather than a silently picked value.
+func optionalResourceCondition(conds []string) (string, error) {
+	switch len(conds) {
+	case 0:
+		return "", nil
+	case 1:
+		return conds[0], nil
+	default:
+		return "", fmt.Errorf("%w: at most one resource condition may be set, got %d", ErrInvalidPage, len(conds))
+	}
 }
 
 // AuditQuery pins the first page of an audit query. startSeq is the first
@@ -491,7 +521,23 @@ func recordMatches(r *AuditRecord, kind, subjectID string) bool {
 // currently stored". The returned checkpoint must be passed to AuditPage
 // for the following pages, so records appended after the first query never
 // mix into later pages.
-func (s *Store) AuditQuery(org string, startSeq, pageSize int, kind, subjectID string) (*AuditPage, error) {
+//
+// kind and subjectID are the existing optional filters (empty means unset):
+// kind selects a record category and subjectID selects one subject's
+// decision records. The optional trailing resourceID adds a resource
+// condition, empty or absent meaning unset: only decision records whose
+// requested resource ID equals it byte-for-byte survive — case sensitive,
+// spaces and control bytes significant, no path or wildcard interpretation,
+// invalid UTF-8 kept as-is — and policy-change records never survive it,
+// even when a published policy names the same resource ID. Every set
+// condition applies together. A resource filter changes only which records
+// are returned: paging, checkpoints and detached copies behave exactly as
+// without it, and omitting it preserves the historical call and its results.
+func (s *Store) AuditQuery(org string, startSeq, pageSize int, kind, subjectID string, resourceID ...string) (*AuditPage, error) {
+	resource, err := optionalResourceCondition(resourceID)
+	if err != nil {
+		return nil, err
+	}
 	if org == "" {
 		return nil, ErrMissingOrganization
 	}
@@ -517,13 +563,23 @@ func (s *Store) AuditQuery(org string, startSeq, pageSize int, kind, subjectID s
 	if startSeq > end {
 		return nil, fmt.Errorf("%w: start sequence %d is beyond end sequence %d", ErrInvalidRange, startSeq, end)
 	}
-	return s.auditPageLocked(org, startSeq, end, fingerprint, pageSize, kind, subjectID), nil
+	return s.auditPageLocked(org, startSeq, end, fingerprint, pageSize, kind, subjectID, resource), nil
 }
 
 // AuditPage returns one page of a previously pinned query. nextSeq is the
 // cursor from the previous page; when it is 0 the range is exhausted. The
 // checkpoint is re-verified against the chain on every call.
-func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID string) (*AuditPage, error) {
+//
+// The filters are the same as AuditQuery's and must agree with the pinned
+// query: pass the same kind, subjectID and optional resourceID on every
+// page. The resource condition is an exact raw-byte match over requested
+// resource IDs and excludes policy-change records, exactly as on the first
+// page; omitting it keeps the historical call and result shape.
+func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID string, resourceID ...string) (*AuditPage, error) {
+	resource, err := optionalResourceCondition(resourceID)
+	if err != nil {
+		return nil, err
+	}
 	if cp.Org == "" {
 		return nil, ErrMissingOrganization
 	}
@@ -570,13 +626,15 @@ func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID 
 	if nextSeq == cp.EndSeq+1 {
 		return &AuditPage{Org: cp.Org, BeginSeq: nextSeq, EndSeq: cp.EndSeq, Checkpoint: cp}, nil
 	}
-	return s.auditPageLocked(cp.Org, nextSeq, cp.EndSeq, wantFP, pageSize, kind, subjectID), nil
+	return s.auditPageLocked(cp.Org, nextSeq, cp.EndSeq, wantFP, pageSize, kind, subjectID, resource), nil
 }
 
 // auditPageLocked scans forward collecting up to pageSize matching records
 // and computes the next-page cursor. It does not stop at pageSize raw
-// records: filtering happens within the pinned [start,end] window.
-func (s *Store) auditPageLocked(org string, startSeq, endSeq int, endFP string, pageSize int, kind, subjectID string) *AuditPage {
+// records: filtering happens within the pinned [start,end] window, so
+// non-matching records between matches — including policy changes excluded
+// by a resource condition — never consume page slots.
+func (s *Store) auditPageLocked(org string, startSeq, endSeq int, endFP string, pageSize int, kind, subjectID, resourceID string) *AuditPage {
 	st := s.orgs[org]
 	// pageSize only bounds how many records this page returns; it must not
 	// drive allocation. A caller may pass any positive value, including the
@@ -591,7 +649,7 @@ func (s *Store) auditPageLocked(org string, startSeq, endSeq int, endFP string, 
 	i := startSeq
 	for ; i <= endSeq && len(out) < pageSize; i++ {
 		r := st.audit[i-1]
-		if recordMatches(r, kind, subjectID) {
+		if recordMatches(r, kind, subjectID, resourceID) {
 			out = append(out, *cloneRecord(r))
 		}
 	}

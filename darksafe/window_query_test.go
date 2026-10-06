@@ -474,7 +474,34 @@ func TestQueryWindowsStepOnlyForNewOp(t *testing.T) {
 	lerr = mustQueryFail(t, store, `{"step":1000,"op":"query","name":"cpu","start":0,"end":2000}`)
 	assertQueryError(t, lerr, `unknown field "step"`)
 
-	// 既有两种查询省略 step 的输入输出完全不变。
+	// step 写在 op 之前时，值是否合法不影响未知字段判定：零、字符串、对象
+	// 都按未知字段拒绝，绝不退化成窗口宽度校验。
+	for _, line := range []string{
+		`{"step":0,"op":"query","name":"cpu","start":0,"end":2000}`,
+		`{"step":"1000","op":"query","name":"cpu","start":0,"end":2000}`,
+		`{"step":{},"op":"query","name":"cpu","start":0,"end":2000}`,
+		`{"step":0,"op":"query_points","name":"cpu","start":0,"end":2000}`,
+		`{"step":"1000","op":"query_points","name":"cpu","start":0,"end":2000}`,
+		`{"step":{},"op":"query_points","name":"cpu","start":0,"end":2000}`,
+	} {
+		lerr = mustQueryFail(t, store, line)
+		assertQueryError(t, lerr, `unknown field "step"`)
+	}
+
+	// 错误仍按字段书写次序选择：step 之前的字段错误先报；把错误字段移到
+	// step 之后则先报 step，即使 op 写在它们之后也一样。
+	lerr = mustQueryFail(t, store, `{"name":7,"step":1,"op":"query","start":0,"end":1}`)
+	assertQueryError(t, lerr, `field "name" must be a string`)
+	lerr = mustQueryFail(t, store, `{"step":1,"name":7,"op":"query","start":0,"end":1}`)
+	assertQueryError(t, lerr, `unknown field "step"`)
+
+	// step 的未知字段错误先于缺少必填项与区间倒置。
+	lerr = mustQueryFail(t, store, `{"step":1,"op":"query"}`)
+	assertQueryError(t, lerr, `unknown field "step"`)
+	lerr = mustQueryFail(t, store, `{"step":1,"op":"query","name":"cpu","start":5,"end":1}`)
+	assertQueryError(t, lerr, `unknown field "step"`)
+
+	// 删掉 step 后原查询正常执行。
 	qr := mustQuery(t, store, `{"op":"query","name":"cpu","start":0,"end":2000}`)
 	if len(qr.Series) != 1 || qr.Series[0].Count != 1 || qr.Series[0].Average != 2 {
 		t.Fatalf("query compatibility broken: %+v", qr.Series)
@@ -483,6 +510,17 @@ func TestQueryWindowsStepOnlyForNewOp(t *testing.T) {
 	if len(qp.Series) != 1 || len(qp.Series[0].Points) != 1 {
 		t.Fatalf("query_points compatibility broken: %+v", qp.Series)
 	}
+
+	// op 缺失、类型错误、未知操作或重复出现时沿用既有处理：step 在出现处
+	// 按窗口宽度校验，op 自身的问题按书写次序暴露。
+	lerr = mustQueryFail(t, store, `{"step":0,"name":"cpu","start":0,"end":1}`)
+	assertQueryError(t, lerr, `field "step"`)
+	lerr = mustQueryFail(t, store, `{"step":0,"op":5,"name":"cpu","start":0,"end":1}`)
+	assertQueryError(t, lerr, `field "step"`)
+	lerr = mustQueryFail(t, store, `{"step":0,"op":"ping","name":"cpu","start":0,"end":1}`)
+	assertQueryError(t, lerr, `field "step"`)
+	lerr = mustQueryFail(t, store, `{"step":5,"op":"query","op":"query","name":"cpu","start":0,"end":1}`)
+	assertQueryError(t, lerr, `duplicate field "op"`)
 }
 
 // TestQueryWindowsErrorSelection 失败原因的选择沿用查询对象的既有次序：

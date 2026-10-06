@@ -870,22 +870,10 @@ func (s *MetricStore) runQueryPoints(q parsedQuery) *QueryPointsResult {
 }
 
 // seriesPointsInRange 按 timestamp 升序返回一条已存序列在 [start,end] 闭区间
-// 内的采样点，供采样明细查询展示。与 allSeriesPoints 一样返回新建切片与新建
-// Point，调用方对结果的修改不影响存储；区别只在这里按区间过滤时间戳。
+// 内的采样点，供采样明细查询展示。选取、升序排列与点构造与写入快照共用
+// seriesPoints，区别只在传入的选取范围是闭区间而不是全部。
 func seriesPointsInRange(sr *storedSeries, start, end int64) []Point {
-	tsList := make([]int64, 0, len(sr.points))
-	for ts := range sr.points {
-		if ts < start || ts > end {
-			continue
-		}
-		tsList = append(tsList, ts)
-	}
-	sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
-	points := make([]Point, len(tsList))
-	for i, ts := range tsList {
-		points[i] = Point{Timestamp: ts, Value: sr.points[ts]}
-	}
-	return points
+	return seriesPoints(sr, func(ts int64) bool { return ts >= start && ts <= end })
 }
 
 // ratToFloat64NearestEven 把有理数 x 舍入到最近的 float64，半数取偶。
@@ -1055,14 +1043,26 @@ func organizeSeries(selected []*storedSeries) []organizedSeries {
 	return out
 }
 
-// allSeriesPoints 按 timestamp 升序返回一条已存序列的全部采样点，数值与
-// 时间戳一一对应，供写入快照展示。返回的是新建切片与新建 Point，调用方对
-// 采样点的修改不影响存储，也不影响此前或此后取得的其他成功结果。均值查询
-// 不构造这样的明细列表，只在点表上计数与求和；采样明细查询的区间版本由
-// seriesPointsInRange 提供。
+// allSeriesPoints 按 timestamp 升序返回一条已存序列的全部采样点，供写入快照
+// 展示。选取、升序排列与点构造与采样明细查询共用 seriesPoints，区别只在传入
+// 的选取范围是全部而不是闭区间。
 func allSeriesPoints(sr *storedSeries) []Point {
+	return seriesPoints(sr, nil)
+}
+
+// seriesPoints 是写入快照与采样明细查询共用的采样点整理：从已存序列的点表中
+// 选出 keep 命中的时间戳（keep 为 nil 表示全部选取），按 timestamp 升序排列，
+// 每个时间戳配上点表中实际存储的 value（数值与时间戳一一对应，排序只动时间戳
+// 列表、不重配对值；int64 比较保留整数精度，float64 原样取出，负零保持负零）。
+// 返回的是新建切片与新建 Point，不持有点表的任何引用：调用方对结果的修改不
+// 影响存储，也不影响此前或此后取得的其他成功结果；取得结果后再写入新点，该份
+// 结果也不跟随存储变化。均值查询不构造这样的明细列表，只在点表上计数与求和。
+func seriesPoints(sr *storedSeries, keep func(ts int64) bool) []Point {
 	tsList := make([]int64, 0, len(sr.points))
 	for ts := range sr.points {
+		if keep != nil && !keep(ts) {
+			continue
+		}
 		tsList = append(tsList, ts)
 	}
 	sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })

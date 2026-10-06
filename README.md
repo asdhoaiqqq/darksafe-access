@@ -109,6 +109,66 @@ printf '%s\n' \
 
 以上三次调用都包含失败行，因此命令均以非零退出码结束；用 `go run` 运行时它会在标准错误额外打印一行 `exit status 1`，那是 `go` 工具对非零退出码的转述，不是 ingest 的输出行。
 
+### 示例：一批里同时有字段错误与数值冲突，先报告哪一个
+
+一批写入里同时存在字段错误与数值冲突时，结果里仍然只有一条 `error`：整行是合法且完整的 JSON 数组时，按采样点在数组中的先后逐个校验，第一个失败的采样点决定报告的原因——字段错误与数值冲突参与同一个先后次序，谁所在的采样点靠前就报告谁，并不是“类型错误总会优先于冲突”。用法与查询侧相同：根据这次结果定位当前问题，修掉后重提同一批，再理解下一条原因。
+
+写入与查询放在同一次 ingest 调用中，数据只保存在本次进程内存。先向 `cpu`、`host=a` 写入时间戳 1000、值 2；第 2 行提交一批，依次包含时间戳 2000、值 4 的合法新增点、时间戳 1000、值 9 的冲突点、以及把 `name` 写成数字的错误点；第 3 行提交同样的三个点，但把后两个点交换位置；最后用覆盖时间戳 1000 与 2000 的区间查询确认存储：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '[{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}},{"name":7,"timestamp":3000,"value":1,"labels":{"host":"a"}}]' \
+  '[{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":7,"timestamp":3000,"value":1,"labels":{"host":"a"}},{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}}]' \
+  '{"op":"query","name":"cpu","start":0,"end":3000,"labels":{"host":"a"}}' \
+  | go run ./cmd/darksafe ingest
+```
+
+逐行输出：
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":2,"index":2,"error":"conflict: series cpu{host=a} at timestamp 1000 already has value 2, submitted 9","conflict":{"series":{"name":"cpu","labels":{"host":"a"}},"timestamp":1000,"existing":2,"submitted":9}}
+{"status":"error","line":3,"index":2,"error":"field \"name\" must be a string"}
+{"status":"ok","op":"query","series":[{"name":"cpu","labels":{"host":"a"},"count":1,"average":2}]}
+```
+
+第 2 行的批次里冲突点排在第 2 位、字段错误点排在第 3 位，因此只报告第 2 个点的冲突：`index` 为 2，`conflict` 中 `existing` 为已存的 2、`submitted` 为 9；第 3 个点的 `name` 类型错误不在这次结果里。第 3 行把后两个点交换后，第 2 个点变成 `name` 为数字的字段错误，于是只报告它，带 `index` 为 2 但不附带 `conflict`；排在第 3 位的冲突点不再检查。两条错误的差异只来自输入次序。这里 `line` 始终是原始输入的行号（2、3），`index` 是从 1 开始的批内位置（两批都是 2），不要把两者混为一谈。
+
+两个失败批次都是整批拒绝：时间戳 2000 的合法新增点没有留下，已存的时间戳 1000 也没有从 2 改成 9——第 4 行查询覆盖这两个时间戳，仍只有一个点，`count` 为 1、`average` 为 2。第 4 行是失败行之后的合法行，仍照常处理；但本次调用出现过失败，命令最终退出码仍非零。
+
+**对照一：同一个采样点同时带未知字段和不同采样值时，字段问题先于数值冲突。** 这是因为单个采样点要先通过字段校验，才会拿它的值参与冲突判定；即使未知字段写在 `name`、`timestamp`、`value` 之后，报告的仍是未知字段。把未知字段去掉后重提，才会报告冲突：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '[{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"},"bogus":1}]' \
+  '[{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}}]' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":2,"index":1,"error":"unknown field \"bogus\""}
+{"status":"error","line":3,"index":1,"error":"conflict: series cpu{host=a} at timestamp 1000 already has value 2, submitted 9","conflict":{"series":{"name":"cpu","labels":{"host":"a"}},"timestamp":1000,"existing":2,"submitted":9}}
+```
+
+**对照二：数组未闭合时属于整行解析失败，不进入批内校验。** 即使未闭合数组中已经写出的那个点本身满足冲突条件（时间戳 1000 已存 2、提交 9），结果也只有整行解析错误，没有 `index`、没有 `conflict`：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '[{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":2,"error":"invalid JSON: unexpected EOF"}
+```
+
+两组对照调用都包含失败行，命令最终同样以非零退出码结束。
+
 ### 示例：不同的十进制数，同一个存储值
 
 `9007199254740992`（即 2^53）可以精确表示，但在它附近相邻可表示值的间隔已经是 2：下一个可表示值是 `9007199254740994`，介于两者之间的 `9007199254740993` 转换时会舍入到 `9007199254740992`。下面先写入 `9007199254740992`，再向同一序列、同一时间戳提交 `9007199254740993`；随后提交一批——时间戳 2000、值 4 的合法新增点在前，相邻可表示值 `9007199254740994` 的冲突点在后；最后查询覆盖两者的区间。写入与查询在同一次 ingest 调用中完成：

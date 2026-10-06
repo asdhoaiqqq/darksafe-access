@@ -19,13 +19,15 @@ import (
 
 // Exit codes for the review command:
 //
-//   - 0: a full review was produced, including a legitimate archive whose
-//     original and recomputed decisions disagree.
+//   - 0: a full review was produced and the complete report was written
+//     without error, including a legitimate archive whose original and
+//     recomputed decisions disagree.
 //   - 2: the invocation itself is wrong (missing/invalid arguments, the
 //     archive file cannot be read).
 //   - 1: the material or target cannot support a review (an invalid or
 //     chain-broken archive, a missing or non-decision target, a historical
-//     policy version that cannot be obtained).
+//     policy version that cannot be obtained), or the review report could
+//     not be written out in full.
 const (
 	reviewExitOK     = 0
 	reviewExitFailed = 1
@@ -80,8 +82,12 @@ Required inputs:
                        the exact bytes>"}, so a lone 0xFF, a lone 0xFE and a
                        real U+FFFD never collapse together and every string's
                        original bytes can be recovered. A nil and an empty
-                       matched list both render as []. On any failure stdout
-                       stays empty and the reason goes to stderr only.
+                       matched list both render as []. A failure before the
+                       report is written leaves stdout empty and the reason on
+                       stderr only; if stdout refuses the report or accepts
+                       only part of it, any accepted prefix stays in place,
+                       the command exits 1 and the output failure is reported
+                       on stderr, never retried in another format.
 
 The checkpoint carried inside the archive is informational only: validation
 always uses --end-seq/--fingerprint supplied here. Even when --seq points at
@@ -101,9 +107,10 @@ report uses Go-style quoting, while --json uses the JSON string /
 distinguishable. This command only reads the named archive: it neither
 rewrites it nor appends audit records.
 
-Exit codes: 0 review complete (decisions may disagree), 1 archive or target
-invalid / historical version unavailable, 2 bad arguments or unreadable
-file. --json changes none of these.
+Exit codes: 0 complete report written without error (decisions may
+disagree), 1 archive or target invalid / historical version unavailable /
+review report could not be written out in full, 2 bad arguments or
+unreadable file. --json changes none of these.
 
 Example:
   (materials produced by examples/offline_review; seq 1 is the
@@ -269,23 +276,39 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 		return reviewExitFailed
 	}
 
+	// Render both formats fully before touching stdout: a render failure must
+	// not leave partial output, and every earlier failure path already
+	// returned with stdout untouched.
+	var payload []byte
 	if in.json {
-		// Render fully before touching stdout: a marshal failure must not
-		// leave a partial object, and every earlier failure path already
-		// returned with stdout untouched.
-		payload, err := renderReviewJSON(review)
+		payload, err = renderReviewJSON(review)
 		if err != nil {
 			fmt.Fprintf(stderr, "review: cannot encode result as JSON: %v\n", err)
 			return reviewExitFailed
 		}
-		if _, err := stdout.Write(payload); err != nil {
-			fmt.Fprintf(stderr, "review: cannot write JSON result: %v\n", err)
-			return reviewExitFailed
-		}
-		return reviewExitOK
+	} else {
+		var buf strings.Builder
+		printReview(&buf, review)
+		payload = []byte(buf.String())
 	}
 
-	printReview(stdout, review)
+	// Success requires the WHOLE report to actually land. A receiver may
+	// accept some bytes and then refuse the rest, or report a short write
+	// with no error; neither may be mistaken for a completed review merely
+	// because the archive validated and the decision recomputed. Whatever
+	// prefix the receiver already accepted stays there (it cannot be
+	// unwritten), but nothing more is appended afterwards.
+	n, werr := stdout.Write(payload)
+	if werr != nil {
+		fmt.Fprintf(stderr, "review: failed to write review report: %v\n", werr)
+		return reviewExitFailed
+	}
+	if n < len(payload) {
+		fmt.Fprintf(stderr,
+			"review: review report output incomplete: wrote %d of %d bytes\n",
+			n, len(payload))
+		return reviewExitFailed
+	}
 	return reviewExitOK
 }
 

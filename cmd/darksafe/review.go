@@ -37,10 +37,21 @@ const (
 // reviewInputs holds everything the review command needs from the caller.
 type reviewInputs struct {
 	archivePath string
-	org         string
-	seq         int
-	endSeq      int
-	fingerprint string
+	// checkpointPath names the independently saved checkpoint file. When
+	// non-empty, org, endSeq and fingerprint come from that file instead of
+	// the command line; the corresponding flags are then forbidden rather
+	// than optional.
+	checkpointPath string
+	org            string
+	seq            int
+	endSeq         int
+	fingerprint    string
+	// haveOrg/haveEndSeq/haveFingerprint record that each checkpoint flag
+	// was actually given, even with an empty value, so mutual exclusion
+	// with --checkpoint is about flag presence and never about values.
+	haveOrg         bool
+	haveEndSeq      bool
+	haveFingerprint bool
 	// json selects machine-readable JSON output instead of the default text
 	// report. The review itself is identical either way: the same archive
 	// validation and the same historical recheck, never a re-submitted
@@ -49,8 +60,9 @@ type reviewInputs struct {
 }
 
 func reviewHelp(w io.Writer) {
-	fmt.Fprint(w, `usage: darksafe review --archive FILE --org ORG --seq N \
-                      --end-seq N --fingerprint HEX
+	fmt.Fprint(w, `usage: darksafe review --archive FILE --seq N
+                      (--checkpoint FILE |
+                       --org ORG --end-seq N --fingerprint HEX)
 
 Review one access decision saved in an audit archive, long after the
 service instance that made the decision has ended. No running service is
@@ -62,15 +74,36 @@ Required inputs:
   --archive FILE       path to the audit archive written by
                        EncodeAuditArchive (the complete export, not a
                        subject-filtered page or a fragment)
-  --org ORG            organization name the archive belongs to; it must
-                       match the organization bound into the records
   --seq N              positive sequence number of the decision record to
                        review (organization-local, starting at 1)
+
+The retained checkpoint (organization, end sequence and fingerprint) is
+supplied in exactly one of two ways:
+
+  --checkpoint FILE    read the checkpoint from the separately saved
+                       checkpoint file, in its plain-text form with one
+                       item per line: org=<Go double-quoted string>,
+                       end_seq=<non-negative decimal integer, 0 for an
+                       organization with no records>, and
+                       fingerprint=<64 hexadecimal characters>, each once
+                       in any order, with one optional trailing newline.
+                       The quoted organization is restored byte for byte
+                       (Chinese, leading/trailing spaces, escaped control
+                       characters and escaped non-UTF-8 bytes). No extra
+                       fields, blank lines or other content are accepted.
+  --org ORG            organization name the archive belongs to; it must
+                       match the organization bound into the records
   --end-seq N          end sequence of the checkpoint retained separately
                        from the archive (0 for an organization with no
                        records); must not be negative
   --fingerprint HEX    checkpoint fingerprint retained separately from the
                        archive (64 hexadecimal SHA-256 characters)
+
+  --checkpoint is mutually exclusive with --org, --end-seq and
+  --fingerprint: with --checkpoint none of the three may be given, even
+  with an identical value. The checkpoint is always taken from exactly
+  one source; flag order never makes one silently override the other.
+
   --json               emit the review as one complete JSON object on
                        stdout instead of the text report. The object gives
                        "target_sequence", "original" and "recomputed"
@@ -90,10 +123,14 @@ Required inputs:
                        on stderr, never retried in another format.
 
 The checkpoint carried inside the archive is informational only: validation
-always uses --end-seq/--fingerprint supplied here. Even when --seq points at
-an early record, every archived record is checked; a corrupted or missing
+always uses the independently retained checkpoint, whether it comes from
+--checkpoint or from --end-seq/--fingerprint. Even when --seq points at an
+early record, every archived record is checked; a corrupted or missing
 later record, or any mismatch with the retained checkpoint, fails the whole
-review with no partial output.
+review with no partial output. A syntactically valid --checkpoint file whose
+organization or checkpoint does not match the archive is a material
+validation failure (exit 1), and the checkpoint embedded in the archive is
+never substituted for it.
 
 The request is replayed strictly against the policy version the recorded
 decision actually used; later publishes or rollbacks present in the archive
@@ -104,25 +141,32 @@ disagreement is shown explicitly rather than reported as file damage.
 Strings may contain spaces, control characters or non-UTF-8 bytes; the text
 report uses Go-style quoting, while --json uses the JSON string /
 {"base64": ...} rule described above, and both keep different raw bytes
-distinguishable. This command only reads the named archive: it neither
-rewrites it nor appends audit records.
+distinguishable. This command only reads the named files: it neither
+rewrites them nor appends audit records.
 
 Exit codes: 0 complete report written without error (decisions may
-disagree), 1 archive or target invalid / historical version unavailable /
-review report could not be written out in full, 2 bad arguments or
-unreadable file. --json changes none of these.
+disagree), 1 archive or target invalid / checkpoint in a readable file does
+not match the archive / historical version unavailable / review report
+could not be written out in full, 2 bad arguments (including --checkpoint
+combined with --org/--end-seq/--fingerprint), an unreadable checkpoint or
+archive file, or a malformed checkpoint file (missing/duplicate/unknown
+entry, bad quoting, bad integer, bad fingerprint). --json changes none of
+these.
 
 Example:
   (materials produced by examples/offline_review; seq 1 is the
   policy publish record, seq 2 is the read decision being reviewed)
+  darksafe review --archive acme-factory.audit --seq 2 \
+      --checkpoint acme-factory.checkpoint
+
+  the equivalent invocation spelling the retained checkpoint out:
   darksafe review --archive acme-factory.audit \
       --org 'acme factory' --seq 2 --end-seq 2 \
       --fingerprint 04b274dbb4cf039bbb4b78f5ee5aae03278d2c34833fe87fecb13ade51ef5299
 
   add --json to get the same review as one JSON object:
-  darksafe review --json --archive acme-factory.audit \
-      --org 'acme factory' --seq 2 --end-seq 2 \
-      --fingerprint 04b274dbb4cf039bbb4b78f5ee5aae03278d2c34833fe87fecb13ade51ef5299
+  darksafe review --json --archive acme-factory.audit --seq 2 \
+      --checkpoint acme-factory.checkpoint
 `)
 }
 
@@ -130,7 +174,7 @@ Example:
 // so tests can drive the command directly. The first element of args is the
 // subcommand name ("review"). --help/-h/-help set wantHelp.
 func parseReviewArgs(args []string) (in reviewInputs, wantHelp bool, err error) {
-	haveSeq, haveEndSeq := false, false
+	haveSeq := false
 	for i := 1; i < len(args); i++ {
 		arg := args[i]
 		value := ""
@@ -167,12 +211,19 @@ func parseReviewArgs(args []string) (in reviewInputs, wantHelp bool, err error) 
 				return reviewInputs{}, false, err
 			}
 			in.archivePath = v
+		case "--checkpoint":
+			v, err := take()
+			if err != nil {
+				return reviewInputs{}, false, err
+			}
+			in.checkpointPath = v
 		case "--org":
 			v, err := take()
 			if err != nil {
 				return reviewInputs{}, false, err
 			}
 			in.org = v
+			in.haveOrg = true
 		case "--seq":
 			v, err := take()
 			if err != nil {
@@ -194,13 +245,14 @@ func parseReviewArgs(args []string) (in reviewInputs, wantHelp bool, err error) 
 				return reviewInputs{}, false, fmt.Errorf("--end-seq must be an integer, got %q", v)
 			}
 			in.endSeq = n
-			haveEndSeq = true
+			in.haveEndSeq = true
 		case "--fingerprint":
 			v, err := take()
 			if err != nil {
 				return reviewInputs{}, false, err
 			}
 			in.fingerprint = v
+			in.haveFingerprint = true
 		case "--json":
 			// Bare --json enables JSON output; --json=value accepts the
 			// usual boolean spellings. No value is ever consumed from the
@@ -223,23 +275,47 @@ func parseReviewArgs(args []string) (in reviewInputs, wantHelp bool, err error) 
 	if in.archivePath == "" {
 		return reviewInputs{}, false, errors.New("--archive is required")
 	}
-	if in.org == "" {
-		return reviewInputs{}, false, errors.New("--org is required")
+
+	// Mutual exclusion is about flag presence, not values: --checkpoint
+	// together with any of --org/--end-seq/--fingerprint is always a
+	// conflict, even when the spelled-out value equals what the file would
+	// supply, and regardless of which flag appears first.
+	if in.checkpointPath != "" {
+		var conflicting []string
+		if in.haveOrg {
+			conflicting = append(conflicting, "--org")
+		}
+		if in.haveEndSeq {
+			conflicting = append(conflicting, "--end-seq")
+		}
+		if in.haveFingerprint {
+			conflicting = append(conflicting, "--fingerprint")
+		}
+		if len(conflicting) > 0 {
+			return reviewInputs{}, false, fmt.Errorf(
+				"--checkpoint cannot be combined with %s",
+				strings.Join(conflicting, ", "))
+		}
+	} else {
+		if !in.haveOrg || in.org == "" {
+			return reviewInputs{}, false, errors.New("--org is required (or supply --checkpoint FILE)")
+		}
+		if !in.haveEndSeq {
+			return reviewInputs{}, false, errors.New("--end-seq is required (or supply --checkpoint FILE)")
+		}
+		if in.endSeq < 0 {
+			return reviewInputs{}, false, fmt.Errorf("--end-seq must not be negative, got %d", in.endSeq)
+		}
+		if !in.haveFingerprint || in.fingerprint == "" {
+			return reviewInputs{}, false, errors.New("--fingerprint is required (or supply --checkpoint FILE)")
+		}
 	}
+
 	if !haveSeq {
 		return reviewInputs{}, false, errors.New("--seq is required")
 	}
 	if in.seq <= 0 {
 		return reviewInputs{}, false, fmt.Errorf("--seq must be a positive integer, got %d", in.seq)
-	}
-	if !haveEndSeq {
-		return reviewInputs{}, false, errors.New("--end-seq is required")
-	}
-	if in.endSeq < 0 {
-		return reviewInputs{}, false, fmt.Errorf("--end-seq must not be negative, got %d", in.endSeq)
-	}
-	if in.fingerprint == "" {
-		return reviewInputs{}, false, errors.New("--fingerprint is required")
 	}
 	return in, false, nil
 }
@@ -264,12 +340,31 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 		return reviewExitUsage
 	}
 
+	// The retained checkpoint has exactly one source: the --checkpoint
+	// file or the three spelled-out flags (parseReviewArgs rejects any
+	// mixture). A file that cannot be read or parsed is a usage-level
+	// failure (exit 2); once it parsed, disagreeing with the archive is a
+	// material failure below (exit 1), never a silent fallback to the
+	// checkpoint embedded in the archive.
 	cp := darksafe.Checkpoint{Org: in.org, EndSeq: in.endSeq, Fingerprint: in.fingerprint}
+	if in.checkpointPath != "" {
+		data, err := os.ReadFile(in.checkpointPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "review: cannot read checkpoint %q: %v\n", in.checkpointPath, err)
+			return reviewExitUsage
+		}
+		parsed, err := parseCheckpointData(data)
+		if err != nil {
+			fmt.Fprintf(stderr, "review: invalid checkpoint file %q: %v\n", in.checkpointPath, err)
+			return reviewExitUsage
+		}
+		cp = parsed
+	}
 	// Decode and chain validation are one stage: the archive is checked
 	// against the retained checkpoint exactly once here, and the review
 	// below replays the target from that already-verified material rather
 	// than walking the whole chain a second time.
-	material, err := darksafe.DecodeVerifiedAuditArchive(archive, in.org, cp)
+	material, err := darksafe.DecodeVerifiedAuditArchive(archive, cp.Org, cp)
 	if err != nil {
 		fmt.Fprintf(stderr, "review: archive validation failed: %v\n", err)
 		return reviewExitFailed

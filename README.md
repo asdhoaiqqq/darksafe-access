@@ -234,6 +234,7 @@ all querying was read-only: chain still 11 records, current version still 3
 | `--seq N` | 要复核的决策记录在该组织内的序号，正整数（从 1 开始）。 |
 | `--end-seq N` | **另行保留**的检查点截至序号（无记录组织为 0），不能为负。 |
 | `--fingerprint HEX` | **另行保留**的检查点指纹（64 个十六进制字符）。支持 `--flag value` 与 `--flag=value` 两种写法；`darksafe review --help` 可查看完整说明。
+| `--json`（可选） | 加上后把复核结果写成**一份完整 JSON 对象**到标准输出，便于交给其他程序读取；默认（不带该参数）仍是下面描述的文字报告。支持裸标记 `--json` 与 `--json=true|false`（`--json=1|0` 同义），取值非法按参数错误处理。 |
 
 要点：
 
@@ -243,8 +244,43 @@ all querying was read-only: chain still 11 records, current version still 3
 - 成功时标准输出依次给出目标序号、原决策、重算决策；两份决策都包含允许与否（`allowed`）、理由（`reason`）、命中策略（`matched policies`）与实际策略版本（`policy version`），并以 `consistent: yes/no` 明确结论。
 - 组织名、命中策略标识与理由可能含空格、控制字符或非 UTF-8 字节；输出使用 Go 风格引号（`%q`）逐字节表示，单个 `0xFF` 显示为 `\xff`、`0xFE` 显示为 `\xfe`、真正的 U+FFFD 仍显示为 `�`，不同非法字节不会被替换成同一个字符。
 - 该命令只读指定归档，不改写归档或检查点，也不追加审计记录。
+- 选择 `--json` 只改变**输出格式**：复核仍来自同一套归档校验（`DecodeAuditArchive`）与历史决策复核（`RecheckDecisionOffline`），不会重新提交访问请求、不改用较新策略、不改写归档、不追加审计记录；nil 与空命中列表是否一致仍按既有规则判断，不随格式改变。
 
-退出码：`0` 已得到完整复核结果（含不一致）；`1` 归档校验失败（`ErrInvalidArchive`/`ErrInvalidRange`）、目标序号不存在（`ErrAuditNotFound`）、目标不是决策记录（`ErrAuditNotADecision`）或历史策略版本无法取得（`ErrVersionNotFound`），错误信息可区分且只写标准错误；`2` 文件无法读取、必填输入缺失、序号无法解析为整数、目标序号非正或截至序号为负，具体原因写标准错误。
+### `--json`：机器可读报告
+
+加上 `--json` 后，成功时**标准输出有且仅有一份完整 JSON 对象**（末尾带一个换行），不混入任何标题、说明或文字版报告；对象结构如下，字段与文字报告一一对应：
+
+| JSON 字段 | 对应文字报告 | 含义 |
+| --- | --- | --- |
+| `target_seq` | `target sequence` | 复核目标在审计链中的序号；与策略版本**分开表示**。 |
+| `original.allowed` / `recomputed.allowed` | 两份决策的 `allowed` | 原决策 / 重算决策是否允许（布尔）。 |
+| `original.reason` / `recomputed.reason` | 两份决策的 `reason` | 原决策 / 重算决策的理由，字符串内容与文字版逐字节相同。 |
+| `original.matched_policies` / `recomputed.matched_policies` | 两份决策的 `matched policies` | 命中策略标识数组，**保持原有顺序**，不重新排序或去重；nil 与空命中列表都编码为 `[]`。 |
+| `original.policy_version` / `recomputed.policy_version` | 两份决策的 `policy version` | 该份决策实际使用的策略版本（整数，与 `target_seq` 分离）。 |
+| `consistent` | `consistent: yes/no` | 原决策与重算决策是否逐字段一致（允许与否、理由、命中策略、实际版本；nil 与空命中列表视为一致）。材料合法但双方结论不一致时为 `false` 且仍以退出码 **0** 结束——不一致不是文件损坏。 |
+
+**字符串表示规则（公开、可还原原始字节）。** 每个字符串都是标准 JSON 字符串，任何标准 JSON 解析器都能读取；接收者按下面这条表示规则即可还原每个字符串的**原始字节**：
+
+- 普通可打印 Unicode（含中文）按字面输出，保持可读；`"`、`\\` 用标准转义（`\"`、`\\\\`），`\n`、`\r`、`\t`、`\b`、`\f` 用对应短转义，其余 ASCII 控制字节（`< 0x20`）用 `\u00XX`，因此控制字符不可能破坏对象边界。
+- 对**不是合法 UTF-8 的单个字节**，逐字节写成 `\u00XX`，`XX` 就是该字节的值：单字节 `0xFF` 写为 `\u00FF`、`0xFE` 写为 `\u00FE`；而真正的 U+FFFD 字符按字面保留为 UTF-8 三字节 `EF BF BD`。三者在线路上与标准解析后都互不相同，绝不会被静默替换成同一个替换字符。
+- 还原原始字节：接收者按 JSON 规则逐段扫描该字符串字面量——遇到字面字节直接保留（因此真正的 U+FFFD 就是 `EF BF BD`）；遇到 `\u00XX` 转义就输出**单个字节 `0xXX`**。因为编码端只会为“非法 UTF-8 的原始字节”发出 `\u00XX`（真正的码位——包括普通的 U+00FF——一律写字面 UTF-8），这条逆映射无歧义：`\u00FF` 还原为字节 `0xFF`，而不是 U+00FF 按 UTF-8 编码出的两个字节 `C3 BF`。仅做一次普通 JSON 解析也能得到两两不同、可正常读取的字符串（非法 0xFF 记为 U+00FF、0xFE 记为 U+00FE、真 U+FFFD 记为 U+FFFD）；需要逐字节复现归档原始内容时，再按本规则把 `\u00XX` 转回字节 `0xXX`。
+
+**失败时不交付部分 JSON。** `--json` 不改变退出码与失败语义：缺少必填参数、`--json` 取值非法或归档文件无法读取以退出码 **2** 失败；归档校验失败（含目标之后的记录损坏）、目标序号不存在、目标不是决策记录、历史策略版本无法取得以退出码 **1** 失败。任何非零退出都只向**标准错误**写具体原因，**标准输出保持完全为空**——即使目标靠前、归档后面的记录损坏，也不会输出半个对象。
+
+实际输出示例（材料由 [`examples/offline_review`](examples/offline_review/main.go) 生成；单行 JSON，此处为便于阅读折行）：
+
+```bash
+darksafe review --archive acme-factory.audit \
+  --org 'acme factory' --seq 2 --end-seq 2 \
+  --fingerprint 04b274dbb4cf039bbb4b78f5ee5aae03278d2c34833fe87fecb13ade51ef5299 \
+  --json
+```
+
+```json
+{"target_seq":2,"original":{"allowed":true,"reason":"matched allow policy","matched_policies":["p-ledger-read-2026"],"policy_version":1},"recomputed":{"allowed":true,"reason":"matched allow policy","matched_policies":["p-ledger-read-2026"],"policy_version":1},"consistent":true}
+```
+
+退出码：`0` 已得到完整复核结果（含不一致）；`1` 归档校验失败（`ErrInvalidArchive`/`ErrInvalidRange`）、目标序号不存在（`ErrAuditNotFound`）、目标不是决策记录（`ErrAuditNotADecision`）或历史策略版本无法取得（`ErrVersionNotFound`），错误信息可区分且只写标准错误；`2` 文件无法读取、必填输入缺失、序号无法解析为整数、目标序号非正、截至序号为负或 `--json` 取值非法，具体原因写标准错误。无论是否加 `--json`，退出码语义相同；`--json` 下任何非零退出都让标准输出保持为空，绝不交付部分 JSON。
 
 ## 完整示例：先保存一条真实决策，再离线复核
 
@@ -418,6 +454,8 @@ consistent: yes
 - **一致性结论（consistent）**：原决策与重算决策在允许与否、理由、命中策略、实际版本上逐字段比较的结果。
 
 本例应得到**允许结果**（两份决策均为 `allowed: true`，理由 `matched allow policy`，命中 `p-ledger-read-2026`）与 **`consistent: yes`**：历史材料重算出的结论与当时记录完全一致。
+
+同一份材料若要交给其他程序读取，在命令末尾加 `--json` 即可：复核过程、判定规则、退出码与只读语义完全不变，只是标准输出换成一份 JSON 对象（字段含义、字符串字节表示规则与真实输出示例见上文“`--json`：机器可读报告”一节）。
 
 ### 两种容易选错材料的情况
 

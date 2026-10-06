@@ -74,7 +74,7 @@ func (e *unpairedSurrogateError) Error() string {
 // to the later encoding/json walk, which reports the format error.
 func checkStrictText(data []byte) error {
 	w := &jsonWalker{data: data}
-	if err := w.value("$"); err != nil && !errors.Is(err, errUndecided) {
+	if err := w.walk(); err != nil && !errors.Is(err, errUndecided) {
 		return err
 	}
 	return nil

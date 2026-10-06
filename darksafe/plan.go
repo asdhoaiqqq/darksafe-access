@@ -76,7 +76,10 @@ type ReleasePlan struct {
 // object in the document — including unknown fields and their nested
 // objects — must then have distinct member names; a name appearing twice
 // (even with the same value, or via equivalent Unicode escapes) is rejected
-// before any business validation runs.
+// before any business validation runs. The document's structural nesting
+// is capped at maxJSONNestingDepth levels in every field, known or not; a
+// document that opens a 10001st level is rejected with
+// errJSONDepthExceeded before any business validation or planning runs.
 func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 	if err := checkStrictText(data); err != nil {
 		return ReleasePlanInput{}, err
@@ -88,6 +91,9 @@ func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 	dec.UseNumber()
 	var doc map[string]any
 	if err := dec.Decode(&doc); err != nil {
+		if isJSONDepthError(err) {
+			return ReleasePlanInput{}, errJSONDepthExceeded
+		}
 		return ReleasePlanInput{}, fmt.Errorf("JSON 格式错误: %w", err)
 	}
 	if dec.More() {
@@ -135,6 +141,12 @@ func (e *duplicateMemberError) Error() string {
 // wording.
 func checkDuplicateMembers(data []byte) error {
 	dup, recognized := scanDuplicateMembers(data)
+	// The nesting limit is a verdict by itself: it holds whether or not the
+	// document is otherwise well-formed and needs no json.Valid confirmation,
+	// so a too-deep document stops here instead of being scanned twice.
+	if errors.Is(dup, errJSONDepthExceeded) {
+		return dup
+	}
 	// json.Valid confirms the whole document — including the numbers the
 	// walk skipped loosely and any trailing content — is one well-formed
 	// JSON value, so a completed walk's verdict can be trusted directly.
@@ -155,24 +167,28 @@ func checkDuplicateMembers(data []byte) error {
 // the decoder walk). recognized does not by itself mean the document is
 // well-formed JSON: the caller confirms that with json.Valid.
 func scanDuplicateMembers(data []byte) (dup error, recognized bool) {
-	// Each object's location in the document is unique, so the seen-name
-	// sets are keyed by the owning object's path; the walk needs no
-	// enter/exit events for them.
-	seen := make(map[string]map[string]struct{})
-	w := &jsonWalker{data: data, onMember: func(ownerPath, name string) error {
-		set := seen[ownerPath]
+	// Each entered object's frame id is unique, so the seen-name sets are
+	// keyed by the owning object's id; the walk needs no enter/exit events
+	// for them.
+	seen := make(map[uint64]map[string]struct{})
+	var w *jsonWalker
+	w = &jsonWalker{data: data, onMember: func(ownerID uint64, name string) error {
+		set := seen[ownerID]
 		if set == nil {
 			set = make(map[string]struct{})
-			seen[ownerPath] = set
+			seen[ownerID] = set
 		}
 		if _, ok := set[name]; ok {
-			dup = &duplicateMemberError{field: name, path: ownerPath}
+			dup = &duplicateMemberError{field: name, path: w.framePathByID(ownerID)}
 			return dup
 		}
 		set[name] = struct{}{}
 		return nil
 	}}
-	if err := w.value("$"); err != nil && dup == nil {
+	if err := w.walk(); err != nil && dup == nil {
+		if errors.Is(err, errJSONDepthExceeded) {
+			return err, true
+		}
 		return nil, false
 	}
 	return dup, true
@@ -182,7 +198,11 @@ func scanDuplicateMembers(data []byte) (dup error, recognized bool) {
 // raw structural walk cannot recognize are handed to. It reports the JSON
 // format error with the established wording — and a duplicate member when
 // its second occurrence precedes the malformation — exactly as the duplicate
-// check always has for such documents.
+// check always has for such documents. The Token API enforces no nesting
+// limit of its own, so the walk carries the same maxJSONNestingDepth
+// counter: a malformed document that is also too deep (e.g. one with no
+// closing brackets at all) is refused with errJSONDepthExceeded instead of
+// recursing down the reader's call stack and reporting "unclosed" later.
 func checkJSONFormatAndDuplicates(data []byte) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	// Numbers are only walked past, never interpreted: UseNumber keeps legal
@@ -190,16 +210,37 @@ func checkJSONFormatAndDuplicates(data []byte) error {
 	// unmarshal-overflow error here. Whether a number is acceptable for a given
 	// field is decided later by business validation.
 	dec.UseNumber()
-	if err := walkJSONValue(dec, "$"); err != nil {
+	depth := 0
+	if err := walkJSONValue(dec, "$", &depth); err != nil {
 		return err
 	}
 	if _, err := dec.Token(); err != io.EOF {
 		if err == nil {
 			return errors.New("JSON 格式错误: 文档包含多余内容")
 		}
+		if isJSONDepthError(err) {
+			return errJSONDepthExceeded
+		}
 		return fmt.Errorf("JSON 格式错误: %w", err)
 	}
 	return nil
+}
+
+// enterContainer enforces the shared nesting limit on the Token walk: the
+// root container is level 1 and each entered object or array adds one,
+// exactly as in the raw walker. It returns errJSONDepthExceeded at the
+// 10001st level.
+func enterContainer(depth *int) error {
+	*depth++
+	if *depth > maxJSONNestingDepth {
+		return errJSONDepthExceeded
+	}
+	return nil
+}
+
+// leaveContainer marks one container closed.
+func leaveContainer(depth *int) {
+	*depth--
 }
 
 // walkJSONValue reads one complete JSON value whose first token has not been
@@ -207,25 +248,31 @@ func checkJSONFormatAndDuplicates(data []byte) error {
 // decoding half of checkJSONFormatAndDuplicates: it only runs for documents
 // the shared structural walk could not recognize, to report the format error
 // (or an earlier duplicate) with the established wording.
-func walkJSONValue(dec *json.Decoder, path string) error {
+func walkJSONValue(dec *json.Decoder, path string, depth *int) error {
 	tok, err := dec.Token()
 	if err != nil {
 		if err == io.EOF {
 			return errors.New("JSON 格式错误: 文档为空")
 		}
+		if isJSONDepthError(err) {
+			return errJSONDepthExceeded
+		}
 		return fmt.Errorf("JSON 格式错误: %w", err)
 	}
-	return walkJSONValueToken(dec, path, tok)
+	return walkJSONValueToken(dec, path, tok, depth)
 }
 
 // walkJSONValueToken reads the remainder of a value given its first token.
-func walkJSONValueToken(dec *json.Decoder, path string, tok json.Token) error {
+func walkJSONValueToken(dec *json.Decoder, path string, tok json.Token, depth *int) error {
 	if d, ok := tok.(json.Delim); ok {
+		if err := enterContainer(depth); err != nil {
+			return err
+		}
 		switch d {
 		case '{':
-			return walkJSONObject(dec, path)
+			return walkJSONObject(dec, path, depth)
 		case '[':
-			return walkJSONArray(dec, path)
+			return walkJSONArray(dec, path, depth)
 		default:
 			return fmt.Errorf("JSON 格式错误: 意外的分隔符 %q", d)
 		}
@@ -233,13 +280,17 @@ func walkJSONValueToken(dec *json.Decoder, path string, tok json.Token) error {
 	return nil // scalar value (string, number, bool, null)
 }
 
-func walkJSONObject(dec *json.Decoder, path string) error {
+func walkJSONObject(dec *json.Decoder, path string, depth *int) error {
+	defer leaveContainer(depth)
 	seen := make(map[string]struct{})
 	for {
 		tok, err := dec.Token()
 		if err != nil {
 			if err == io.EOF {
 				return errors.New("JSON 格式错误: 对象未闭合")
+			}
+			if isJSONDepthError(err) {
+				return errJSONDepthExceeded
 			}
 			return fmt.Errorf("JSON 格式错误: %w", err)
 		}
@@ -262,30 +313,46 @@ func walkJSONObject(dec *json.Decoder, path string) error {
 			if err == io.EOF {
 				return errors.New("JSON 格式错误: 缺少成员值")
 			}
+			if isJSONDepthError(err) {
+				return errJSONDepthExceeded
+			}
 			return fmt.Errorf("JSON 格式错误: %w", err)
 		}
-		if err := walkJSONValueToken(dec, joinMemberPath(path, key), vtok); err != nil {
+		if err := walkJSONValueToken(dec, joinMemberPath(path, key), vtok, depth); err != nil {
 			return err
 		}
 	}
 }
 
-func walkJSONArray(dec *json.Decoder, path string) error {
+func walkJSONArray(dec *json.Decoder, path string, depth *int) error {
+	defer leaveContainer(depth)
 	for i := 0; ; i++ {
 		tok, err := dec.Token()
 		if err != nil {
 			if err == io.EOF {
 				return errors.New("JSON 格式错误: 数组未闭合")
 			}
+			if isJSONDepthError(err) {
+				return errJSONDepthExceeded
+			}
 			return fmt.Errorf("JSON 格式错误: %w", err)
 		}
 		if d, ok := tok.(json.Delim); ok && d == ']' {
 			return nil
 		}
-		if err := walkJSONValueToken(dec, joinIndexPath(path, i), tok); err != nil {
+		if err := walkJSONValueToken(dec, joinIndexPath(path, i), tok, depth); err != nil {
 			return err
 		}
 	}
+}
+
+// isJSONDepthError reports whether err is encoding/json's own
+// nesting-limit failure (Decode/Valid enforce it even though the Token
+// API does not). The message is matched rather than a typed error,
+// because the scanner's "exceeded max depth" SyntaxError is not exported
+// as one.
+func isJSONDepthError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "exceeded max depth")
 }
 
 func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {

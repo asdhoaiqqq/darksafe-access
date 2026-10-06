@@ -76,7 +76,12 @@ type ReleasePlan struct {
 // object in the document — including unknown fields and their nested
 // objects — must then have distinct member names; a name appearing twice
 // (even with the same value, or via equivalent Unicode escapes) is rejected
-// before any business validation runs.
+// before any business validation runs. The whole document's nesting is
+// bounded by maxJSONDepth levels (the outermost object is level 1, each
+// object or array entered adds one), again across known and unknown fields
+// alike, so arbitrarily deep extra content is a configuration error rather
+// than a way to exhaust the reading process. A failure returns the zero
+// ReleasePlanInput; the caller may go on to parse other configurations.
 func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 	if err := checkStrictText(data); err != nil {
 		return ReleasePlanInput{}, err
@@ -135,6 +140,14 @@ func (e *duplicateMemberError) Error() string {
 // wording.
 func checkDuplicateMembers(data []byte) error {
 	dup, recognized := scanDuplicateMembers(data)
+	var de *nestingDepthError
+	if errors.As(dup, &de) {
+		// Excessive nesting is a definitive verdict of the walk, reported
+		// with its own wording — it is not a format problem for the
+		// encoding/json walk, and json.Valid would only reject the same
+		// document without naming the limit.
+		return dup
+	}
 	// json.Valid confirms the whole document — including the numbers the
 	// walk skipped loosely and any trailing content — is one well-formed
 	// JSON value, so a completed walk's verdict can be trusted directly.
@@ -173,6 +186,12 @@ func scanDuplicateMembers(data []byte) (dup error, recognized bool) {
 		return nil
 	}}
 	if err := w.value("$"); err != nil && dup == nil {
+		var de *nestingDepthError
+		if errors.As(err, &de) {
+			// Excessive nesting is a definitive verdict, not an
+			// unrecognized structure: report it directly.
+			return err, true
+		}
 		return nil, false
 	}
 	return dup, true
@@ -215,17 +234,19 @@ func walkJSONValue(dec *json.Decoder, path string) error {
 		}
 		return fmt.Errorf("JSON 格式错误: %w", err)
 	}
-	return walkJSONValueToken(dec, path, tok)
+	return walkJSONValueToken(dec, path, tok, 0)
 }
 
 // walkJSONValueToken reads the remainder of a value given its first token.
-func walkJSONValueToken(dec *json.Decoder, path string, tok json.Token) error {
+// depth is the nesting level of the innermost container already entered, so
+// the same maxJSONDepth rule the structural walk enforces applies here too.
+func walkJSONValueToken(dec *json.Decoder, path string, tok json.Token, depth int) error {
 	if d, ok := tok.(json.Delim); ok {
 		switch d {
 		case '{':
-			return walkJSONObject(dec, path)
+			return walkJSONObject(dec, path, depth+1)
 		case '[':
-			return walkJSONArray(dec, path)
+			return walkJSONArray(dec, path, depth+1)
 		default:
 			return fmt.Errorf("JSON 格式错误: 意外的分隔符 %q", d)
 		}
@@ -233,7 +254,10 @@ func walkJSONValueToken(dec *json.Decoder, path string, tok json.Token) error {
 	return nil // scalar value (string, number, bool, null)
 }
 
-func walkJSONObject(dec *json.Decoder, path string) error {
+func walkJSONObject(dec *json.Decoder, path string, depth int) error {
+	if depth > maxJSONDepth {
+		return &nestingDepthError{}
+	}
 	seen := make(map[string]struct{})
 	for {
 		tok, err := dec.Token()
@@ -264,13 +288,16 @@ func walkJSONObject(dec *json.Decoder, path string) error {
 			}
 			return fmt.Errorf("JSON 格式错误: %w", err)
 		}
-		if err := walkJSONValueToken(dec, joinMemberPath(path, key), vtok); err != nil {
+		if err := walkJSONValueToken(dec, joinMemberPath(path, key), vtok, depth); err != nil {
 			return err
 		}
 	}
 }
 
-func walkJSONArray(dec *json.Decoder, path string) error {
+func walkJSONArray(dec *json.Decoder, path string, depth int) error {
+	if depth > maxJSONDepth {
+		return &nestingDepthError{}
+	}
 	for i := 0; ; i++ {
 		tok, err := dec.Token()
 		if err != nil {
@@ -282,7 +309,7 @@ func walkJSONArray(dec *json.Decoder, path string) error {
 		if d, ok := tok.(json.Delim); ok && d == ']' {
 			return nil
 		}
-		if err := walkJSONValueToken(dec, joinIndexPath(path, i), tok); err != nil {
+		if err := walkJSONValueToken(dec, joinIndexPath(path, i), tok, depth); err != nil {
 			return err
 		}
 	}

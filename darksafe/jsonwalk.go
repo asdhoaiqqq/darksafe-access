@@ -33,12 +33,36 @@ import (
 // Numbers are scanned loosely (their characters are skipped, not judged):
 // whether a number is well-formed is the decoder's call, and the duplicate
 // check confirms the document with json.Valid before trusting a completed
-// walk.
+// walk. Nesting depth is the one structural property the walker judges
+// itself: entering more than maxJSONDepth levels of objects and arrays is a
+// definitive rejection (nestingDepthError), which also bounds the walk's own
+// recursion.
 
 // errUndecided is the internal sentinel meaning "this document is not
 // structurally recognizable here": the check stops and the encoding/json
 // walk reports the format error instead. It is never returned to callers.
 var errUndecided = errors.New("darksafe: unrecognized JSON structure")
+
+// maxJSONDepth is the maximum nesting depth a configuration document may
+// have: the outermost value is level 1 and entering one object or array adds
+// one level, however the two are mixed. Members and array items at the same
+// level do not add up, and brackets inside strings are text, not structure.
+// The limit covers every field — known or unknown, on disabled or
+// filtered-out candidates alike — so a document carrying arbitrarily deep
+// extra content is rejected as a configuration error instead of consuming
+// unbounded stack and memory in the reading process. It constrains only the
+// JSON document structure; a directly constructed ReleasePlanInput is not
+// subject to it.
+const maxJSONDepth = 10000
+
+// nestingDepthError reports a document whose nesting exceeds maxJSONDepth.
+// The message is fixed — it never embeds a location path, so it stays the
+// same length however much deeper the offending input goes.
+type nestingDepthError struct{}
+
+func (e *nestingDepthError) Error() string {
+	return fmt.Sprintf("JSON 嵌套深度超限: 最多允许 %d 层嵌套", maxJSONDepth)
+}
 
 // jsonWalker is a recursive-descent reader over the raw document bytes. It
 // sees the text before any decoding, so corrupt bytes and escapes are still
@@ -50,6 +74,9 @@ var errUndecided = errors.New("darksafe: unrecognized JSON structure")
 type jsonWalker struct {
 	data []byte
 	pos  int
+	// depth is the nesting level of the innermost object or array the walk
+	// has entered and not yet left; the outermost container is level 1.
+	depth int
 	// onMember, when set, is called for every object member in document
 	// order with the owning object's location and the decoded member name.
 	// A non-nil result aborts the walk and is propagated to the caller.
@@ -97,7 +124,24 @@ func (w *jsonWalker) value(path string) error {
 	}
 }
 
+// enter records the descent into one object or array and rejects the
+// document when that takes the nesting beyond maxJSONDepth. The rejection is
+// a definitive verdict, not errUndecided: an over-deep document is a
+// configuration error in its own right, and stopping here also keeps the
+// walk itself from recursing without bound.
+func (w *jsonWalker) enter() error {
+	w.depth++
+	if w.depth > maxJSONDepth {
+		return &nestingDepthError{}
+	}
+	return nil
+}
+
 func (w *jsonWalker) object(path string) error {
+	if err := w.enter(); err != nil {
+		return err
+	}
+	defer func() { w.depth-- }()
 	w.pos++ // consume '{'
 	w.skipSpace()
 	if w.pos < len(w.data) && w.data[w.pos] == '}' {
@@ -143,6 +187,10 @@ func (w *jsonWalker) object(path string) error {
 }
 
 func (w *jsonWalker) array(path string) error {
+	if err := w.enter(); err != nil {
+		return err
+	}
+	defer func() { w.depth-- }()
 	w.pos++ // consume '['
 	w.skipSpace()
 	if w.pos < len(w.data) && w.data[w.pos] == ']' {

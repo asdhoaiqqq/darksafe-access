@@ -438,11 +438,56 @@ func (r *archiveReader) decisionRecord() *DecisionRecord {
 	return d
 }
 
-// DecodeAuditArchive reads one archive produced by EncodeAuditArchive and
-// returns records that can be handed directly to RecheckDecisionOffline.
-// org is the organization the caller expects, and cp is the checkpoint the
-// caller independently retained; the checkpoint embedded in the file is
-// never treated as evidence, so even an archive carrying a plausible
+// VerifiedAuditArchive is one archive whose complete content has already
+// been decoded AND chain-validated against the checkpoint the caller
+// independently retained. It exists so the offline review command performs
+// the whole-material VerifyAudit check exactly once: the decode proves the
+// chain, and the subsequent decision review reuses that verdict instead of
+// re-walking the same records.
+//
+// The type carries no "valid" flag to toggle. A value is obtained only
+// from DecodeVerifiedAuditArchive, which returns nothing on failure, so a
+// value that exists has been validated for exactly its Org/Checkpoint
+// against exactly its records. It is not a cache keyed by archive bytes:
+// changing the material or swapping the checkpoint means decoding again,
+// and a previously obtained value can never certify different bytes. The
+// records it holds are kept unexported precisely so code outside this
+// package cannot mutate already validated material and then reuse the old
+// verdict — different bytes are only reachable through a fresh,
+// re-validating decode. The records are detached from the archive bytes
+// and the returned decisions are detached from them.
+type VerifiedAuditArchive struct {
+	// Org is the organization the archive validated as belonging to.
+	Org string
+	// Checkpoint is the independently retained checkpoint the records were
+	// validated against (the same one passed to the decode).
+	Checkpoint Checkpoint
+	// records is the complete, chain-validated export; only the decoder can
+	// populate it and only the review method reads it.
+	records []AuditRecord
+}
+
+// RecheckDecisionOffline reviews one decision in an already validated
+// archive without a second whole-chain validation. It is the
+// decode-then-review continuation of DecodeVerifiedAuditArchive: because
+// the receiver exists only as the result of a successful validation for
+// its own org and checkpoint, the material is trusted for THIS call and
+// only the target decision is replayed (see recheckValidated). The result
+// is read-only and detached from the receiver exactly like the standalone
+// RecheckDecisionOffline function, and every error distinction —
+// ErrAuditNotFound, ErrAuditNotADecision and ErrVersionNotFound — is
+// unchanged.
+func (a *VerifiedAuditArchive) RecheckDecisionOffline(seq int) (OfflineDecisionReview, error) {
+	return recheckValidated(a.Org, a.records, seq)
+}
+
+// DecodeVerifiedAuditArchive reads one archive produced by
+// EncodeAuditArchive, validates its complete content, and on success
+// returns a VerifiedAuditArchive whose records can be handed straight to
+// its RecheckDecisionOffline method without re-validating. org is the
+// organization the caller expects, and cp is the checkpoint the caller
+// independently retained; the checkpoint embedded in the file is never
+// treated as evidence, so even an archive carrying a plausible embedded
 // checkpoint only validates against the one supplied here.
 //
 // A missing organization is ErrMissingOrganization. Unrecognized framing,
@@ -451,12 +496,12 @@ func (r *archiveReader) decisionRecord() *DecisionRecord {
 // decode but are missing, out of order, foreign to the organization,
 // modified (including a record after the one the caller intends to review)
 // or mismatched with the supplied checkpoint fail the whole read with
-// ErrInvalidRange. Failure returns no records. A successful read only
+// ErrInvalidRange. Failure returns no archive. A successful decode only
 // proves the material matches the checkpoint: an original decision that
 // disagrees with a recomputed one is reported later by offline review, not
 // treated as archive damage. The result is detached from archive (mutating
 // one never reaches the other), and the call is read-only.
-func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecord, error) {
+func DecodeVerifiedAuditArchive(archive []byte, org string, cp Checkpoint) (*VerifiedAuditArchive, error) {
 	if org == "" {
 		return nil, ErrMissingOrganization
 	}
@@ -521,7 +566,10 @@ func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecor
 
 	// Content checks reuse the exact audit-range validation the live export
 	// and offline review paths use, so an archive can never smuggle in a
-	// shape those entry points would reject.
+	// shape those entry points would reject. This is the single
+	// whole-material validation of the decode-then-review path: the
+	// returned VerifiedAuditArchive carries the verdict forward and its
+	// decision review never walks the chain a second time.
 	if embeddedOrg != org {
 		return nil, fmt.Errorf("%w: archive organization %q does not match %q", ErrInvalidRange, embeddedOrg, org)
 	}
@@ -534,5 +582,40 @@ func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecor
 	if err := VerifyAudit(org, records, cp); err != nil {
 		return nil, err
 	}
-	return records, nil
+	return &VerifiedAuditArchive{Org: org, Checkpoint: cp, records: records}, nil
+}
+
+// DecodeAuditArchive reads one archive produced by EncodeAuditArchive and
+// returns records that can be handed directly to the standalone
+// RecheckDecisionOffline function. org is the organization the caller
+// expects, and cp is the checkpoint the caller independently retained; the
+// checkpoint embedded in the file is never treated as evidence, so even an
+// archive carrying a plausible embedded checkpoint only validates against
+// the one supplied here.
+//
+// A missing organization is ErrMissingOrganization. Unrecognized framing,
+// truncation, a trailing second archive or any other extra byte, a bad
+// checksum, and undecodable content are ErrInvalidArchive. Records that
+// decode but are missing, out of order, foreign to the organization,
+// modified (including a record after the one the caller intends to review)
+// or mismatched with the supplied checkpoint fail the whole read with
+// ErrInvalidRange. Failure returns no records. A successful read only
+// proves the material matches the checkpoint: an original decision that
+// disagrees with a recomputed one is reported later by offline review, not
+// treated as archive damage. The result is detached from archive (mutating
+// one never reaches the other), and the call is read-only.
+//
+// This is the raw-material form of the decoder: it hands back records the
+// standalone RecheckDecisionOffline validates again itself, so a caller
+// that obtained the records through any route still gets the full check on
+// every call. Code that decodes an archive solely to review one of its
+// decisions should instead use DecodeVerifiedAuditArchive and its
+// RecheckDecisionOffline method, which validate the whole material exactly
+// once rather than verifying the chain on both sides.
+func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecord, error) {
+	validated, err := DecodeVerifiedAuditArchive(archive, org, cp)
+	if err != nil {
+		return nil, err
+	}
+	return validated.records, nil
 }

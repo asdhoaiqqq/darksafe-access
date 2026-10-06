@@ -38,8 +38,12 @@ type OfflineDecisionReview struct {
 // the supplied material nor appends audit records, and the returned
 // decisions are detached from the input slices.
 //
-// The entire export is chain-validated before any result is produced;
-// tampering anywhere, including in records after the target, fails the
+// This standalone entry point treats its arguments as unverified
+// material: every call validates the WHOLE export itself (see
+// validateReviewMaterial) before any result is produced, so a caller never
+// has to run another entry point first, and a previous validation can
+// never be reused after the material, organization or checkpoint changed.
+// Tampering anywhere, including in records after the target, fails the
 // review. Distinguishable errors follow the other audit entry points:
 // ErrMissingOrganization for an empty organization, ErrAuditNotFound for a
 // non-positive or absent target sequence, and ErrAuditNotADecision when the
@@ -60,15 +64,40 @@ type OfflineDecisionReview struct {
 // reports version 0 with no matched policies; it is then compared field by
 // field with the preserved original and may come back inconsistent.
 func RecheckDecisionOffline(org string, records []AuditRecord, cp Checkpoint, seq int) (OfflineDecisionReview, error) {
-	if org == "" {
-		return OfflineDecisionReview{}, ErrMissingOrganization
-	}
-	// Validate the whole export first. A subject-filtered page, a fragment
-	// missing the beginning, or a checkpoint that does not pin the records
-	// all fail here, as does any corruption after the target.
-	if err := VerifyAudit(org, records, cp); err != nil {
+	if err := validateReviewMaterial(org, records, cp); err != nil {
 		return OfflineDecisionReview{}, err
 	}
+	return recheckValidated(org, records, seq)
+}
+
+// validateReviewMaterial is the whole-material gate for the standalone
+// offline review entry point: the organization check followed by the
+// complete VerifyAudit chain validation. The decode-then-review path runs
+// the equivalent check once itself while decoding (see
+// DecodeVerifiedAuditArchive) and then calls recheckValidated directly, so
+// across either shape the chain is walked exactly once per invocation and
+// the integrity rules are always VerifyAudit's.
+//
+// A subject-filtered page, a fragment missing the beginning, a checkpoint
+// that does not pin the records, or any corruption after the target all
+// fail here, before the target decision is even read.
+func validateReviewMaterial(org string, records []AuditRecord, cp Checkpoint) error {
+	if org == "" {
+		return ErrMissingOrganization
+	}
+	return VerifyAudit(org, records, cp)
+}
+
+// recheckValidated reviews one decision in material the caller has already
+// put through validateReviewMaterial for THIS org. It performs no chain
+// validation of its own: the whole-export check is the caller's one
+// validation, and running it again here would re-verify the same records
+// within a single command invocation. Everything below — target lookup,
+// historical-version recovery and request replay — is pure review over
+// the already verified material. Material integrity cannot fail here
+// because it was proved before the call; only target lookup and
+// historical-version problems still return an error.
+func recheckValidated(org string, records []AuditRecord, seq int) (OfflineDecisionReview, error) {
 	if seq < 1 {
 		return OfflineDecisionReview{}, fmt.Errorf("%w: sequence %d", ErrAuditNotFound, seq)
 	}

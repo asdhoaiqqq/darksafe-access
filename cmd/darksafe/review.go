@@ -265,12 +265,18 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 	}
 
 	cp := darksafe.Checkpoint{Org: in.org, EndSeq: in.endSeq, Fingerprint: in.fingerprint}
-	records, err := darksafe.DecodeAuditArchive(archive, in.org, cp)
+	// Decode and validate in one step: a successful decode hands back an
+	// already chain-verified archive, so the review below replays only the
+	// target decision and the whole chain is checked exactly once per
+	// invocation. The standalone RecheckDecisionOffline function still
+	// validates raw material itself; this command has no raw material at the
+	// review point and must not re-verify what the decode just proved.
+	validated, err := darksafe.DecodeVerifiedAuditArchive(archive, in.org, cp)
 	if err != nil {
 		fmt.Fprintf(stderr, "review: archive validation failed: %v\n", err)
 		return reviewExitFailed
 	}
-	review, err := darksafe.RecheckDecisionOffline(in.org, records, cp, in.seq)
+	review, err := validated.RecheckDecisionOffline(in.seq)
 	if err != nil {
 		fmt.Fprintf(stderr, "review: %v\n", err)
 		return reviewExitFailed

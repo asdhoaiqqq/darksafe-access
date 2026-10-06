@@ -39,6 +39,11 @@ type reviewInputs struct {
 	seq         int
 	endSeq      int
 	fingerprint string
+	// json selects machine-readable JSON output instead of the default text
+	// report. The review itself is identical either way: the same archive
+	// validation and the same historical recheck, never a re-submitted
+	// request.
+	json bool
 }
 
 func reviewHelp(w io.Writer) {
@@ -64,6 +69,19 @@ Required inputs:
                        records); must not be negative
   --fingerprint HEX    checkpoint fingerprint retained separately from the
                        archive (64 hexadecimal SHA-256 characters)
+  --json               emit the review as one complete JSON object on
+                       stdout instead of the text report. The object gives
+                       "target_sequence", "original" and "recomputed"
+                       decisions (each with "allowed", "reason",
+                       "matched_policies" in original order, and
+                       "policy_version"), and "consistent". A valid UTF-8
+                       string is a JSON string; a string that is not valid
+                       UTF-8 is the object {"base64": "<standard base64 of
+                       the exact bytes>"}, so a lone 0xFF, a lone 0xFE and a
+                       real U+FFFD never collapse together and every string's
+                       original bytes can be recovered. A nil and an empty
+                       matched list both render as []. On any failure stdout
+                       stays empty and the reason goes to stderr only.
 
 The checkpoint carried inside the archive is informational only: validation
 always uses --end-seq/--fingerprint supplied here. Even when --seq points at
@@ -77,18 +95,25 @@ are never substituted. A chain that is valid but whose original and
 recomputed decisions disagree is still printed in full and exits 0; the
 disagreement is shown explicitly rather than reported as file damage.
 
-Strings may contain spaces, control characters or non-UTF-8 bytes; output
-quoting keeps different raw bytes distinguishable. This command only reads
-the named archive: it neither rewrites it nor appends audit records.
+Strings may contain spaces, control characters or non-UTF-8 bytes; the text
+report uses Go-style quoting, while --json uses the JSON string /
+{"base64": ...} rule described above, and both keep different raw bytes
+distinguishable. This command only reads the named archive: it neither
+rewrites it nor appends audit records.
 
 Exit codes: 0 review complete (decisions may disagree), 1 archive or target
 invalid / historical version unavailable, 2 bad arguments or unreadable
-file.
+file. --json changes none of these.
 
 Example:
   (materials produced by examples/offline_review; seq 1 is the
   policy publish record, seq 2 is the read decision being reviewed)
   darksafe review --archive acme-factory.audit \
+      --org 'acme factory' --seq 2 --end-seq 2 \
+      --fingerprint 04b274dbb4cf039bbb4b78f5ee5aae03278d2c34833fe87fecb13ade51ef5299
+
+  add --json to get the same review as one JSON object:
+  darksafe review --json --archive acme-factory.audit \
       --org 'acme factory' --seq 2 --end-seq 2 \
       --fingerprint 04b274dbb4cf039bbb4b78f5ee5aae03278d2c34833fe87fecb13ade51ef5299
 `)
@@ -169,6 +194,20 @@ func parseReviewArgs(args []string) (in reviewInputs, wantHelp bool, err error) 
 				return reviewInputs{}, false, err
 			}
 			in.fingerprint = v
+		case "--json":
+			// Bare --json enables JSON output; --json=value accepts the
+			// usual boolean spellings. No value is ever consumed from the
+			// following token, so "--json --seq 2" keeps working.
+			switch {
+			case !hasValue:
+				in.json = true
+			default:
+				b, perr := strconv.ParseBool(value)
+				if perr != nil {
+					return reviewInputs{}, false, fmt.Errorf("--json must be a boolean, got %q", value)
+				}
+				in.json = b
+			}
 		default:
 			return reviewInputs{}, false, fmt.Errorf("unknown review flag %q", arg)
 		}
@@ -228,6 +267,22 @@ func runReview(args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "review: %v\n", err)
 		return reviewExitFailed
+	}
+
+	if in.json {
+		// Render fully before touching stdout: a marshal failure must not
+		// leave a partial object, and every earlier failure path already
+		// returned with stdout untouched.
+		payload, err := renderReviewJSON(review)
+		if err != nil {
+			fmt.Fprintf(stderr, "review: cannot encode result as JSON: %v\n", err)
+			return reviewExitFailed
+		}
+		if _, err := stdout.Write(payload); err != nil {
+			fmt.Fprintf(stderr, "review: cannot write JSON result: %v\n", err)
+			return reviewExitFailed
+		}
+		return reviewExitOK
 	}
 
 	printReview(stdout, review)

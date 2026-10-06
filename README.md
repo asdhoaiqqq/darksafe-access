@@ -234,6 +234,7 @@ all querying was read-only: chain still 11 records, current version still 3
 | `--seq N` | 要复核的决策记录在该组织内的序号，正整数（从 1 开始）。 |
 | `--end-seq N` | **另行保留**的检查点截至序号（无记录组织为 0），不能为负。 |
 | `--fingerprint HEX` | **另行保留**的检查点指纹（64 个十六进制字符）。支持 `--flag value` 与 `--flag=value` 两种写法；`darksafe review --help` 可查看完整说明。
+| `--json` | 可选开关。加上后标准输出改为**一份完整的 JSON 对象**，便于把单条离线复核结果交给其他程序读取；不加则保持上面的文字报告不变。也接受 `--json=true/false`，不接受其后的位置值（`--json --seq 2` 照常工作）。 |
 
 要点：
 
@@ -245,6 +246,53 @@ all querying was read-only: chain still 11 records, current version still 3
 - 该命令只读指定归档，不改写归档或检查点，也不追加审计记录。
 
 退出码：`0` 已得到完整复核结果（含不一致）；`1` 归档校验失败（`ErrInvalidArchive`/`ErrInvalidRange`）、目标序号不存在（`ErrAuditNotFound`）、目标不是决策记录（`ErrAuditNotADecision`）或历史策略版本无法取得（`ErrVersionNotFound`），错误信息可区分且只写标准错误；`2` 文件无法读取、必填输入缺失、序号无法解析为整数、目标序号非正或截至序号为负，具体原因写标准错误。
+
+### `--json`：把单条复核结果作为 JSON 交付
+
+加上 `--json` 后，复核过程完全不变（仍然先 `DecodeAuditArchive` 全量链校验、再 `RecheckDecisionOffline` 按当时版本重算，不重新提交访问请求、不改用较新策略、不改写归档、不追加审计记录），只是标准输出变成**且仅变成**一份完整的 JSON 对象：没有标题、说明，也不混入文字版报告。任何失败（退出码 1 或 2）时标准输出保持为空，原因只写标准错误；即使目标序号靠前，只要归档后面的记录损坏，整次失败且不交付部分 JSON。
+
+对象字段与文字报告一一对应，目标序号与策略版本是两个独立字段：
+
+| JSON 字段 | 对应文字报告 | 含义 |
+| --- | --- | --- |
+| `target_sequence` | `target sequence` | 被复核的审计记录序号（不是策略版本号）。 |
+| `original` | `original decision` | 记录中保存的原决策。 |
+| `recomputed` | `recomputed decision` | 按归档材料与当时版本重算的决策。 |
+| `consistent` | `consistent: yes/no` | 两份决策是否逐字段一致；材料合法但结论不一致时为 `false`，退出码仍是 0。 |
+
+每份决策对象包含：`allowed`（允许与否，布尔）、`reason`（理由）、`matched_policies`（命中策略标识列表，**顺序与文字报告一致**）、`policy_version`（实际策略版本；与 `target_sequence` 分开表示）。判断规则不因选择格式而改变：`nil` 与空命中列表仍视为一致，二者在 JSON 中都输出 `[]`。
+
+**字符串表示规则（公开约定）。** 理由与命中策略标识可以包含中文、首尾空格、换行、引号、反斜杠、控制字符以及非法 UTF-8 字节：
+
+- 字符串是**合法 UTF-8** 时，按普通 JSON 字符串输出：引号、反斜杠与控制字符按 JSON 规则转义（如 `"` → `\"`、换行 → `\n`、制表符 → `\t`），普通中文与真正的 U+FFFD 直接以可读 UTF-8 出现，控制字符不会破坏对象边界。
+- 字符串**不是合法 UTF-8** 时，输出对象 `{"base64": "<标准 base64>"}`，base64 载荷是该字符串**原始字节**的 RFC 4648 标准编码。两种表示形状互斥（字符串不可能是对象），接收方据此可无歧义还原每个字符串的原始字节：单个 `0xFF` 为 `{"base64": "/w=="}`、`0xFE` 为 `{"base64": "/g=="}`，而真正的 U+FFFD 是合法 UTF-8，直接输出为字符串里的 `�`（JSON 转义形式 `"�"`），三者始终可区分，不会被静默替换成同一个字符。
+
+一份实际输出（在上面的 `acme factory` 材料上运行 `darksafe review --json ...`）：
+
+```json
+{
+  "target_sequence": 2,
+  "original": {
+    "allowed": true,
+    "reason": "matched allow policy",
+    "matched_policies": [
+      "p-ledger-read-2026"
+    ],
+    "policy_version": 1
+  },
+  "recomputed": {
+    "allowed": true,
+    "reason": "matched allow policy",
+    "matched_policies": [
+      "p-ledger-read-2026"
+    ],
+    "policy_version": 1
+  },
+  "consistent": true
+}
+```
+
+接收方用任意标准 JSON 解析器读取即可；还原字符串时：字段是 JSON 字符串就按其 UTF-8 字节取用，字段是 `{"base64": ...}` 对象则对载荷做标准 base64 解码得到原始字节。
 
 ## 完整示例：先保存一条真实决策，再离线复核
 

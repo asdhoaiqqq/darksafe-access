@@ -72,6 +72,68 @@ decide  (subject org mismatch)     : allowed=false reason="organization mismatch
 - 请求缺少资源 ID、主体停用或组织不一致时，仍按既有信封规则拒绝，资源限定不能绕过任何检查。
 - 限定作为策略内容随版本保存：历史查询、回滚、`Review`、`RecheckDecision` 与离线复核都使用当时的限定；事后把策略从甲改到乙不影响旧决策的复核结论。限定字段纳入审计指纹（为空时沿用历史指纹编码，旧记录与旧导出的指纹、检查点不变），修改导出材料中的限定而保留原指纹与检查点会导致校验失败；含非 UTF-8 字节时按原始字节保存与校验。
 
+### 完整示例：一次失败的替换发布为什么没有改变已有授权
+
+`Publish` 是**整套替换、先校验后提交**：一次提交里只要有一条策略非法，整批都不会生效——集内那条本身合法的拒绝策略也不会"先应用一半"。完整程序是 [`examples/publish_atomicity/main.go`](examples/publish_atomicity/main.go)，只依赖本项目公开 API 与 Go 标准库，自行建立内存存储与请求，在本机离线即可复现：
+
+```bash
+go run ./examples/publish_atomicity
+```
+
+场景固定为**同一组织、同一启用主体对同一资源的读取**：组织 `acme factory`，主体 `svc-billing`（启用、不带任何角色），资源 `billing-2026`，作用域 `acme/factory/billing`。决策组织、主体组织、资源组织三者一致，作用域合法，因此结论完全由该组织**当前已发布策略**按组织级默认拒绝、拒绝优先的规则决定。程序连续展示五步：
+
+1. **发布一组允许读取的策略，成为版本 1**；同一读取被允许，理由 `matched allow policy`、命中标识 `p-billing-read-allow`、实际版本 1。发布与这次决策各自留下一条审计记录（序号 1 策略变更、序号 2 决策）。
+2. **提交一组打算把读取改为拒绝的新策略集**：一条本身合法的拒绝策略 `p-billing-read-deny`，加一条作用域含**连续斜杠**的非法策略（`acme//factory/billing`）。`Publish` 明确返回 `ErrInvalidPolicySet`（而不是 `ErrVersionConflict`），返回版本为 0：合法的拒绝策略不会被先应用，也不占用新版本号；当前版本仍是 1，版本 2 不存在，版本 1 的内容原样保留。
+3. **为观察效果，在失败提交之后用完全相同的请求再做一次 `Decide`**：读取**仍然被允许**，理由、命中标识与实际版本全部来自原策略（版本 1），不会出现只存在于失败集合里的标识。这里必须区分两件事：**失败的发布本身不增加任何审计记录，检查点（截至序号与指纹）逐字节不变**；而这次为观察效果发起的决策是另一次独立操作，它按已有规则正常留下一条**新的决策记录（序号 3）**——不能把这条记录算作失败发布产生的变更。
+4. **把非法策略修正后，以未变的当前版本（`expectedVersion=1`）重新提交整组策略**：生成紧接原版本的**版本 2**，同一读取转为拒绝，输出明确的拒绝理由 `matched deny policy`、命中策略 `p-billing-read-deny` 与实际版本 2。版本 2 的策略变更记录保存的是**完整新策略集**；发布是整组**替换**而非把本次策略追加到旧集——v1 的允许策略既不在新集里也不再出现在命中列表。历史不可改写，`Policies(org, 1)` 仍能查询版本 1 的原内容。
+5. **另一个影响提交的边界：策略内容合法但预期版本已经过期**。版本 2 已存在后仍以 `expectedVersion=1` 提交，返回 `ErrVersionConflict`：不覆盖当前策略、不推进当前版本，也不留下变更记录。使用者需要先依据 `CurrentVersion`/`Policies` 看清当前内容，再决定是否再次提交。
+
+输出刻意把三个容易被当成同一个数的数字分成不同字段：
+
+- `Publish -> new version N` 是**发布成功返回的新版本号**（失败时为 0，不返回可用版本）；
+- 决策行的 `applied-version=N` 是**这次访问实际使用的策略版本**——失败提交之后它仍然是 1，发布成功之后才变成 2；
+- `[audit]` 行的 `head-seq=N` 是**审计链记录序号**，每次成功发布和每次决策各占一个连续序号，与策略版本号没有数值上的对应关系（如版本 2 的发布是审计序号 4）。
+
+预期输出（确定性，重复运行逐字节一致；指纹由记录内容决定，可直接对照两次"checkpoint unchanged"）：
+
+```text
+step 1: publish the allow-read policy set
+  Publish -> new version 1
+    policy id="p-billing-read-allow" subject="svc-billing" action="read" scope="acme/factory/billing" effect="allow" recursive=false resource-id=""
+  Decide  -> allowed=true reason="matched allow policy" matched=["p-billing-read-allow"] applied-version=1
+  [audit] after v1 publish + allow decision            records=2 head-seq=2 head-fingerprint=825ce1048b4fb3f1f120c9e2ef16421e090ff7d0a192b3c622c4d3d24671f60b
+
+step 2: replace the set with a batch containing an illegal policy
+    policy id="p-billing-read-deny" subject="svc-billing" action="read" scope="acme/factory/billing" effect="deny" recursive=false resource-id=""
+    policy id="p-billing-read-extra" subject="svc-billing" action="read" scope="acme//factory/billing" effect="allow" recursive=false resource-id=""
+  Publish -> returned version=0 err=darksafe: invalid policy set: policy "p-billing-read-extra" has invalid scope: scope "acme//factory/billing" contains consecutive slashes
+  [audit] immediately after failed publish             records=2 head-seq=2 head-fingerprint=825ce1048b4fb3f1f120c9e2ef16421e090ff7d0a192b3c622c4d3d24671f60b
+  [audit] checkpoint unchanged vs "after v1 publish + allow decision": head-seq=2 fingerprint=825ce1048b4fb3f1f120c9e2ef16421e090ff7d0a192b3c622c4d3d24671f60b
+
+step 3: observe with the same read after the failed publish
+  Decide  -> allowed=true reason="matched allow policy" matched=["p-billing-read-allow"] applied-version=1
+  [audit] after the observation decision               records=3 head-seq=3 head-fingerprint=50cee1631861b4a4385bb702980088264b95874c0fe5b70dafb6fca30527c685
+  the failed publish added no record; seq 3 comes from this separate Decide, not from the failure
+
+step 4: fix the scope and resubmit the complete set against current version 1
+    policy id="p-billing-read-deny" subject="svc-billing" action="read" scope="acme/factory/billing" effect="deny" recursive=false resource-id=""
+    policy id="p-billing-read-extra" subject="svc-billing" action="read" scope="acme/factory/billing/audit" effect="allow" recursive=false resource-id=""
+  Publish -> new version 2 (immediate successor of 1)
+  Decide  -> allowed=false reason="matched deny policy" matched=["p-billing-read-deny"] applied-version=2
+  version-2 change record stores the complete new set ["p-billing-read-deny" "p-billing-read-extra"] (nothing appended from v1)
+  Policies(org, 1) still returns the original set ["p-billing-read-allow"]
+  [audit] after v2 publish + deny decision             records=5 head-seq=5 head-fingerprint=b0462b288c2ec2cda884e63ee580879c329d77810de3517977d1db02b9ae68a2
+
+step 5: submit legal content against a stale expected version
+    policy id="p-billing-read-allow" subject="svc-billing" action="read" scope="acme/factory/billing" effect="allow" recursive=false resource-id=""
+  Publish -> returned version=0 err=darksafe: version conflict: expected 1, current is 2
+  current version stays 2 and its set is untouched; re-read it before resubmitting
+  [audit] immediately after stale submit               records=5 head-seq=5 head-fingerprint=b0462b288c2ec2cda884e63ee580879c329d77810de3517977d1db02b9ae68a2
+  [audit] checkpoint unchanged vs "after v2 publish + deny decision": head-seq=5 fingerprint=b0462b288c2ec2cda884e63ee580879c329d77810de3517977d1db02b9ae68a2
+```
+
+对照审计序号看这次过程（五步结束后共 5 条记录）：序号 1 是版本 1 的策略变更；序号 2 是第 1 步的允许决策；序号 3 是第 3 步观察决策——它与序号 2 的结论完全相同（同为版本 1 下的允许），但它是失败发布**之后**一次独立 `Decide` 留下的新记录；序号 4 是版本 2 的策略变更，记录里是完整新策略集；序号 5 是版本 2 下的拒绝决策。第 2 步的失败发布在 2 与 3 之间没有留下任何序号，第 5 步的过期提交在 5 之后也没有——两次失败后 `head-seq` 与指纹都保持不变，正是"失败提交不改变已有授权、也不改变审计链"的直接证据。
+
 ### 跨作用域示例：上级递归拒绝为什么压过下级精确允许
 
 `Decide` 的冲突规则不是"更具体者胜"，而是**拒绝优先（deny-overrides）**：先按主体、动作、作用域（含 `Recursive` 子作用域）与可选资源限定找出**全部**命中策略；只要其中有一条拒绝，结果就是拒绝（理由 `matched deny policy`），作用域更精确的允许不会把它"覆盖"掉。命中列表保留**所有**命中策略的标识并按标识升序排列——包括被压过的那条允许，它是冲突可复核的证据，而不是被最终决定抹掉。完整跨层级示例是 [`examples/scope_deny_override/main.go`](examples/scope_deny_override/main.go)，只依赖本项目公开 API 与 Go 标准库，自行创建内存存储并真实发布策略：

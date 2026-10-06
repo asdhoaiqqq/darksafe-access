@@ -811,6 +811,51 @@ func (s *MetricStore) queryFromObject(raw json.RawMessage) (any, *LineError) {
 	}
 }
 
+// scanQueryOp 在逐字段严格校验之前单独扫一遍查询对象，只确认 op 的出现情况：
+// op 恰好出现一次且值是受支持的操作字符串时返回该操作与 true；其余情况
+// （op 缺失、重复出现、值不是字符串或不是受支持的操作）返回 false，
+// 由严格解析按既有规则逐项报告。调用方保证 raw 是完整合法的 JSON 值，
+// 因此这里的解码不会失败；失败时按未确定处理，不影响后续的严格校验。
+// 字段名按转义还原后比较，与 parseStrictObject 的判重口径一致。
+func scanQueryOp(raw json.RawMessage) (op string, certain bool) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	tok, err := dec.Token()
+	if err != nil {
+		return "", false
+	}
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return "", false
+	}
+	count := 0
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return "", false
+		}
+		key, _ := keyTok.(string)
+		var v any
+		if err := dec.Decode(&v); err != nil {
+			return "", false
+		}
+		if key == "op" {
+			count++
+			if s, ok := v.(string); ok {
+				op = s
+			} else {
+				op = ""
+			}
+		}
+	}
+	if count != 1 {
+		return "", false
+	}
+	switch op {
+	case "query", "query_points", "query_windows":
+		return op, true
+	}
+	return "", false
+}
+
 // parseQuery 对查询对象做严格校验：仅允许 op/name/start/end/labels，
 // 以及仅 query_windows 使用的 step；拒绝重复键与未知字段；标量必须是精确的
 // JSON 类型，start/end 为 int64 毫秒。op 只接受 "query"（区间点数与均值）、
@@ -820,13 +865,18 @@ func (s *MetricStore) queryFromObject(raw json.RawMessage) (any, *LineError) {
 // 错误选择沿用既有次序：结构完整的对象按字段书写顺序暴露问题，已出现字段全部
 // 合法后才按 op、name、start、end 的顺序报告缺失的必填字段（step 是否必填要
 // 等 op 确定，其缺失由 queryFromObject 在四项必填齐全后判定）。step 的合法性
-// 依赖 op：读到 step 时若 op 已经出现且不是 query_windows，它就是未知字段，
-// 立即按书写次序拒绝；op 写在 step 之后时先暂存，四项必填检查之前统一补判，
-// 保证“已出现但对该 op 非法的字段”仍先于缺字段暴露。step 的值在出现处即按
-// JSON 正整数校验：int64 范围、大于零，缺失、类型不符或值不合法都指出 step。
+// 依赖 op：op 恰好出现一次且指定受支持操作时（由 scanQueryOp 在逐字段校验前
+// 确定），step 是否允许由该操作决定，与字段书写位置无关——query 与
+// query_points 中 step 是未知字段，无论写在 op 前后、值是正整数、零、字符串
+// 还是对象，都在 step 出现处按书写次序拒绝（不读其值，与 parseStrictObject
+// 对其他未知字段的处理一致），且先于缺字段与区间检查暴露；query_windows 中
+// step 的值在出现处即按 JSON 正整数校验：int64 范围、大于零，缺失、类型不符
+// 或值不合法都指出 step。op 缺失、重复、类型错误或未知操作时不做预判，
+// 沿用逐字段的既有处理（op 自身的问题由字段校验与必填检查报告）。
 func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 	var q parsedQuery
 	q.basicGiven = map[string]bool{}
+	certainOp, opCertain := scanQueryOp(raw)
 	err := parseStrictObject(raw,
 		"each query must be a JSON object",
 		"unexpected content after the query object",
@@ -864,8 +914,14 @@ func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 				return readLabelsField(dec, `field "labels" must be an object of non-empty string keys to string values`, &q.labels)
 			},
 			"step": func(dec *json.Decoder) error {
-				// op 已出现且不是 query_windows：对该操作 step 是未知字段，
-				// 不读其值，直接按书写次序拒绝（与 parseStrictObject 的未知字段处理一致）。
+				// op 已唯一确定且不是 query_windows：对该操作 step 是未知字段，
+				// 无论写在 op 前后、值是什么，都在此处按书写次序拒绝，
+				// 不读其值（与 parseStrictObject 的未知字段处理一致）。
+				if opCertain && certainOp != "query_windows" {
+					return fmt.Errorf(`unknown field "step"`)
+				}
+				// op 未经预判但已读到合法的 op 值（如 op 重复出现时第二个
+				// op 之前的 step）：沿用同一判定。
 				if q.op != "" && q.op != "query_windows" {
 					return fmt.Errorf(`unknown field "step"`)
 				}
@@ -881,13 +937,6 @@ func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 		})
 	if err != nil {
 		return q, err
-	}
-	// op 写在 step 之后时，读完对象才知道 step 对该 op 是否合法；该判定属于
-	// “已出现字段的合法性”，必须先于下面的必填字段缺失检查。op 本身缺失时不在这里
-	// 判定 step 未知——请求可能是漏写 op 的 query_windows，交给下面的固定必填次序
-	// 先报告 op（与“缺字段检查先于区间检查”等既有选择规则一致）。
-	if q.stepGiven && q.op != "" && q.op != "query_windows" {
-		return q, fmt.Errorf(`unknown field "step"`)
 	}
 	// 必填项固定按 op、name、start、end 的顺序报告第一个缺项，与字段书写位置无关。
 	for _, field := range []string{"op", "name", "start", "end"} {

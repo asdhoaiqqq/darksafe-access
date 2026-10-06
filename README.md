@@ -28,7 +28,7 @@ printf '%s\n' \
 
 同一对象内不允许重复键，且字段名是否重复以 JSON 转义还原后的字符为准：采样点同时直接书写 `name`、又把首字母 n 写成十六进制转义（`\u006eame`），还原后两个键都是 name，即重复指标名字段；`labels` 内的 `host` 与 `\u0068ost` 同理为重复标签键。两个值完全相同也必须失败，值不同也不会静默选用其中一个或解释成两个标签/采样值冲突。标签键的判重先于第二次值的类型校验：某个非空标签键第一次出现且值为合法字符串后再次出现，无论第二次的值是字符串、数字、布尔、null、对象还是数组，都报告重复标签键（原因指出转义还原后的键名），第二次值的类型不会把它掩盖成“标签值必须是字符串”；若该键第一次出现时值就不是字符串，仍报告那次值的类型错误。写入批次里出错采样点按数组中从 1 开始的位置给出 `index`，错误原因指出重复字段或标签键且不附带 `conflict`，该批次前面的合法新增点同样不提交，此前成功写入的数据仍可查询到原来的数量与均值；查询对象或其标签条件出现重复键时返回查询错误，不带 `index` 与 `conflict`，也不返回查询结果。判重只在同一个对象内进行：不同采样点各自携带同名字段、采样点的字段名与其标签键同名都合法；两个合法采样点表示同一序列、同一时间戳且值相等时仍按既有重复采样点规则忽略并计入 duplicates。字段名只以转义形式出现一次时与直接书写同名同义，可照常写入与查询。
 
-查询对 `[start,end]` 闭区间内的点按序列返回 `count` 与算术平均 `average`；`labels` 省略或为 `{}` 时匹配该指标的全部序列，否则按子集匹配。需要查看区间内的原始采样点时，把对象行的 `op` 写为 `query_points`，沿用相同的查询条件取得采样明细（见下文「查看区间内原始采样点」）。详见 `go run ./cmd/darksafe help`。
+查询对 `[start,end]` 闭区间内的点按序列返回 `count` 与算术平均 `average`；`labels` 省略或为 `{}` 时匹配该指标的全部序列，否则按子集匹配。需要查看区间内的原始采样点时，把对象行的 `op` 写为 `query_points`，沿用相同的查询条件取得采样明细（见下文「查看区间内原始采样点」）。需要按固定宽度时间窗口分别统计点数与均值时，把 `op` 写为 `query_windows` 并额外给出毫秒窗口宽度 `step`（见下文「按固定时间窗口统计：query_windows」）。详见 `go run ./cmd/darksafe help`。
 
 ## 重复与冲突：同一序列、同一时间戳的再次提交
 
@@ -411,6 +411,34 @@ printf '%s\n' \
 ```
 
 第一条明细查询的区间 `[1000,2000]` 包含两个端点，列出前两个点，3000 上的点不出现；第二条的起止时间相等，只返回 3000 上的采样。
+
+## 按固定时间窗口统计：query_windows
+
+`query` 给出整条区间上的点数与均值，`query_points` 列出原始采样；需要按固定时间粒度分窗统计时，把对象行的 `op` 写为 `query_windows`。它沿用 `name`、`start`、`end` 与可选 `labels`（名称精确、标签子集、`[start,end]` 闭区间、序列排列次序都与 `query` 一致），并额外要求 `step`：毫秒窗口宽度，必须是大于零且在 int64 范围内的 JSON 整数。缺失、类型不符（字符串、布尔、小数、科学计数写出的非整数等）或值不合法（零、负数、超出 int64）都返回查询错误并指出 `step`；`step` 只用于这一新操作，`query` 与 `query_points` 携带 `step` 仍按未知字段拒绝。
+
+查询区间按 `step` 从 `start` 起连续划分，每个窗口包含首尾毫秒：第 k 个窗口为 `[start+k*step, start+(k+1)*step-1]`，最后一个截到 `end`；所有序列共用这同一组窗口边界。例如区间 `[1000,3000]`、`step` 为 `1000` 时，窗口是 `[1000,1999]`、`[2000,2999]`、`[3000,3000]`——最后一个窗口只有 1 毫秒。每个点只归入一个窗口（按 `floor((timestamp-start)/step)`）；`start` 等于 `end` 时也允许查询，命中的点全部归入唯一窗口。即使起止时间接近 int64 上下界、`step` 接近 int64 上界，窗口也不会溢出、倒置或遗漏采样。
+
+成功结果保持查询结果的外层格式，`op` 为 `query_windows`；每条序列保留完整指标名与完整标签集合，在 `windows` 中按窗口起点升序列出**实际有点**的窗口，每个窗口给出 `start`、`end`、`count`、`average`。空窗口不补零；整个区间没有点的序列不列出；无任何命中时 `series` 为 `[]`。`count` 统计该窗口内已成功保存的点（等值重复不计）；`average` 与 `query` 完全相同——按实际存储的 float64 值在有理数上精确求和、精确除以点数，再舍入到最近的可表示 float64（正中取偶，精确为零输出 `0`），因此同一窗口内正负大数抵消后的小余量不会丢失，窗口总和超出 float64 范围时平均仍是有限值。该操作只读，不改变存储。
+
+```bash
+printf '%s\n' \
+'[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}},{"name":"cpu","timestamp":1500,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":3000,"value":8,"labels":{"host":"a"}},{"name":"cpu","timestamp":2500,"value":6,"labels":{"host":"b"}}]' \
+'{"op":"query_windows","name":"cpu","start":1000,"end":3000,"step":1000}' \
+'{"op":"query_windows","name":"cpu","start":1000,"end":3000,"step":1000,"labels":{"host":"a"}}' \
+'{"op":"query_windows","name":"cpu","start":3000,"end":3000,"step":1000,"labels":{"host":"a"}}' \
+| go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":4,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2},{"timestamp":1500,"value":4},{"timestamp":3000,"value":8}]},{"name":"cpu","labels":{"host":"b"},"points":[{"timestamp":2500,"value":6}]}]}
+{"status":"ok","op":"query_windows","series":[{"name":"cpu","labels":{"host":"a"},"windows":[{"start":1000,"end":1999,"count":2,"average":3},{"start":3000,"end":3000,"count":1,"average":8}]},{"name":"cpu","labels":{"host":"b"},"windows":[{"start":2000,"end":2999,"count":1,"average":6}]}]}
+{"status":"ok","op":"query_windows","series":[{"name":"cpu","labels":{"host":"a"},"windows":[{"start":1000,"end":1999,"count":2,"average":3},{"start":3000,"end":3000,"count":1,"average":8}]}]}
+{"status":"ok","op":"query_windows","series":[{"name":"cpu","labels":{"host":"a"},"windows":[{"start":3000,"end":3000,"count":1,"average":8}]}]}
+```
+
+第二条查询省略 `labels`，两条序列共用 `[1000,1999]`、`[2000,2999]`、`[3000,3000]` 这组边界：host=a 在中间窗口没有点，该窗口整条不出现（不补零）；host=b 只在中间窗口有点，只列那一条。第三条带标签子集查询只返回 host=a；第四条起止相等，唯一窗口 `[3000,3000]` 归入该时间戳上的点。
+
+失败规则与另两种查询一致：倒置区间（即使 `step` 合法）仍报告 `start` 与 `end` 的实际取值；字段问题按书写次序暴露，`op`、`name`、`start`、`end` 四项必填齐全后才轮到 query_windows 特有的“缺 `step`”，区间倒置排在最后。失败结果保留原始行号，不带 `series`、`index` 或 `conflict`，后续输入照常处理。
 
 ## 技术方向
 

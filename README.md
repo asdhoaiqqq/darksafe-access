@@ -192,7 +192,7 @@ case 3: recursive deny on org/a cannot reach the sibling scope org/ab
 
 - 策略变更记录（`AuditPolicyChange`）：保留新版本号与该版本完整策略；回滚记录额外以 `SourceVersion`/`RolledBack` 说明来源版本。
 - 决策记录（`AuditDecision`）：保留完整请求以及实际返回的允许与否、理由、命中策略和实际版本（含未发布策略、主体停用、字段缺失、组织不一致等拒绝）。
-- `AuditQuery(org, startSeq, pageSize, kind, subject)`：按序号升序分页，可按类别或决策主体筛选（指定主体时只返回其决策记录）。首次查询固定“截至序号 + 指纹”检查点，后续用 `AuditPage(checkpoint, nextSeq, ...)` 翻页；查询期间新增的记录不会混入。无记录组织返回空页与序号 0 的根指纹。页大小非正、起始序号非法、范围倒置、截至序号超出当前记录或指纹不符均返回明确错误。
+- `AuditQuery(org, startSeq, pageSize, kind, subject, resource...)`：按序号升序分页，可按类别或决策主体筛选（指定主体时只返回其决策记录），还可追加一个可选的资源条件（至多一个），只返回请求中资源标识与之逐字节相等的决策记录——允许与拒绝都保留，包括主体停用、组织不一致等拒绝；比较区分大小写、不去首尾空格、不解释路径或通配符，中文、控制字符与非 UTF-8 字节各保持其含义，空字符串等同不设置。资源条件与类别、主体条件同时生效（合取）；它不会返回策略变更记录，因此与 `AuditPolicyChange` 类别同用时结果为空。不指定资源条件时行为与之前完全一致。首次查询固定"截至序号 + 指纹"检查点，后续用 `AuditPage(checkpoint, nextSeq, ...)` 翻页并传入同样的筛选条件；查询期间新增的记录不会混入。无记录组织返回空页与序号 0 的根指纹。页大小非正、起始序号非法、范围倒置、截至序号超出当前记录或指纹不符均返回明确错误。
 - `AuditExport(org, endSeq)`：导出截至序号内的完整记录（空组织导出空集与根检查点），返回的副本与内部状态完全脱离。
 - `VerifyAudit(org, records, checkpoint)`：纯函数，不依赖 Store，可离线校验。修改字段、删除中间或尾部记录、交换顺序、拼入其他组织记录都会验证失败。
 - `RecheckDecision(org, seq)`：按决策记录里保存的请求与其实际使用的策略版本恢复结论，后续发布/回滚不影响结果；非决策记录返回 `ErrAuditNotADecision`，序号不存在返回 `ErrAuditNotFound`。

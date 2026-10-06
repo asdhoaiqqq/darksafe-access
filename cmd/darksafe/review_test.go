@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -632,6 +633,108 @@ func TestLegacyCommandsSurvive(t *testing.T) {
 	}
 	if code, _, errOut := runDispatch(t, "bogus"); code != 2 || errOut == "" {
 		t.Fatalf("unknown command exit = %d stderr=%q", code, errOut)
+	}
+}
+
+// failingWriter rejects every write with a fixed error and records how many
+// times it was called.
+type failingWriter struct {
+	err   error
+	calls int
+}
+
+func (w *failingWriter) Write(p []byte) (int, error) {
+	w.calls++
+	return 0, w.err
+}
+
+// truncatingWriter accepts only the first limit bytes across all writes,
+// reporting a short count WITHOUT an error — the case a plain err check
+// cannot see. It records everything it accepted.
+type truncatingWriter struct {
+	limit    int
+	accepted bytes.Buffer
+	calls    int
+}
+
+func (w *truncatingWriter) Write(p []byte) (int, error) {
+	w.calls++
+	n := min(len(p), w.limit-w.accepted.Len())
+	if n < 0 {
+		n = 0
+	}
+	w.accepted.Write(p[:n])
+	return n, nil
+}
+
+// TestReviewReportWriteFailureExitsOne covers both output modes against a
+// receiver that refuses the report outright: exit 1, the concrete write
+// error preserved on stderr, and nothing delivered to stdout.
+func TestReviewReportWriteFailureExitsOne(t *testing.T) {
+	const org = "acme"
+	path, cp := fixtureChain(t, org)
+	writeErr := errors.New("disk full")
+
+	for _, mode := range []struct {
+		name string
+		args []string
+	}{
+		{"text", reviewArgs(path, org, 2, cp.EndSeq, cp.Fingerprint)},
+		{"json", jsonReviewArgs(path, org, 2, cp.EndSeq, cp.Fingerprint)},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			out := &failingWriter{err: writeErr}
+			var stderr bytes.Buffer
+			code := runReview(mode.args, out, &stderr)
+			if code != 1 {
+				t.Fatalf("exit = %d, want 1; stderr=%q", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "report output failed") {
+				t.Fatalf("stderr must name the report output failure, got %q", stderr.String())
+			}
+			if !strings.Contains(stderr.String(), writeErr.Error()) {
+				t.Fatalf("stderr must keep the concrete write error, got %q", stderr.String())
+			}
+			if out.calls != 1 {
+				t.Fatalf("report must be attempted exactly once, got %d writes", out.calls)
+			}
+		})
+	}
+}
+
+// TestReviewReportShortWriteExitsOne covers a receiver that silently accepts
+// only a prefix of the report: no error is returned, yet the missing bytes
+// must still fail the review with exit 1. The delivered prefix is left in
+// place and nothing further is written.
+func TestReviewReportShortWriteExitsOne(t *testing.T) {
+	const org = "acme"
+	path, cp := fixtureChain(t, org)
+
+	for _, mode := range []struct {
+		name string
+		args []string
+	}{
+		{"text", reviewArgs(path, org, 2, cp.EndSeq, cp.Fingerprint)},
+		{"json", jsonReviewArgs(path, org, 2, cp.EndSeq, cp.Fingerprint)},
+	} {
+		t.Run(mode.name, func(t *testing.T) {
+			out := &truncatingWriter{limit: 10}
+			var stderr bytes.Buffer
+			code := runReview(mode.args, out, &stderr)
+			if code != 1 {
+				t.Fatalf("exit = %d, want 1; stderr=%q", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "report output failed") ||
+				!strings.Contains(stderr.String(), "incomplete write") {
+				t.Fatalf("stderr must report an incomplete report, got %q", stderr.String())
+			}
+			if out.accepted.Len() != 10 {
+				t.Fatalf("the accepted prefix stays as delivered, got %d bytes", out.accepted.Len())
+			}
+			if out.calls != 1 {
+				t.Fatalf("no retry or second format after a short write, got %d writes", out.calls)
+			}
+		})
 	}
 }
 

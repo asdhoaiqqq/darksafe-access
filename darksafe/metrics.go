@@ -60,6 +60,32 @@ type QueryPointsResult struct {
 	Series []QueryPointsSeries `json:"series"`
 }
 
+// WindowStat 是固定时间窗口统计中的一个窗口：闭区间 [Start,End] 内的点数与
+// 算术平均值。Start/End 是毫秒整数边界，同一次查询的各条序列共用同一套窗口
+// 边界；空窗口不输出，因此每个条目都对应至少一个已成功保存的点。
+type WindowStat struct {
+	Start   int64   `json:"start"`
+	End     int64   `json:"end"`
+	Count   int     `json:"count"`
+	Average float64 `json:"average"`
+}
+
+// QueryWindowsSeries 是窗口均值查询结果中的一条序列：完整身份与该序列实际有
+// 点的窗口统计，窗口按起点升序排列（不补空窗口）。
+type QueryWindowsSeries struct {
+	Name    string            `json:"name"`
+	Labels  map[string]string `json:"labels"`
+	Windows []WindowStat      `json:"windows"`
+}
+
+// QueryWindowsResult 是一次固定时间窗口均值查询（op 为 query_windows）成功后
+// 的结果，只读，不改变存储。
+type QueryWindowsResult struct {
+	Status string               `json:"status"`
+	Op     string               `json:"op"`
+	Series []QueryWindowsSeries `json:"series"`
+}
+
 // BatchResult 是一批采样点写入成功后的结果。
 type BatchResult struct {
 	Status     string       `json:"status"`
@@ -186,10 +212,10 @@ var (
 )
 
 // ProcessLine 处理一行非空输入：JSON 数组为写入批次，JSON 对象为查询/操作。
-// 成功时返回非 nil 的 *BatchResult、*QueryResult 或 *QueryPointsResult 且错误为
-// nil；任何失败都返回真正的 nil 结果与 *LineError，调用方直接比较
-// result == nil 即可判定失败，无须先区分结果类型。空写入数组与无命中的查询
-// 仍是成功，结果不为 nil。
+// 成功时返回非 nil 的 *BatchResult、*QueryResult、*QueryPointsResult 或
+// *QueryWindowsResult 且错误为 nil；任何失败都返回真正的 nil 结果与 *LineError，
+// 调用方直接比较 result == nil 即可判定失败，无须先区分结果类型。空写入数组与
+// 无命中的查询仍是成功，结果不为 nil。
 func (s *MetricStore) ProcessLine(line string) (any, *LineError) {
 	top, ok, lerr := decodeTopValue(line)
 	if lerr != nil {
@@ -249,7 +275,13 @@ func (s *MetricStore) QueryLine(line string) (*QueryResult, *LineError) {
 	}
 	qr, isQuery := res.(*QueryResult)
 	if !isQuery {
-		return nil, &LineError{Status: "error", Error: `op "query_points" lists sample points; use QueryPointsLine`}
+		// 结果类型与入口不匹配：保留各 op 既有的措辞，错误规则不因新增操作改变。
+		switch res.(type) {
+		case *QueryPointsResult:
+			return nil, &LineError{Status: "error", Error: `op "query_points" lists sample points; use QueryPointsLine`}
+		default:
+			return nil, &LineError{Status: "error", Error: `op "query_windows" lists window statistics; use QueryWindowsLine`}
+		}
 	}
 	return qr, nil
 }
@@ -270,9 +302,41 @@ func (s *MetricStore) QueryPointsLine(line string) (*QueryPointsResult, *LineErr
 	}
 	qp, isPoints := res.(*QueryPointsResult)
 	if !isPoints {
-		return nil, &LineError{Status: "error", Error: `op "query" computes range statistics; use QueryLine`}
+		// 结果类型与入口不匹配：保留各 op 既有的措辞，错误规则不因新增操作改变。
+		switch res.(type) {
+		case *QueryResult:
+			return nil, &LineError{Status: "error", Error: `op "query" computes range statistics; use QueryLine`}
+		default:
+			return nil, &LineError{Status: "error", Error: `op "query_windows" lists window statistics; use QueryWindowsLine`}
+		}
 	}
 	return qp, nil
+}
+
+// QueryWindowsLine 解析并执行一行 op 为 "query_windows" 的固定时间窗口均值
+// 查询对象。成功返回 QueryWindowsResult；查询只读，不改变存储。
+func (s *MetricStore) QueryWindowsLine(line string) (*QueryWindowsResult, *LineError) {
+	top, ok, lerr := decodeTopValue(line)
+	if lerr != nil {
+		return nil, lerr
+	}
+	if ok != '{' {
+		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a query object"}
+	}
+	res, lerr := s.queryFromObject(top)
+	if lerr != nil {
+		return nil, lerr
+	}
+	qw, isWindows := res.(*QueryWindowsResult)
+	if !isWindows {
+		switch res.(type) {
+		case *QueryResult:
+			return nil, &LineError{Status: "error", Error: `op "query" computes range statistics; use QueryLine`}
+		default:
+			return nil, &LineError{Status: "error", Error: `op "query_points" lists sample points; use QueryPointsLine`}
+		}
+	}
+	return qw, nil
 }
 
 // validateLineText 在 JSON 解析之前强制整行文本合法：原始字节必须是合法
@@ -720,12 +784,15 @@ type parsedQuery struct {
 	name   string
 	start  int64
 	end    int64
+	step   int64
 	labels map[string]string
 }
 
 // queryFromObject 严格解析查询对象并执行对应的只读操作：op 为 "query" 时
-// 统计区间内点数与均值，为 "query_points" 时列出区间内采样明细。
-// 成功返回非 nil 的 *QueryResult 或 *QueryPointsResult；失败返回 nil 与 *LineError。
+// 统计区间内点数与均值，为 "query_points" 时列出区间内采样明细，为
+// "query_windows" 时按固定宽度窗口统计点数与均值。
+// 成功返回非 nil 的 *QueryResult、*QueryPointsResult 或 *QueryWindowsResult；
+// 失败返回 nil 与 *LineError。
 func (s *MetricStore) queryFromObject(raw json.RawMessage) (any, *LineError) {
 	q, err := parseQuery(raw)
 	if err != nil {
@@ -735,18 +802,25 @@ func (s *MetricStore) queryFromObject(raw json.RawMessage) (any, *LineError) {
 		return nil, &LineError{Status: "error", Error: fmt.Sprintf(
 			`invalid range: "start" must not be greater than "end" (%d > %d)`, q.start, q.end)}
 	}
-	if q.op == "query_points" {
+	switch q.op {
+	case "query_points":
 		return s.runQueryPoints(q), nil
+	case "query_windows":
+		return s.runQueryWindows(q), nil
+	default:
+		return s.runQuery(q), nil
 	}
-	return s.runQuery(q), nil
 }
 
-// parseQuery 对查询对象做严格校验：仅允许 op/name/start/end/labels，
-// 拒绝重复键与未知字段；标量必须是精确的 JSON 类型，start/end 为 int64 毫秒。
-// op 只接受 "query"（区间点数与均值）与 "query_points"（区间采样明细），
-// 两种操作共用同一套字段校验与区间规则。
+// parseQuery 对查询对象做严格校验：仅允许 op/name/start/end/labels，以及仅
+// query_windows 使用的 step；拒绝重复键与未知字段；标量必须是精确的 JSON
+// 类型，start/end 为 int64 毫秒。op 只接受 "query"（区间点数与均值）、
+// "query_points"（区间采样明细）与 "query_windows"（固定窗口均值），三种操作
+// 共用同一套字段校验与区间规则；step 仅在 op 为 query_windows 时必填，且必须
+// 是大于零、不超过 int64 上界的 JSON 整数，另外两种操作不接受 step。
 func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 	var q parsedQuery
+	var stepSeen bool
 	err := parseStrictObject(raw,
 		"each query must be a JSON object",
 		"unexpected content after the query object",
@@ -761,8 +835,8 @@ func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 				if !ok {
 					return fmt.Errorf(`field "op" must be a string`)
 				}
-				if op != "query" && op != "query_points" {
-					return fmt.Errorf(`unknown op %q (only "query" and "query_points" are supported)`, op)
+				if op != "query" && op != "query_points" && op != "query_windows" {
+					return fmt.Errorf(`unknown op %q (only "query", "query_points" and "query_windows" are supported)`, op)
 				}
 				q.op = op
 				return nil
@@ -770,11 +844,37 @@ func parseQuery(raw json.RawMessage) (parsedQuery, error) {
 			"name":  func(dec *json.Decoder) error { return readNameField(dec, &q.name) },
 			"start": func(dec *json.Decoder) error { return readInt64Field(dec, "start", &q.start) },
 			"end":   func(dec *json.Decoder) error { return readInt64Field(dec, "end", &q.end) },
+			"step": func(dec *json.Decoder) error {
+				stepSeen = true
+				// op 已在 step 之前给出且不是 query_windows 时，step 与未知字段
+				// 同义，在其书写位置立即报错，错误次序与其他字段一致。
+				// （op 出现在 step 之后时无法在解析途中判定，留给解析后检查。）
+				if q.op != "" && q.op != "query_windows" {
+					return fmt.Errorf(`unknown field %q`, "step")
+				}
+				return readInt64Field(dec, "step", &q.step)
+			},
 			"labels": func(dec *json.Decoder) error {
 				return readLabelsField(dec, `field "labels" must be an object of non-empty string keys to string values`, &q.labels)
 			},
 		})
-	return q, err
+	if err != nil {
+		return q, err
+	}
+	if q.op == "query_windows" {
+		// step 是 query_windows 的必填项；按与 op/name/start/end 相同的方式，
+		// 在已出现字段全部合法后才报缺失。
+		if !stepSeen {
+			return q, fmt.Errorf(`missing required field %q`, "step")
+		}
+		if q.step <= 0 {
+			return q, fmt.Errorf(`field "step": must be a JSON integer greater than zero`)
+		}
+	} else if stepSeen {
+		// step 只用于新增操作：query 与 query_points 上出现 step 一律视为未知字段。
+		return q, fmt.Errorf(`unknown field %q`, "step")
+	}
+	return q, nil
 }
 
 // labelsMatch 实现子集匹配：want 中每个键都必须在 stored 中存在且值完全相等，
@@ -874,6 +974,105 @@ func (s *MetricStore) runQueryPoints(q parsedQuery) *QueryPointsResult {
 // seriesPoints，区别只在传入的选取范围是闭区间而不是全部。
 func seriesPointsInRange(sr *storedSeries, start, end int64) []Point {
 	return seriesPoints(sr, func(ts int64) bool { return ts >= start && ts <= end })
+}
+
+// windowAgg 累积一个固定窗口内已成功保存点的个数与精确有理数总和。
+// start/end 在首次有点落入该窗口时按统一公式推导，因此各条序列上同一窗口
+// 的边界完全一致。
+type windowAgg struct {
+	start int64
+	end   int64
+	count int
+	sum   *big.Rat
+}
+
+// runQueryWindows 只读统计固定时间窗口内的点数与均值：name 精确、标签子集、
+// [start,end] 闭区间，序列筛选、身份整理（标签副本、排序键值对）与排列次序
+// 完全沿用 runQuery/runQueryPoints，只是把区间按 step 毫秒从 start 起连续
+// 划分成一个个首尾相接的闭窗口：第 i 个窗口常规覆盖
+// [start+i*step, start+(i+1)*step-1]，最后一个窗口截到 end。窗口边界各序列
+// 共用且不逐一枚举（step 为 1、区间跨满 int64 时窗口数可达 2^63 以上），
+// 只在有点落入时按窗口下标建立聚合，因此空窗口不占成本、也不补零。
+//
+// 每个点恰好归入一个窗口：窗口下标为 floor((ts-start)/step)，下标与窗口
+// 起点都用无符号回绕算术从时间戳直接推导，不做可能溢出的 start+idx*step
+// int64 加法，因此即使 start/end 接近 int64 上下界，窗口也不会溢出、倒置或
+// 漏掉采样；start == end 时只有一个 [start,start] 窗口。每条序列只输出实际
+// 有点的窗口并按窗口起点升序，区间内没有点的序列不列出；窗口均值与 runQuery
+// 一样在有理数上精确求和、精确除以窗口内点数后按最近偶数舍入为 float64，
+// 正负大数抵消或窗口总和超出 float64 范围时仍给出正确的有限结果。
+func (s *MetricStore) runQueryWindows(q parsedQuery) *QueryWindowsResult {
+	organized := organizeSeries(s.matchSeries(q))
+	stepU := uint64(q.step)
+
+	out := make([]QueryWindowsSeries, 0, len(organized))
+	for _, entry := range organized {
+		// 只保存实际有点落入的窗口；key 是窗口下标，理论上可达 2^63 以上，
+		// 因此不能先按区间长度枚举窗口再填点。
+		aggs := make(map[uint64]*windowAgg)
+		r := new(big.Rat)
+		for ts, v := range entry.sr.points {
+			if ts < q.start || ts > q.end {
+				continue
+			}
+			// uint64 回绕减法精确给出非负的 ts-start（最大 2^64-1），
+			// 避开 int64 减法在 MinInt64/MaxInt64 附近的溢出。
+			off := uint64(ts) - uint64(q.start)
+			idx := off / stepU
+			agg := aggs[idx]
+			if agg == nil {
+				// 窗口起点 = ts - (off mod step)，等于该窗口第一个毫秒；
+				// 直接由时间戳反推而不是 start+idx*step，int64 内绝不溢出。
+				wStart := ts - int64(off%stepU)
+				// 常规终点是 wStart+step-1；超过 end 时最后一个窗口截到 end。
+				// wStart<=ts<=end 保证 end-wStart 非负，但其差值最大可达
+				// MaxInt64-MinInt64=2^64-1，超出 int64，因此用 uint64 表示这段
+				// 剩余宽度再比较；条件成立时 wStart+span 必然不超过 end，安全。
+				span := stepU - 1
+				remaining := uint64(q.end) - uint64(wStart)
+				var wEnd int64
+				if span <= remaining {
+					wEnd = wStart + int64(span)
+				} else {
+					wEnd = q.end
+				}
+				agg = &windowAgg{start: wStart, end: wEnd, sum: new(big.Rat)}
+				aggs[idx] = agg
+			}
+			agg.count++
+			// 写入侧已保证 v 有限，SetFloat64 对有限值是精确的。
+			agg.sum.Add(agg.sum, r.SetFloat64(v))
+		}
+		if len(aggs) == 0 {
+			// 整个区间没有点的序列不列出。
+			continue
+		}
+
+		// 窗口下标单调对应窗口起点，按下标升序即按窗口起点升序。
+		indexes := make([]uint64, 0, len(aggs))
+		for idx := range aggs {
+			indexes = append(indexes, idx)
+		}
+		sort.Slice(indexes, func(i, j int) bool { return indexes[i] < indexes[j] })
+
+		windows := make([]WindowStat, 0, len(indexes))
+		for _, idx := range indexes {
+			agg := aggs[idx]
+			mean := new(big.Rat).Quo(agg.sum, new(big.Rat).SetInt64(int64(agg.count)))
+			windows = append(windows, WindowStat{
+				Start:   agg.start,
+				End:     agg.end,
+				Count:   agg.count,
+				Average: ratToFloat64NearestEven(mean),
+			})
+		}
+		out = append(out, QueryWindowsSeries{
+			Name:    entry.ref.Name,
+			Labels:  entry.ref.Labels,
+			Windows: windows,
+		})
+	}
+	return &QueryWindowsResult{Status: "ok", Op: "query_windows", Series: out}
 }
 
 // ratToFloat64NearestEven 把有理数 x 舍入到最近的 float64，半数取偶。

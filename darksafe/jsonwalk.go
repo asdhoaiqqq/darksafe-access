@@ -31,10 +31,15 @@ import (
 // makes it stop (errUndecided) and defer to the encoding/json walk in
 // plan.go, which reports the JSON format error with the established
 // wording — so malformed documents keep their existing error messages.
-// Numbers are scanned loosely (their characters are skipped, not judged):
-// whether a number is well-formed is the decoder's call, and the duplicate
-// check confirms the document with json.Valid before trusting a completed
-// walk.
+// Numbers carry no text, but their grammar is still judged as they are
+// scanned: a malformed number (1e, 1E+, 0., 01) is a JSON format error at
+// exactly that position, so the walk stops there and defers instead of
+// skipping past it and letting a later string's text problem — or a later
+// duplicate member — mask the earlier format error. Legal numbers beyond
+// float64 range (1e400, a tiny 1e-400, a huge integer literal) are
+// well-formed and pass; whether a number is acceptable for a given field
+// is business validation's call, and the duplicate check confirms the
+// document with json.Valid before trusting a completed walk.
 //
 // The walk is iterative: entered containers live on an explicit frame
 // stack, never on the reading goroutine's call stack, and nesting is
@@ -192,10 +197,11 @@ func (w *jsonWalker) walk() error {
 		case c == 'n':
 			return w.literal("null")
 		case c == '-' || ('0' <= c && c <= '9'):
-			// Numbers carry no text; skip their characters loosely and let
-			// the decoder judge whether the number itself is well-formed.
-			w.number()
-			return nil
+			// Numbers carry no text, but a malformed number is a JSON format
+			// error at exactly this position: judge the grammar here and stop
+			// on it (deferring the report to the decoder) rather than skip
+			// past it and blame a later string or duplicate.
+			return w.number()
 		default:
 			return errUndecided
 		}
@@ -340,16 +346,62 @@ func (w *jsonWalker) literal(word string) error {
 	return nil
 }
 
-func (w *jsonWalker) number() {
-	for w.pos < len(w.data) {
-		switch c := w.data[w.pos]; {
-		case c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' || ('0' <= c && c <= '9'):
+// number scans one JSON number literal, judging its grammar exactly as the
+// decoder would: an optional minus, an integer part with no leading zeros,
+// an optional fraction with at least one digit, and an optional exponent
+// with at least one digit. A malformed number — a missing exponent digit
+// (1e, 1E+), a missing fraction (0.), an illegal leading zero (01) — is a
+// JSON format error, so the scan stops with errUndecided and leaves the
+// report to the encoding/json walk, at the number's own position in the
+// document rather than after some later string. Legal numbers beyond
+// float64 range (1e400, 1e-400, huge integer literals) are well-formed
+// here; whether one is acceptable for a given field is decided later by
+// business validation.
+func (w *jsonWalker) number() error {
+	if w.pos < len(w.data) && w.data[w.pos] == '-' {
+		w.pos++
+	}
+	if w.pos >= len(w.data) {
+		return errUndecided
+	}
+	switch c := w.data[w.pos]; {
+	case c == '0':
+		w.pos++
+		if w.pos < len(w.data) && isJSONDigit(w.data[w.pos]) {
+			return errUndecided // illegal leading zero
+		}
+	case '1' <= c && c <= '9':
+		for w.pos < len(w.data) && isJSONDigit(w.data[w.pos]) {
 			w.pos++
-		default:
-			return
+		}
+	default:
+		return errUndecided
+	}
+	if w.pos < len(w.data) && w.data[w.pos] == '.' {
+		w.pos++
+		if w.pos >= len(w.data) || !isJSONDigit(w.data[w.pos]) {
+			return errUndecided // the fraction needs at least one digit
+		}
+		for w.pos < len(w.data) && isJSONDigit(w.data[w.pos]) {
+			w.pos++
 		}
 	}
+	if w.pos < len(w.data) && (w.data[w.pos] == 'e' || w.data[w.pos] == 'E') {
+		w.pos++
+		if w.pos < len(w.data) && (w.data[w.pos] == '+' || w.data[w.pos] == '-') {
+			w.pos++
+		}
+		if w.pos >= len(w.data) || !isJSONDigit(w.data[w.pos]) {
+			return errUndecided // the exponent needs at least one digit
+		}
+		for w.pos < len(w.data) && isJSONDigit(w.data[w.pos]) {
+			w.pos++
+		}
+	}
+	return nil
 }
+
+func isJSONDigit(c byte) bool { return '0' <= c && c <= '9' }
 
 // jsonString reads one string literal whose opening quote is at w.pos,
 // validating every byte and escape, and returns the decoded contents. The

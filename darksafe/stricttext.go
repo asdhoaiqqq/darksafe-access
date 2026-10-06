@@ -71,7 +71,11 @@ func (e *unpairedSurrogateError) Error() string {
 // or an unpaired-surrogate \uXXXX escape. It runs before duplicate-member
 // detection and business validation, so no rewritten string can be compared
 // or planned with. A document the walker cannot structurally follow is left
-// to the later encoding/json walk, which reports the format error.
+// to the later encoding/json walk, which reports the format error. A
+// malformed number is such a stop: the walk never reads past it, so a
+// number format error earlier in the document is reported as the JSON
+// format error it is, never masked by a text problem in a later string —
+// while a text problem read before the number keeps its own verdict.
 func checkStrictText(data []byte) error {
 	w := &jsonWalker{data: data}
 	if err := w.walk(); err != nil && !errors.Is(err, errUndecided) {

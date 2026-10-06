@@ -135,8 +135,8 @@ func (e *duplicateMemberError) Error() string {
 // walker recognizes the nesting, decodes the member names and tracks each
 // object's location; this check only keeps the seen-name set of each object.
 // A document the walk cannot fully vouch for — an unrecognized structure,
-// trailing content, or a loosely scanned number only the decoder judges —
-// is handed to the encoding/json walk, which reports the established format
+// trailing content, or a malformed number the grammar scan stopped at — is
+// handed to the encoding/json walk, which reports the established format
 // error (and any duplicate preceding the malformation) with the existing
 // wording.
 func checkDuplicateMembers(data []byte) error {
@@ -147,12 +147,12 @@ func checkDuplicateMembers(data []byte) error {
 	if errors.Is(dup, errJSONDepthExceeded) {
 		return dup
 	}
-	// json.Valid confirms the whole document — including the numbers the
-	// walk skipped loosely and any trailing content — is one well-formed
-	// JSON value, so a completed walk's verdict can be trusted directly.
-	// Legal numbers beyond float64 range (e.g. 1e400) are valid JSON and
-	// pass; whether a number is acceptable for a given field is decided
-	// later by business validation.
+	// json.Valid confirms the whole document — including every number the
+	// walk scanned by grammar without interpreting it and any trailing
+	// content — is one well-formed JSON value, so a completed walk's verdict
+	// can be trusted directly. Legal numbers beyond float64 range (e.g.
+	// 1e400) are valid JSON and pass; whether a number is acceptable for a
+	// given field is decided later by business validation.
 	if recognized && json.Valid(data) {
 		return dup
 	}

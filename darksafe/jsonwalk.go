@@ -31,8 +31,12 @@ import (
 // makes it stop (errUndecided) and defer to the encoding/json walk in
 // plan.go, which reports the JSON format error with the established
 // wording — so malformed documents keep their existing error messages.
-// Numbers are scanned loosely (their characters are skipped, not judged):
-// whether a number is well-formed is the decoder's call, and the duplicate
+// Numbers are scanned with the exact JSON number grammar (their characters
+// are never interpreted as values): a malformed number such as 1e, 1E+ or
+// 0. makes the walker stop at that number's first illegal character, so a
+// format error earlier in the document is never hidden by a text problem
+// in a string read later. Whether a legal number is acceptable for a
+// particular field is the business validation's call, and the duplicate
 // check confirms the document with json.Valid before trusting a completed
 // walk.
 //
@@ -192,10 +196,10 @@ func (w *jsonWalker) walk() error {
 		case c == 'n':
 			return w.literal("null")
 		case c == '-' || ('0' <= c && c <= '9'):
-			// Numbers carry no text; skip their characters loosely and let
-			// the decoder judge whether the number itself is well-formed.
-			w.number()
-			return nil
+			// Numbers carry no text, but their grammar is checked here: the
+			// walk must stop at a malformed number's first illegal character
+			// rather than read past it into a later string.
+			return w.number()
 		default:
 			return errUndecided
 		}
@@ -340,15 +344,59 @@ func (w *jsonWalker) literal(word string) error {
 	return nil
 }
 
-func (w *jsonWalker) number() {
-	for w.pos < len(w.data) {
-		switch c := w.data[w.pos]; {
-		case c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E' || ('0' <= c && c <= '9'):
+// number scans one JSON number literal starting at w.pos using exactly the
+// JSON number grammar: an optional sign, a single zero or a non-zero digit
+// followed by digits, then an optional decimal point with at least one
+// fraction digit, then an optional exponent whose indicator is followed by
+// at least one digit (with an optional sign). The digits are never
+// interpreted — legal numbers beyond float64 range (e.g. 1e400) scan
+// exactly like any other — so range and type are left to json.Valid and
+// business validation. A missing exponent digit (1e, 1E+), a missing
+// fraction digit (0.), or an illegal leading zero (01) stops the walk at
+// that number's first illegal character and returns errUndecided, letting
+// the decoder report the format error at the position read first.
+func (w *jsonWalker) number() error {
+	if w.pos < len(w.data) && w.data[w.pos] == '-' {
+		w.pos++
+	}
+	switch {
+	case w.pos >= len(w.data):
+		return errUndecided
+	case w.data[w.pos] == '0':
+		w.pos++
+	case '1' <= w.data[w.pos] && w.data[w.pos] <= '9':
+		for w.pos < len(w.data) && '0' <= w.data[w.pos] && w.data[w.pos] <= '9' {
 			w.pos++
-		default:
-			return
+		}
+	default:
+		// A sign not followed by a digit, or a non-digit start that reached
+		// here, is not a number at all.
+		return errUndecided
+	}
+	// Fraction part: a decimal point must be followed by at least one digit.
+	if w.pos < len(w.data) && w.data[w.pos] == '.' {
+		w.pos++
+		if w.pos >= len(w.data) || w.data[w.pos] < '0' || w.data[w.pos] > '9' {
+			return errUndecided
+		}
+		for w.pos < len(w.data) && '0' <= w.data[w.pos] && w.data[w.pos] <= '9' {
+			w.pos++
 		}
 	}
+	// Exponent part: e/E, an optional sign, then at least one digit.
+	if w.pos < len(w.data) && (w.data[w.pos] == 'e' || w.data[w.pos] == 'E') {
+		w.pos++
+		if w.pos < len(w.data) && (w.data[w.pos] == '+' || w.data[w.pos] == '-') {
+			w.pos++
+		}
+		if w.pos >= len(w.data) || w.data[w.pos] < '0' || w.data[w.pos] > '9' {
+			return errUndecided
+		}
+		for w.pos < len(w.data) && '0' <= w.data[w.pos] && w.data[w.pos] <= '9' {
+			w.pos++
+		}
+	}
+	return nil
 }
 
 // jsonString reads one string literal whose opening quote is at w.pos,

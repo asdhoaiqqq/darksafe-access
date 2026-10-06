@@ -982,43 +982,80 @@ func (s *MetricStore) matchSeries(q parsedQuery) []*storedSeries {
 	return matched
 }
 
+// valueStats 是区间统计（query）与固定窗口统计（query_windows）共用的
+// 点数/均值累计器：两种统计各自决定把哪些已保存的点划入哪个统计范围
+// （整个闭区间，或由 start 与 step 划出的某个窗口），划入后的计数、精确求和
+// 与均值舍入规则只有这里一份，调整数值规则时无须同步两处。
+//
+// 求和在有理数上精确完成：与点的提交顺序、批次划分及遍历次序无关，正负大数
+// 抵消后的微小余量不会丢失，各点之和超出 float64 有限范围时均值仍然有限。
+type valueStats struct {
+	count int
+	sum   *big.Rat
+	// scratch 是 add/result 内部复用的临时有理数，避免每个点都分配。
+	scratch *big.Rat
+}
+
+func newValueStats() *valueStats {
+	return &valueStats{sum: new(big.Rat), scratch: new(big.Rat)}
+}
+
+// add 计入一个实际保存的采样值。写入侧已保证 v 有限，SetFloat64 对有限值
+// 是精确的，因此累计总和等于这些 float64 值的数学精确和。
+func (a *valueStats) add(v float64) {
+	a.count++
+	a.sum.Add(a.sum, a.scratch.SetFloat64(v))
+}
+
+// reset 清空累计，供下一个独立统计范围（如固定窗口查询的后一个窗口）复用
+// 同一累计器：前一范围的点数与数值不会带入后一范围。
+func (a *valueStats) reset() {
+	a.count = 0
+	a.sum = new(big.Rat)
+}
+
+// result 返回当前范围的点数与均值。均值等于已计入值数学上精确的算术平均
+// 舍入到最近的 float64：恰在两个相邻可表示值正中时取有效数字末位为偶数的
+// 一边，精确平均为零时返回正零。没有计入任何点时返回 (0, 0)；两种查询都不会
+// 为空范围构造条目，该分支只是防御性兜底。
+func (a *valueStats) result() (count int, average float64) {
+	if a.count == 0 {
+		return 0, 0
+	}
+	avg := new(big.Rat).Quo(a.sum, a.scratch.SetInt64(int64(a.count)))
+	return a.count, ratToFloat64NearestEven(avg)
+}
+
 // runQuery 只读统计已成功提交的数据：name 精确、标签子集、[start,end] 闭区间。
 // 序列身份的整理（标签副本、排序键值对、排列次序）与写入快照共用同一套
 // organizeSeries 规则，只是入选范围不同：这里先按名称与标签条件筛出命中序列
 // 再整理，不为无关指标承担展示准备；筛后剩余序列的相对次序因此与写入全量
 // 结果一致。查询只返回每条序列的点数与均值，不构造采样明细列表（明细由
-// query_points 操作提供）——单次遍历点表只做计数与精确有理数求和（计数与
-// 均值都与点的排列次序无关）。区间内没有点的序列不列出，不补零值条目。
+// query_points 操作提供）——单次遍历点表直接累计进 valueStats，计数与均值
+// 规则与固定窗口统计共用同一实现。区间内没有点的序列不列出，不补零值条目。
 func (s *MetricStore) runQuery(q parsedQuery) *QueryResult {
 	organized := organizeSeries(s.matchSeries(q))
 
 	out := make([]QuerySeries, 0, len(organized))
 	for _, entry := range organized {
-		// 一次遍历直接统计：区间内点的个数与精确总和。不构造值切片、
-		// 不排序时间戳，避免为只返回 count/average 的查询承担采样明细展示。
-		// 求和在有理数上精确完成：与写入顺序、批次划分无关，正负大数抵消后的
-		// 小余量不会丢失，总和超出 float64 范围时均值仍然有限。
-		count := 0
-		sum := new(big.Rat)
-		r := new(big.Rat)
+		// 一次遍历直接统计：不构造值切片、不排序时间戳，避免为只返回
+		// count/average 的查询承担采样明细展示。
+		stats := newValueStats()
 		for ts, v := range entry.sr.points {
 			if ts < q.start || ts > q.end {
 				continue
 			}
-			count++
-			// 写入侧已保证 v 有限，SetFloat64 对有限值是精确的。
-			sum.Add(sum, r.SetFloat64(v))
+			stats.add(v)
 		}
+		count, average := stats.result()
 		if count == 0 {
 			continue
 		}
-		sum.Quo(sum, r.SetInt64(int64(count)))
 		out = append(out, QuerySeries{
-			Name:   entry.ref.Name,
-			Labels: entry.ref.Labels,
-			Count:  count,
-			// 精确平均舍入到最近可表示 float64（正中取偶）；精确为零时返回 +0。
-			Average: ratToFloat64NearestEven(sum),
+			Name:    entry.ref.Name,
+			Labels:  entry.ref.Labels,
+			Count:   count,
+			Average: average,
 		})
 	}
 	return &QueryResult{Status: "ok", Op: "query", Series: out}
@@ -1064,12 +1101,12 @@ func seriesPointsInRange(sr *storedSeries, start, end int64) []Point {
 //
 // 名称精确、标签子集的序列筛选与 organizeSeries 整理、序列排列次序和另两种
 // 查询完全一致。每条序列独立统计：先取区间内按时间戳升序的采样点，升序点流
-// 中落在同一窗口的点必然连续，据此一次遍历分窗累计 count 与精确有理数总和；
-// 只输出实际有点的窗口，按窗口起点升序，空窗口不补零，整个区间没有点的序列
-// 不列出，无任何命中时 series 为空数组。每个点只归入 floor((ts-start)/step)
-// 唯一窗口；start==end 时所有点归入唯一窗口。平均值沿用 query 的精确平均与
-// 居中取偶舍入，依据实际存储的 float64 值计算，正负大数抵消或总和超出
-// float64 范围时仍得有限结果。查询只读，不改变存储。
+// 中落在同一窗口的点必然连续，据此一次遍历分窗，每个窗口的点数与均值由
+// valueStats 累计——与区间统计共用同一份计数、精确求和与舍入规则；窗口切换
+// 时 reset，前一窗口的点数与数值不带入后一窗口，也不影响其他序列。只输出
+// 实际有点的窗口，按窗口起点升序，空窗口不补零，整个区间没有点的序列不列出，
+// 无任何命中时 series 为空数组。每个点只归入 floor((ts-start)/step) 唯一窗口；
+// start==end 时所有点归入唯一窗口。查询只读，不改变存储。
 func (s *MetricStore) runQueryWindows(q parsedQuery) *QueryWindowsResult {
 	organized := organizeSeries(s.matchSeries(q))
 
@@ -1085,24 +1122,19 @@ func (s *MetricStore) runQueryWindows(q parsedQuery) *QueryWindowsResult {
 		}
 		windows := make([]Window, 0)
 		var curIdx uint64
-		count := 0
-		sum := new(big.Rat)
-		rv := new(big.Rat)
+		stats := newValueStats()
 		flush := func() {
-			windows = append(windows, buildWindow(q.start, q.end, q.step, diff, curIdx, count, sum))
+			windows = append(windows, buildWindow(q.start, q.end, q.step, diff, curIdx, stats))
 		}
 		for i, p := range points {
 			// 无符号偏移除以 step 得窗口下标；升序点流下标单调不减。
 			idx := (uint64(p.Timestamp) - uint64(q.start)) / uint64(q.step)
 			if i > 0 && idx != curIdx {
 				flush()
-				count = 0
-				sum = new(big.Rat)
+				stats.reset()
 			}
 			curIdx = idx
-			count++
-			// 写入侧已保证 value 有限，SetFloat64 对有限值是精确的。
-			sum.Add(sum, rv.SetFloat64(p.Value))
+			stats.add(p.Value)
 		}
 		flush()
 		out = append(out, QueryWindowsSeries{
@@ -1116,9 +1148,10 @@ func (s *MetricStore) runQueryWindows(q parsedQuery) *QueryWindowsResult {
 
 // buildWindow 构造一个非空窗口的统计：窗口起点是 start + idx*step，终点是
 // 起点加 step 减一；起点加 step 减一越过查询区间（含无符号加法溢出）时截到
-// end。sum 在此被精确除以 count，再按与 query 相同的居中取偶规则舍入为
-// float64（精确为零返回 +0）。调用方保证 0 <= idx*step <= diff。
-func buildWindow(start, end, step int64, diff, idx uint64, count int, sum *big.Rat) Window {
+// end。点数与均值取自 stats——与区间统计共用的同一套计数、精确平均与居中
+// 取偶舍入规则（精确为零返回 +0）。调用方保证 0 <= idx*step <= diff 且
+// stats 已计入本窗口的全部点。
+func buildWindow(start, end, step int64, diff, idx uint64, stats *valueStats) Window {
 	startOff := idx * uint64(step)
 	wStart := int64AtOffset(start, startOff)
 	wEnd := end
@@ -1127,12 +1160,12 @@ func buildWindow(start, end, step int64, diff, idx uint64, count int, sum *big.R
 	if tail := uint64(step) - 1; tail <= diff-startOff {
 		wEnd = int64AtOffset(start, startOff+tail)
 	}
-	sum.Quo(sum, new(big.Rat).SetInt64(int64(count)))
+	count, average := stats.result()
 	return Window{
 		Start:   wStart,
 		End:     wEnd,
 		Count:   count,
-		Average: ratToFloat64NearestEven(sum),
+		Average: average,
 	}
 }
 

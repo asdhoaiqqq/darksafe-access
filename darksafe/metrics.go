@@ -856,7 +856,9 @@ func (s *MetricStore) runQueryPoints(q parsedQuery) *QueryPointsResult {
 
 	out := make([]QueryPointsSeries, 0, len(organized))
 	for _, entry := range organized {
-		points := seriesPointsInRange(entry.sr, q.start, q.end)
+		// 采样明细整理与写入快照共用 seriesPoints，区别只在区间边界：
+		// 这里传查询闭区间，快照传 int64 全域边界取全部点。
+		points := seriesPoints(entry.sr, q.start, q.end)
 		if len(points) == 0 {
 			continue
 		}
@@ -869,10 +871,15 @@ func (s *MetricStore) runQueryPoints(q parsedQuery) *QueryPointsResult {
 	return &QueryPointsResult{Status: "ok", Op: "query_points", Series: out}
 }
 
-// seriesPointsInRange 按 timestamp 升序返回一条已存序列在 [start,end] 闭区间
-// 内的采样点，供采样明细查询展示。与 allSeriesPoints 一样返回新建切片与新建
-// Point，调用方对结果的修改不影响存储；区别只在这里按区间过滤时间戳。
-func seriesPointsInRange(sr *storedSeries, start, end int64) []Point {
+// seriesPoints 按 timestamp 升序返回一条已存序列在 [start,end] 闭区间内的
+// 采样点，数值与时间戳一一对应，写入全量快照与 query_points 区间明细共用
+// 这一处整理逻辑：快照传 int64 全域边界（math.MinInt64、math.MaxInt64）
+// 取全部已提交点，区间查询传查询条件的闭区间。start == end 时只返回该
+// 时间戳上的点。返回的始终是新建切片与新建 Point，调用方对结果的增删改
+// 不影响存储，也不影响此前或此后取得的其他成功结果；时间戳以 int64 比较
+// 与输出（含负数与两个极值），value 直接取实际存储的 float64（含首次存入
+// 的负零），排序只重排时间戳，不会把数值与时间戳配错。
+func seriesPoints(sr *storedSeries, start, end int64) []Point {
 	tsList := make([]int64, 0, len(sr.points))
 	for ts := range sr.points {
 		if ts < start || ts > end {
@@ -1036,9 +1043,9 @@ func seriesLess(a, b organizedSeries) bool {
 // 传入名称与标签条件命中的序列；它们因此遵循同一套整理规则而各自保留数据
 // 范围。每条序列的标签只在入选时整理一次：排序后的键值对随条目保留，sort
 // 的反复比较直接复用同一份结果，不会因一条序列参与多次比较而反复整理同一
-// 套标签。整理结果不复制采样点；写入快照的采样点选取与升序排列由
-// allSeriesPoints 完成，均值查询只在点表上计数与求和，采样明细查询由
-// seriesPointsInRange 按区间选取并升序排列。
+// 套标签。整理结果不复制采样点；采样明细的选取与升序排列（写入全量快照与
+// query_points 区间明细共用）由 seriesPoints 完成，均值查询只在点表上计数
+// 与求和。
 func organizeSeries(selected []*storedSeries) []organizedSeries {
 	out := make([]organizedSeries, 0, len(selected))
 	for _, sr := range selected {
@@ -1055,22 +1062,11 @@ func organizeSeries(selected []*storedSeries) []organizedSeries {
 	return out
 }
 
-// allSeriesPoints 按 timestamp 升序返回一条已存序列的全部采样点，数值与
-// 时间戳一一对应，供写入快照展示。返回的是新建切片与新建 Point，调用方对
-// 采样点的修改不影响存储，也不影响此前或此后取得的其他成功结果。均值查询
-// 不构造这样的明细列表，只在点表上计数与求和；采样明细查询的区间版本由
-// seriesPointsInRange 提供。
+// allSeriesPoints 按 timestamp 升序返回一条已存序列的全部采样点：写入快照
+// 看到的是全部已提交数据，等价于在 int64 全域闭区间上取采样明细，因此直接
+// 复用两种结果共用的 seriesPoints 整理规则。
 func allSeriesPoints(sr *storedSeries) []Point {
-	tsList := make([]int64, 0, len(sr.points))
-	for ts := range sr.points {
-		tsList = append(tsList, ts)
-	}
-	sort.Slice(tsList, func(i, j int) bool { return tsList[i] < tsList[j] })
-	points := make([]Point, len(tsList))
-	for i, ts := range tsList {
-		points[i] = Point{Timestamp: ts, Value: sr.points[ts]}
-	}
-	return points
+	return seriesPoints(sr, math.MinInt64, math.MaxInt64)
 }
 
 // snapshot 生成按规范排序的全部序列视图：入选范围是全部已提交序列，

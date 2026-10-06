@@ -109,6 +109,66 @@ printf '%s\n' \
 
 以上三次调用都包含失败行，因此命令均以非零退出码结束；用 `go run` 运行时它会在标准错误额外打印一行 `exit status 1`，那是 `go` 工具对非零退出码的转述，不是 ingest 的输出行。
 
+### 示例：同一批里字段错误与数值冲突都存在时，只报告哪一个
+
+一批写入同时含有字段错误与数值冲突时，结果仍然只有一条 `error`。规则是：整行是合法且完整的 JSON 数组时，按采样点在数组中的先后逐个处理——每个点先做字段校验，校验通过后才与已存位置（含本批较早接受的点）比较数值，遇到的第一个失败点就是本次报告的结果，其后的点不再检查。因此字段错误与数值冲突按同一个数组顺序参与竞争，不存在“类型错误总优先于冲突”的固定优先级：哪个问题所在的点更靠前，就先报告哪一个。定位方式与查询失败相同：按本次返回的 `line`、`index` 修掉那个点的问题后重提，再看下一条原因。
+
+写入与查询放在同一次 ingest 调用中：先写入 `cpu`、`host=a`、时间戳 1000、值 2；第 2 行的批次依次是时间戳 2000、值 4 的合法新增点，时间戳 1000、值 9 的冲突点，以及 `name` 写成数字的错误点；第 3 行把后两个点交换位置；第 4 行查询覆盖两个时间戳：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '[{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}},{"name":123,"timestamp":3000,"value":5,"labels":{"host":"a"}}]' \
+  '[{"name":"cpu","timestamp":2000,"value":4,"labels":{"host":"a"}},{"name":123,"timestamp":3000,"value":5,"labels":{"host":"a"}},{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}}]' \
+  '{"op":"query","name":"cpu","start":0,"end":3000,"labels":{"host":"a"}}' \
+  | go run ./cmd/darksafe ingest
+```
+
+逐行输出：
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":2,"index":2,"error":"conflict: series cpu{host=a} at timestamp 1000 already has value 2, submitted 9","conflict":{"series":{"name":"cpu","labels":{"host":"a"}},"timestamp":1000,"existing":2,"submitted":9}}
+{"status":"error","line":3,"index":2,"error":"field \"name\" must be a string"}
+{"status":"ok","op":"query","series":[{"name":"cpu","labels":{"host":"a"},"count":1,"average":2}]}
+```
+
+第 2 行先撞上批内第 2 个点与已存值的冲突：`index` 为 2，`conflict` 给出 `existing` 为 2、`submitted` 为 9；排在后面的第 3 个点虽然 `name` 是数字，也不会被报告。把后两个点交换位置后，第 3 行的第 2 个点变成 `name` 类型错误，于是只报告字段问题，`index` 仍为 2 且不附带 `conflict`；此时把该点的 `name` 改回字符串再重提，才会看到第 3 个点的冲突。两行结果的原因不同，完全来自输入次序的变化，而不是类型错误总会优先于冲突。两个失败批次都整批丢弃：时间戳 2000 的新增点没有留下，时间戳 1000 上已存的 2 也没有被改成 9，所以第 4 行覆盖这两个时间戳的查询仍是 `count` 为 1、`average` 为 2。第 2、3 行失败后第 4 行照常处理，但本次调用出现过失败，命令最终仍以非零退出码结束。
+
+### 边界对照：同一个点上字段问题先于冲突；数组未闭合则没有 index
+
+同一个采样点既带未知字段、又在同一位置提交不同采样值时，字段问题先于数值冲突——因为该点必须先通过逐字段校验，才会进入与已存位置的数值比较；即使未知字段写在 `name`、`timestamp`、`value` 之后也一样。下面第 2 行把未知字段 `bogus` 放在最后，报告的仍是字段问题（`index` 为 1、无 `conflict`）；第 3 行去掉 `bogus` 后重提，才报告该点与已存值 2 的冲突：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '[{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"},"bogus":1}]' \
+  '[{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}}]' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":2,"index":1,"error":"unknown field \"bogus\""}
+{"status":"error","line":3,"index":1,"error":"conflict: series cpu{host=a} at timestamp 1000 already has value 2, submitted 9","conflict":{"series":{"name":"cpu","labels":{"host":"a"}},"timestamp":1000,"existing":2,"submitted":9}}
+```
+
+数组未闭合则属于整行解析失败，整行根本进不了按点校验与冲突检测阶段：下面第 2 行唯一的采样点本身满足冲突条件（对已存的时间戳 1000 提交 9），但结果没有 `index`、也没有 `conflict`，与其他整行解析失败的措辞一致：
+
+```bash
+printf '%s\n' \
+  '[{"name":"cpu","timestamp":1000,"value":2,"labels":{"host":"a"}}]' \
+  '[{"name":"cpu","timestamp":1000,"value":9,"labels":{"host":"a"}' \
+  | go run ./cmd/darksafe ingest
+```
+
+```json
+{"status":"ok","added":1,"duplicates":0,"series":[{"name":"cpu","labels":{"host":"a"},"points":[{"timestamp":1000,"value":2}]}]}
+{"status":"error","line":2,"error":"invalid JSON: unexpected EOF"}
+```
+
+以上示例的写入与查询都在同一次 ingest 进程内完成，数据仅保存在该进程的内存中，进程结束即丢弃；每次调用都包含失败行，退出码均非零。
+
 ### 示例：不同的十进制数，同一个存储值
 
 `9007199254740992`（即 2^53）可以精确表示，但在它附近相邻可表示值的间隔已经是 2：下一个可表示值是 `9007199254740994`，介于两者之间的 `9007199254740993` 转换时会舍入到 `9007199254740992`。下面先写入 `9007199254740992`，再向同一序列、同一时间戳提交 `9007199254740993`；随后提交一批——时间戳 2000、值 4 的合法新增点在前，相邻可表示值 `9007199254740994` 的冲突点在后；最后查询覆盖两者的区间。写入与查询在同一次 ingest 调用中完成：

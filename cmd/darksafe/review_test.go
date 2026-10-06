@@ -605,8 +605,8 @@ func TestReviewHelp(t *testing.T) {
 			t.Fatalf("review %s: code=%d stderr=%q", flag, code, errOut)
 		}
 		for _, want := range []string{
-			"--archive", "--org", "--seq", "--end-seq", "--fingerprint",
-			"informational only", "Example:", "darksafe review",
+			"--archive", "--checkpoint", "--org", "--seq", "--end-seq", "--fingerprint",
+			"informational only", "mutually exclusive", "Examples:", "darksafe review",
 			"Exit codes",
 		} {
 			if !strings.Contains(out, want) {

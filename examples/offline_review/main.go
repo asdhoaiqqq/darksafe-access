@@ -149,7 +149,7 @@ func run() error {
 		return err
 	}
 
-	// Report the saved materials and the exact review command to run next.
+	// Report the saved materials and the exact review commands to run next.
 	fmt.Println()
 	fmt.Println("materials saved:")
 	fmt.Printf("  archive:    %s (%d bytes, %d records)\n", archivePath, len(archive), len(records))
@@ -161,7 +161,8 @@ func run() error {
 	fmt.Printf("  fingerprint: %s\n", cp.Fingerprint)
 	fmt.Println()
 	fmt.Println("Now run (the Store and the original request are gone; the review reads")
-	fmt.Println("only the saved materials and never re-submits the request):")
+	fmt.Println("only the saved materials and never re-submits the request). Either pass")
+	fmt.Println("the checkpoint fields on the command line:")
 	fmt.Println()
 	fmt.Println("  go run ./cmd/darksafe review \\")
 	fmt.Printf("    --archive %s \\\n", archivePath)
@@ -169,6 +170,16 @@ func run() error {
 	fmt.Printf("    --seq %d \\\n", targetSeq)
 	fmt.Printf("    --end-seq %d \\\n", cp.EndSeq)
 	fmt.Printf("    --fingerprint %s\n", cp.Fingerprint)
+	fmt.Println()
+	fmt.Println("...or hand the separately saved checkpoint straight to --checkpoint,")
+	fmt.Println("which reads org/end-seq/fingerprint from that file instead. The two")
+	fmt.Println("forms are mutually exclusive: --checkpoint cannot be combined with")
+	fmt.Println("--org, --end-seq or --fingerprint, even when the values agree:")
+	fmt.Println()
+	fmt.Println("  go run ./cmd/darksafe review \\")
+	fmt.Printf("    --archive %s \\\n", archivePath)
+	fmt.Printf("    --seq %d \\\n", targetSeq)
+	fmt.Printf("    --checkpoint %s\n", checkpointPath)
 	fmt.Println()
 	fmt.Println("Two ways to pick the wrong material:")
 	fmt.Println()

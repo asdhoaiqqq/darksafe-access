@@ -142,28 +142,73 @@ func (e *fingerprintEncoder) rawString(s string) {
 	e.buf = append(e.buf, s...)
 }
 
-// writeRawList frames every length-counted list in the raw canonical
-// encoding, whatever its item type: the subject-role and matched-policy
-// string lists and the policy-change policy list all share this one shape.
-// The tag identifies the list kind, then nil is one marker and a non-nil
-// list is a presence marker, a count and one encoded item each, so nil,
-// non-nil empty and populated lists stay distinct and element order is
-// whatever the caller supplied. Keeping the framing here — rather than
-// copied per item type — means a list-format change is made once instead of
-// mirrored between the two list kinds.
-func writeRawList[T any](e *fingerprintEncoder, t fingerprintTag, items []T, writeItem func(T)) {
-	e.tag(t)
+// List-shape markers shared by every length-counted list encoding. nil is
+// one marker and a non-nil list is the other, so nil, non-nil empty and
+// populated lists stay distinct in both the raw fingerprint encoding and
+// the archive.
+const (
+	listShapeNil     byte = 0
+	listShapePresent byte = 1
+)
+
+// listShapeWriter is the minimal sink the shared list-shape encoding needs:
+// the nil/present marker byte and the element count, each written with the
+// output's own conventions. The raw fingerprint encoder and the archive
+// writer both implement it, so the list-shape rules — which marker means
+// which shape, the count's position, one encoded item per element in
+// caller-supplied order — are maintained in exactly one place while each
+// output keeps its own byte-level format.
+type listShapeWriter interface {
+	// listMarker writes the marker distinguishing a nil list from a
+	// non-nil one.
+	listMarker(present bool)
+	// listCount writes the element count of a non-nil list.
+	listCount(n int)
+}
+
+// writeListShape frames every length-counted list, whatever its item type
+// and whichever output it targets: the subject-role and matched-policy
+// string lists and the policy-change policy list all share this one shape
+// in both the raw fingerprint encoding and the archive. nil is one marker,
+// a non-nil list is a presence marker, a count and one encoded item each,
+// so nil, non-nil empty and populated lists stay distinct and element
+// order, duplicates and exact item bytes are whatever the caller supplied.
+// Keeping the framing here — rather than copied per item type or per
+// output — means a list-shape change is made once instead of mirrored
+// between list kinds or between the fingerprint and the archive.
+func writeListShape[T any](w listShapeWriter, items []T, writeItem func(T)) {
 	if items == nil {
-		e.buf = append(e.buf, 0)
+		w.listMarker(false)
 		return
 	}
-	e.buf = append(e.buf, 1)
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], uint32(len(items)))
-	e.buf = append(e.buf, b[:]...)
+	w.listMarker(true)
+	w.listCount(len(items))
 	for i := range items {
 		writeItem(items[i])
 	}
+}
+
+func (e *fingerprintEncoder) listMarker(present bool) {
+	if present {
+		e.buf = append(e.buf, listShapePresent)
+	} else {
+		e.buf = append(e.buf, listShapeNil)
+	}
+}
+
+func (e *fingerprintEncoder) listCount(n int) {
+	var b [4]byte
+	binary.BigEndian.PutUint32(b[:], uint32(n))
+	e.buf = append(e.buf, b[:]...)
+}
+
+// writeRawList frames a length-counted list in the raw canonical encoding.
+// The tag identifies the list kind — the fingerprint's own format
+// convention — and the shared list shape supplies the marker, count and
+// per-item framing that the archive uses as well.
+func writeRawList[T any](e *fingerprintEncoder, t fingerprintTag, items []T, writeItem func(T)) {
+	e.tag(t)
+	writeListShape(e, items, writeItem)
 }
 
 // stringList preserves nil-vs-empty explicitly: in the JSON envelope a

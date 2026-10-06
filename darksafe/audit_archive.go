@@ -50,8 +50,11 @@ const archiveMagic = "darksafe-audit-archive-v1\n"
 const (
 	archiveTagBoolFalse byte = 0
 	archiveTagBoolTrue  byte = 1
-	archiveTagNil       byte = 0
-	archiveTagPresent   byte = 1
+	// The list markers are the shared list-shape markers, so the archive's
+	// nil-versus-present framing is the fingerprint's framing by
+	// construction and a shape change cannot drift between the two outputs.
+	archiveTagNil     byte = listShapeNil
+	archiveTagPresent byte = listShapePresent
 )
 
 // archiveWriter appends length-delimited fields to a byte buffer.
@@ -94,24 +97,27 @@ func (w *archiveWriter) stringField(s string) {
 	w.buf = append(w.buf, s...)
 }
 
-// writeList frames every length-counted list in the archive, whatever its
-// item type: the subject-role and matched-policy string lists and the
-// policy-change policy list all share this one shape. nil is one marker, a
-// non-nil list is a presence marker, a count and one encoded item each, so
-// nil, non-nil empty and populated lists stay distinct and element order is
-// whatever the caller supplied. Keeping the framing here — rather than
-// copied per item type — means a list-format change is made once instead of
-// mirrored between the two list kinds.
-func writeList[T any](w *archiveWriter, items []T, writeItem func(T)) {
-	if items == nil {
+func (w *archiveWriter) listMarker(present bool) {
+	if present {
+		w.buf = append(w.buf, archiveTagPresent)
+	} else {
 		w.buf = append(w.buf, archiveTagNil)
-		return
 	}
-	w.buf = append(w.buf, archiveTagPresent)
-	w.u32(len(items))
-	for i := range items {
-		writeItem(items[i])
-	}
+}
+
+// listCount writes the element count through the archive's own u32, so the
+// archive keeps its range check and sticky error for counts its format
+// cannot represent.
+func (w *archiveWriter) listCount(n int) {
+	w.u32(n)
+}
+
+// writeList frames a length-counted list in the archive. The shared list
+// shape supplies the marker, count and per-item framing — the same rules
+// the raw fingerprint encoding maintains — while each item keeps its own
+// content encoding and the archive keeps its own byte-level format.
+func writeList[T any](w *archiveWriter, items []T, writeItem func(T)) {
+	writeListShape(w, items, writeItem)
 }
 
 // policy writes one Policy by walking the single policy field table, so the

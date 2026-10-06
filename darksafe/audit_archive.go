@@ -438,31 +438,26 @@ func (r *archiveReader) decisionRecord() *DecisionRecord {
 	return d
 }
 
-// DecodeAuditArchive reads one archive produced by EncodeAuditArchive and
-// returns records that can be handed directly to RecheckDecisionOffline.
-// org is the organization the caller expects, and cp is the checkpoint the
-// caller independently retained; the checkpoint embedded in the file is
-// never treated as evidence, so even an archive carrying a plausible
-// checkpoint only validates against the one supplied here.
-//
-// A missing organization is ErrMissingOrganization. Unrecognized framing,
-// truncation, a trailing second archive or any other extra byte, a bad
-// checksum, and undecodable content are ErrInvalidArchive. Records that
-// decode but are missing, out of order, foreign to the organization,
-// modified (including a record after the one the caller intends to review)
-// or mismatched with the supplied checkpoint fail the whole read with
-// ErrInvalidRange. Failure returns no records. A successful read only
-// proves the material matches the checkpoint: an original decision that
-// disagrees with a recomputed one is reported later by offline review, not
-// treated as archive damage. The result is detached from archive (mutating
-// one never reaches the other), and the call is read-only.
-func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecord, error) {
-	if org == "" {
-		return nil, ErrMissingOrganization
-	}
+// decodedArchiveFrame is one archive parsed up to, but not including, the
+// content checks: the reconstructed records and the informational
+// checkpoint embedded in the header. Nothing at this stage has been
+// validated against the caller's organization or retained checkpoint.
+type decodedArchiveFrame struct {
+	records     []AuditRecord
+	org         string
+	endSeq      int
+	fingerprint string
+}
+
+// decodeAuditArchiveFrame parses one frame's framing, checksum and payload.
+// It performs no content validation: the embedded organization and
+// checkpoint are returned for the caller to compare, and the records are
+// not chain-checked until a content-validating entry point runs the single
+// VerifyAudit pass.
+func decodeAuditArchiveFrame(archive []byte) (decodedArchiveFrame, error) {
 	magicLen := len(archiveMagic)
 	if len(archive) < magicLen+4+sha256.Size || string(archive[:magicLen]) != archiveMagic {
-		return nil, fmt.Errorf("%w: unrecognized audit archive", ErrInvalidArchive)
+		return decodedArchiveFrame{}, fmt.Errorf("%w: unrecognized audit archive", ErrInvalidArchive)
 	}
 	pos := magicLen
 	payloadLen := int(binary.BigEndian.Uint32(archive[pos : pos+4]))
@@ -472,12 +467,12 @@ func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecor
 		// A short frame is truncation; bytes beyond the one frame (a
 		// concatenated second archive, junk appended to a good file) are a
 		// framing failure too.
-		return nil, fmt.Errorf("%w: truncated or trailing audit archive bytes", ErrInvalidArchive)
+		return decodedArchiveFrame{}, fmt.Errorf("%w: truncated or trailing audit archive bytes", ErrInvalidArchive)
 	}
 	payload := archive[pos:checksumEnd]
 	sum := sha256.Sum256(payload)
 	if !bytes.Equal(sum[:], archive[checksumEnd:checksumEnd+sha256.Size]) {
-		return nil, fmt.Errorf("%w: checksum mismatch", ErrInvalidArchive)
+		return decodedArchiveFrame{}, fmt.Errorf("%w: checksum mismatch", ErrInvalidArchive)
 	}
 
 	r := &archiveReader{data: payload}
@@ -489,13 +484,13 @@ func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecor
 	// when every string is empty.
 	n := r.boundedCount(22)
 	if r.err != nil {
-		return nil, r.err
+		return decodedArchiveFrame{}, r.err
 	}
 	records := make([]AuditRecord, 0, n)
 	for i := 0; i < n; i++ {
 		// Read the outer fields in the single record field table's (write
-		// and fingerprint) order, so a field can never be restored into
-		// the wrong member or skipped.
+		// and fingerprint) order, so a field can never be restored into the
+		// wrong member or skipped.
 		var rec AuditRecord
 		for j := range recordFields {
 			f := &recordFields[j]
@@ -513,26 +508,98 @@ func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecor
 		records = append(records, rec)
 	}
 	if r.err != nil {
-		return nil, r.err
+		return decodedArchiveFrame{}, r.err
 	}
 	if r.pos != len(payload) {
-		return nil, fmt.Errorf("%w: %d unconsumed archive bytes", ErrInvalidArchive, len(payload)-r.pos)
+		return decodedArchiveFrame{}, fmt.Errorf("%w: %d unconsumed archive bytes", ErrInvalidArchive, len(payload)-r.pos)
 	}
+	return decodedArchiveFrame{
+		records:     records,
+		org:         embeddedOrg,
+		endSeq:      embeddedEndSeq,
+		fingerprint: embeddedFingerprint,
+	}, nil
+}
 
+// validateDecodedFrame applies the content checks to a parsed frame and
+// returns the material as VerifiedAuditMaterial after the single complete
+// VerifyAudit chain pass. The embedded checkpoint is informational; still,
+// contradicting the retained checkpoint means the payload was altered, and
+// the authoritative check always uses the caller's independently retained
+// checkpoint.
+func validateDecodedFrame(frame decodedArchiveFrame, org string, cp Checkpoint) (VerifiedAuditMaterial, error) {
 	// Content checks reuse the exact audit-range validation the live export
 	// and offline review paths use, so an archive can never smuggle in a
 	// shape those entry points would reject.
-	if embeddedOrg != org {
-		return nil, fmt.Errorf("%w: archive organization %q does not match %q", ErrInvalidRange, embeddedOrg, org)
+	if frame.org != org {
+		return VerifiedAuditMaterial{}, fmt.Errorf("%w: archive organization %q does not match %q", ErrInvalidRange, frame.org, org)
 	}
-	// The embedded checkpoint is informational; still, contradicting its own
-	// header means the payload was altered, and the authoritative check
-	// below always uses the caller's independently retained checkpoint.
-	if embeddedEndSeq != cp.EndSeq || embeddedFingerprint != cp.Fingerprint {
-		return nil, fmt.Errorf("%w: embedded checkpoint does not match the retained checkpoint", ErrInvalidRange)
+	if frame.endSeq != cp.EndSeq || frame.fingerprint != cp.Fingerprint {
+		return VerifiedAuditMaterial{}, fmt.Errorf("%w: embedded checkpoint does not match the retained checkpoint", ErrInvalidRange)
 	}
-	if err := VerifyAudit(org, records, cp); err != nil {
+	return verifyAuditMaterial(org, frame.records, cp)
+}
+
+// DecodeVerifiedAuditArchive reads one archive produced by
+// EncodeAuditArchive, validates it once, and returns the material ready
+// for RecheckVerifiedDecisionOffline. It is the single-validation half of
+// the offline review flow: the returned VerifiedAuditMaterial carries the
+// already-checked chain, so the following review performs no second chain
+// pass. org is the organization the caller expects, and cp is the
+// checkpoint the caller independently retained; the checkpoint embedded in
+// the file is never treated as evidence, so even an archive carrying a
+// plausible checkpoint only validates against the one supplied here.
+//
+// A missing organization is ErrMissingOrganization. Unrecognized framing,
+// truncation, a trailing second archive or any other extra byte, a bad
+// checksum, and undecodable content are ErrInvalidArchive. Records that
+// decode but are missing, out of order, foreign to the organization,
+// modified (including a record after the one the caller intends to review)
+// or mismatched with the supplied checkpoint fail the whole read with
+// ErrInvalidRange. Failure returns no material. A successful read only
+// proves the material matches the checkpoint: an original decision that
+// disagrees with a recomputed one is reported later by offline review, not
+// treated as archive damage. The material is detached from archive
+// (mutating one never reaches the other), and the call is read-only.
+func DecodeVerifiedAuditArchive(archive []byte, org string, cp Checkpoint) (VerifiedAuditMaterial, error) {
+	if org == "" {
+		return VerifiedAuditMaterial{}, ErrMissingOrganization
+	}
+	frame, err := decodeAuditArchiveFrame(archive)
+	if err != nil {
+		return VerifiedAuditMaterial{}, err
+	}
+	return validateDecodedFrame(frame, org, cp)
+}
+
+// DecodeAuditArchive reads one archive produced by EncodeAuditArchive and
+// returns records that can be handed directly to RecheckDecisionOffline.
+// org is the organization the caller expects, and cp is the checkpoint the
+// caller independently retained; the checkpoint embedded in the file is
+// never treated as evidence, so even an archive carrying a plausible
+// checkpoint only validates against the one supplied here.
+//
+// This is a standalone entry point: it performs the complete archive and
+// chain validation itself and never assumes another entry point ran first.
+// (The `darksafe review` command instead uses DecodeVerifiedAuditArchive
+// followed by RecheckVerifiedDecisionOffline, so one invocation validates
+// the chain exactly once rather than once here and again in the review.)
+//
+// A missing organization is ErrMissingOrganization. Unrecognized framing,
+// truncation, a trailing second archive or any other extra byte, a bad
+// checksum, and undecodable content are ErrInvalidArchive. Records that
+// decode but are missing, out of order, foreign to the organization,
+// modified (including a record after the one the caller intends to review)
+// or mismatched with the supplied checkpoint fail the whole read with
+// ErrInvalidRange. Failure returns no records. A successful read only
+// proves the material matches the checkpoint: an original decision that
+// disagrees with a recomputed one is reported later by offline review, not
+// treated as archive damage. The result is detached from archive (mutating
+// one never reaches the other), and the call is read-only.
+func DecodeAuditArchive(archive []byte, org string, cp Checkpoint) ([]AuditRecord, error) {
+	m, err := DecodeVerifiedAuditArchive(archive, org, cp)
+	if err != nil {
 		return nil, err
 	}
-	return records, nil
+	return m.records, nil
 }

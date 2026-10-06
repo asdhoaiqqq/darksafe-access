@@ -82,45 +82,67 @@ func validateStrictText(in ReleasePlanInput) error {
 	return nil
 }
 
-// validateStrictTagText checks one candidate's tags at its zero-based
-// candidate position. Entries are examined in ascending key order; for each
-// entry the key is checked before its value. An invalid value is reported
-// with the (valid) key it belongs to; an invalid key is quoted byte-for-byte
-// (so the corrupt bytes are shown as Go-escaped octets rather than rewritten
-// to "�") and reported as belonging to that candidate's tags object.
-func validateStrictTagText(clusterIndex int, tags map[string]string) error {
-	for _, k := range sortedLabelKeys(tags) {
+// checkLabelSetText is the UTF-8 check shared by every label set in a
+// directly constructed config — a candidate's tags and each include/exclude
+// condition alike. Entries are examined in ascending key order (so map
+// iteration order can never change the outcome); for each entry the key is
+// checked before its value. The set is only read. Each kind of object keeps
+// its own error wording and position style by formatting problems through
+// keyErr (invalid key, quoted byte-for-byte so the corrupt bytes are shown
+// as Go-escaped octets rather than rewritten to "�") and valueErr (invalid
+// value, named by the valid key it belongs to) — the same call-site
+// formatting pattern labelsFromJSON uses for the JSON entry.
+func checkLabelSetText(labels map[string]string, keyErr, valueErr func(key string) error) error {
+	for _, k := range sortedLabelKeys(labels) {
 		if !utf8.ValidString(k) {
-			return &invalidConfigTextError{
-				where: fmt.Sprintf("clusters[%d] 的标签映射包含非法键 %q", clusterIndex, k),
-			}
+			return keyErr(k)
 		}
-		if !utf8.ValidString(tags[k]) {
-			return &invalidConfigTextError{
-				where: fmt.Sprintf("clusters[%d] 的标签键 %q 对应的值", clusterIndex, k),
-			}
+		if !utf8.ValidString(labels[k]) {
+			return valueErr(k)
 		}
 	}
 	return nil
 }
 
+// validateStrictTagText checks one candidate's tags at its zero-based
+// candidate position, applying the shared label-set text check. An invalid
+// key is reported as belonging to that candidate's tags object; an invalid
+// value names the key it belongs to.
+func validateStrictTagText(clusterIndex int, tags map[string]string) error {
+	return checkLabelSetText(tags,
+		func(k string) error {
+			return &invalidConfigTextError{
+				where: fmt.Sprintf("clusters[%d] 的标签映射包含非法键 %q", clusterIndex, k),
+			}
+		},
+		func(k string) error {
+			return &invalidConfigTextError{
+				where: fmt.Sprintf("clusters[%d] 的标签键 %q 对应的值", clusterIndex, k),
+			}
+		},
+	)
+}
+
 // validateStrictConditionText checks every condition of one field
 // ("include" or "exclude") at its zero-based list position, applying the
-// same ascending-key, key-before-value order as
-// validateStrictTagText.
+// shared label-set text check to each. An invalid key is reported as
+// belonging to that condition object; an invalid value names the key it
+// belongs to.
 func validateStrictConditionText(field string, conds []LabelCondition) error {
 	for i, cond := range conds {
-		for _, k := range sortedLabelKeys(cond) {
-			if !utf8.ValidString(k) {
+		if err := checkLabelSetText(cond,
+			func(k string) error {
 				return &invalidConfigTextError{
 					where: fmt.Sprintf("%s[%d] 的条件对象包含非法键 %q", field, i, k),
 				}
-			}
-			if !utf8.ValidString(cond[k]) {
+			},
+			func(k string) error {
 				return &invalidConfigTextError{
 					where: fmt.Sprintf("%s[%d] 的条件键 %q 对应的值", field, i, k),
 				}
-			}
+			},
+		); err != nil {
+			return err
 		}
 	}
 	return nil

@@ -142,35 +142,31 @@ func (e *fingerprintEncoder) rawString(s string) {
 	e.buf = append(e.buf, s...)
 }
 
-// writeRawList frames every length-counted list in the raw canonical
-// encoding, whatever its item type: the subject-role and matched-policy
-// string lists and the policy-change policy list all share this one shape.
-// The tag identifies the list kind, then nil is one marker and a non-nil
-// list is a presence marker, a count and one encoded item each, so nil,
-// non-nil empty and populated lists stay distinct and element order is
-// whatever the caller supplied. Keeping the framing here — rather than
-// copied per item type — means a list-format change is made once instead of
-// mirrored between the two list kinds.
-func writeRawList[T any](e *fingerprintEncoder, t fingerprintTag, items []T, writeItem func(T)) {
-	e.tag(t)
-	if items == nil {
-		e.buf = append(e.buf, 0)
-		return
-	}
-	e.buf = append(e.buf, 1)
+// put appends one raw framing byte. It is the fingerprint sink's side of the
+// shared list shape: the list presence marker goes into the canonical bytes
+// verbatim.
+func (e *fingerprintEncoder) put(b byte) {
+	e.buf = append(e.buf, b)
+}
+
+// listCount writes a list element count as a big-endian uint32. The raw
+// canonical encoding has no length ceiling beyond the hash input, so unlike
+// the archive sink the count is written unconditionally; only the list shape
+// (nil marker, presence marker, count then one item per element) is shared.
+func (e *fingerprintEncoder) listCount(n int) {
 	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], uint32(len(items)))
+	binary.BigEndian.PutUint32(b[:], uint32(n))
 	e.buf = append(e.buf, b[:]...)
-	for i := range items {
-		writeItem(items[i])
-	}
 }
 
 // stringList preserves nil-vs-empty explicitly: in the JSON envelope a
 // nil slice is "null" and a non-nil empty slice is "[]", so the raw
-// encoding must keep the two shapes apart as well.
+// encoding must keep the two shapes apart as well. The list's own kind tag
+// leads, then the shared list shape carries the presence marker, count and
+// elements under it.
 func (e *fingerprintEncoder) stringList(items []string) {
-	writeRawList(e, tagStringList, items, e.rawString)
+	e.tag(tagStringList)
+	writeListShape(e, items, e.rawString)
 }
 
 func (e *fingerprintEncoder) policy(p Policy) {
@@ -196,11 +192,12 @@ func (e *fingerprintEncoder) policy(p Policy) {
 	}
 }
 
-// policyList frames the full policy set with the shared list shape, under
+// policyList frames the full policy set with the shared list shape, led by
 // the policy-list tag so a policy set can never collide with a string list
 // whose concatenated bytes happen to match.
 func (e *fingerprintEncoder) policyList(policies []Policy) {
-	writeRawList(e, tagPolicyList, policies, e.policy)
+	e.tag(tagPolicyList)
+	writeListShape(e, policies, e.policy)
 }
 
 func (e *fingerprintEncoder) change(c *PolicyChange) {

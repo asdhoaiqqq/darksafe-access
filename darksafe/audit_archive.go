@@ -83,6 +83,21 @@ func (w *archiveWriter) boolean(v bool) {
 	}
 }
 
+// put appends one raw framing byte. It is the archive sink's side of the
+// shared list shape: the list presence marker (archiveTagNil for nil,
+// archiveTagPresent for a non-nil list) goes into the payload verbatim.
+func (w *archiveWriter) put(b byte) {
+	w.buf = append(w.buf, b)
+}
+
+// listCount writes a list element count through the archive's own
+// range-checked u32, so a list length the uint32 format cannot represent
+// still fails the whole archive with the existing ErrInvalidArchive rather
+// than emitting truncated framing or returning partial bytes.
+func (w *archiveWriter) listCount(n int) {
+	w.u32(n)
+}
+
 // stringField writes a string from its exact memory bytes. Nothing is
 // validated, replaced or normalized: a lone 0xFF reaches the output as
 // itself and stays distinguishable from 0xFE and a genuine U+FFFD.
@@ -92,26 +107,6 @@ func (w *archiveWriter) stringField(s string) {
 		return
 	}
 	w.buf = append(w.buf, s...)
-}
-
-// writeList frames every length-counted list in the archive, whatever its
-// item type: the subject-role and matched-policy string lists and the
-// policy-change policy list all share this one shape. nil is one marker, a
-// non-nil list is a presence marker, a count and one encoded item each, so
-// nil, non-nil empty and populated lists stay distinct and element order is
-// whatever the caller supplied. Keeping the framing here — rather than
-// copied per item type — means a list-format change is made once instead of
-// mirrored between the two list kinds.
-func writeList[T any](w *archiveWriter, items []T, writeItem func(T)) {
-	if items == nil {
-		w.buf = append(w.buf, archiveTagNil)
-		return
-	}
-	w.buf = append(w.buf, archiveTagPresent)
-	w.u32(len(items))
-	for i := range items {
-		writeItem(items[i])
-	}
 }
 
 // policy writes one Policy by walking the single policy field table, so the
@@ -149,7 +144,7 @@ func (w *archiveWriter) change(c *PolicyChange) {
 		case changeFieldInt:
 			w.u32(f.getInt(c))
 		case changeFieldPolicyList:
-			writeList(w, f.getPolicies(c), w.policy)
+			writeListShape(w, f.getPolicies(c), w.policy)
 		case changeFieldBool:
 			w.boolean(f.getBool(c))
 		}
@@ -174,7 +169,7 @@ func (w *archiveWriter) decisionRecord(d *DecisionRecord) {
 		case decisionFieldString:
 			w.stringField(f.getString(d))
 		case decisionFieldStringList:
-			writeList(w, f.getList(d), w.stringField)
+			writeListShape(w, f.getList(d), w.stringField)
 		case decisionFieldBool:
 			w.boolean(f.getBool(d))
 		case decisionFieldInt:
@@ -331,8 +326,9 @@ func (r *archiveReader) stringField() string {
 	return s
 }
 
-// readList reads one length-counted list framed by writeList, whatever its
-// item type: both string lists and the policy list decode here. Every list
+// readList reads one length-counted list framed by writeListShape on the
+// archive sink, whatever its item type: both string lists and the policy
+// list decode here. Every list
 // kind gets the exact same framing checks — the nil/presence marker, the
 // per-item byte floor before any allocation, and each item's own
 // truncation/structure errors — so a hostile count can neither drive a

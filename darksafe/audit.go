@@ -513,6 +513,47 @@ func optionalResourceCondition(conds []string) (string, error) {
 	}
 }
 
+// auditPageInput carries the inputs AuditQuery and AuditPage validate
+// identically: the organization, the record filters and the page size.
+// Validating them in one place keeps the two entry points' rules — and the
+// order their failures are reported — from drifting apart.
+type auditPageInput struct {
+	org       string
+	kind      string
+	subjectID string
+	resource  string
+	pageSize  int
+}
+
+// validateAuditPageInput checks the inputs shared by AuditQuery and
+// AuditPage and returns them normalized. The checks run in the historical
+// order both entry points reported them: the optional resource condition
+// first, then the organization, the record category and the page size.
+// Path-specific arguments (the start sequence of a first query, the cursor
+// and checkpoint of a continuation) are validated by the callers.
+func validateAuditPageInput(org string, pageSize int, kind, subjectID string, resourceID []string) (auditPageInput, error) {
+	resource, err := optionalResourceCondition(resourceID)
+	if err != nil {
+		return auditPageInput{}, err
+	}
+	if org == "" {
+		return auditPageInput{}, ErrMissingOrganization
+	}
+	if kind != "" && kind != AuditPolicyChange && kind != AuditDecision {
+		return auditPageInput{}, fmt.Errorf("%w: unknown category %q", ErrInvalidPage, kind)
+	}
+	if pageSize <= 0 {
+		return auditPageInput{}, fmt.Errorf("%w: page size must be positive, got %d", ErrInvalidPage, pageSize)
+	}
+	return auditPageInput{
+		org:       org,
+		kind:      kind,
+		subjectID: subjectID,
+		resource:  resource,
+		pageSize:  pageSize,
+	}, nil
+}
+
 // AuditQuery pins the first page of an audit query. startSeq is the first
 // sequence considered (1 from the beginning); endSeq <= 0 means "everything
 // currently stored". The returned checkpoint must be passed to AuditPage
@@ -531,36 +572,27 @@ func optionalResourceCondition(conds []string) (string, error) {
 // are returned: paging, checkpoints and detached copies behave exactly as
 // without it, and omitting it preserves the historical call and its results.
 func (s *Store) AuditQuery(org string, startSeq, pageSize int, kind, subjectID string, resourceID ...string) (*AuditPage, error) {
-	resource, err := optionalResourceCondition(resourceID)
+	in, err := validateAuditPageInput(org, pageSize, kind, subjectID, resourceID)
 	if err != nil {
 		return nil, err
-	}
-	if org == "" {
-		return nil, ErrMissingOrganization
-	}
-	if kind != "" && kind != AuditPolicyChange && kind != AuditDecision {
-		return nil, fmt.Errorf("%w: unknown category %q", ErrInvalidPage, kind)
-	}
-	if pageSize <= 0 {
-		return nil, fmt.Errorf("%w: page size must be positive, got %d", ErrInvalidPage, pageSize)
 	}
 	if startSeq < 1 {
 		return nil, fmt.Errorf("%w: start sequence must be >= 1, got %d", ErrInvalidPage, startSeq)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st := s.orgLocked(org)
-	end, fingerprint := st.auditHeadLocked(org)
-	cp := Checkpoint{Org: org, EndSeq: end, Fingerprint: fingerprint}
+	st := s.orgLocked(in.org)
+	end, fingerprint := st.auditHeadLocked(in.org)
+	cp := Checkpoint{Org: in.org, EndSeq: end, Fingerprint: fingerprint}
 	if end == 0 {
 		// An organization with no records always yields the empty genesis
 		// page, regardless of where the caller asked to begin.
-		return &AuditPage{Org: org, BeginSeq: 1, EndSeq: 0, Checkpoint: cp}, nil
+		return &AuditPage{Org: in.org, BeginSeq: 1, EndSeq: 0, Checkpoint: cp}, nil
 	}
 	if startSeq > end {
 		return nil, fmt.Errorf("%w: start sequence %d is beyond end sequence %d", ErrInvalidRange, startSeq, end)
 	}
-	return s.auditPageLocked(org, startSeq, end, fingerprint, pageSize, kind, subjectID, resource), nil
+	return s.auditPageLocked(in.org, startSeq, end, fingerprint, in.pageSize, in.kind, in.subjectID, in.resource), nil
 }
 
 // AuditPage returns one page of a previously pinned query. nextSeq is the
@@ -583,18 +615,9 @@ func (s *Store) AuditQuery(org string, startSeq, pageSize int, kind, subjectID s
 // resource IDs and excludes policy-change records, exactly as on the first
 // page; omitting it keeps the historical call and result shape.
 func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID string, resourceID ...string) (*AuditPage, error) {
-	resource, err := optionalResourceCondition(resourceID)
+	in, err := validateAuditPageInput(cp.Org, pageSize, kind, subjectID, resourceID)
 	if err != nil {
 		return nil, err
-	}
-	if cp.Org == "" {
-		return nil, ErrMissingOrganization
-	}
-	if kind != "" && kind != AuditPolicyChange && kind != AuditDecision {
-		return nil, fmt.Errorf("%w: unknown category %q", ErrInvalidPage, kind)
-	}
-	if pageSize <= 0 {
-		return nil, fmt.Errorf("%w: page size must be positive, got %d", ErrInvalidPage, pageSize)
 	}
 	if nextSeq < 0 {
 		return nil, fmt.Errorf("%w: next sequence must be >= 0, got %d", ErrInvalidPage, nextSeq)
@@ -604,7 +627,7 @@ func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	genesis := genesisFingerprint(cp.Org)
+	genesis := genesisFingerprint(in.org)
 	if cp.EndSeq == 0 {
 		// A root checkpoint pins the empty range the organization had when
 		// it was issued. Read-only paging must never depend on whether this
@@ -623,9 +646,9 @@ func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID 
 		if nextSeq > 1 {
 			return nil, fmt.Errorf("%w: next sequence %d beyond pinned empty range ending at 0", ErrInvalidRange, nextSeq)
 		}
-		return &AuditPage{Org: cp.Org, BeginSeq: 1, EndSeq: 0, Next: 0, Checkpoint: cp}, nil
+		return &AuditPage{Org: in.org, BeginSeq: 1, EndSeq: 0, Next: 0, Checkpoint: cp}, nil
 	}
-	st, ok := s.orgs[cp.Org]
+	st, ok := s.orgs[in.org]
 	if !ok {
 		// The checkpoint claims positive records in an organization this
 		// store has never seen; it can never verify.
@@ -640,15 +663,15 @@ func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID 
 		return nil, fmt.Errorf("%w: checkpoint fingerprint does not match the chain at sequence %d", ErrInvalidRange, cp.EndSeq)
 	}
 	if nextSeq == 0 {
-		return &AuditPage{Org: cp.Org, BeginSeq: 1, EndSeq: cp.EndSeq, Checkpoint: cp}, nil
+		return &AuditPage{Org: in.org, BeginSeq: 1, EndSeq: cp.EndSeq, Checkpoint: cp}, nil
 	}
 	if nextSeq > cp.EndSeq+1 {
 		return nil, fmt.Errorf("%w: next sequence %d beyond pinned range ending at %d", ErrInvalidRange, nextSeq, cp.EndSeq)
 	}
 	if nextSeq == cp.EndSeq+1 {
-		return &AuditPage{Org: cp.Org, BeginSeq: nextSeq, EndSeq: cp.EndSeq, Checkpoint: cp}, nil
+		return &AuditPage{Org: in.org, BeginSeq: nextSeq, EndSeq: cp.EndSeq, Checkpoint: cp}, nil
 	}
-	return s.auditPageLocked(cp.Org, nextSeq, cp.EndSeq, wantFP, pageSize, kind, subjectID, resource), nil
+	return s.auditPageLocked(in.org, nextSeq, cp.EndSeq, wantFP, in.pageSize, in.kind, in.subjectID, in.resource), nil
 }
 
 // auditPageLocked scans forward collecting up to pageSize matching records

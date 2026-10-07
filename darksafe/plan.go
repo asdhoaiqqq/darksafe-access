@@ -34,9 +34,14 @@ type ReleasePlanInput struct {
 	Revision  string
 	Image     string
 	BatchSize int
-	Clusters  []Cluster
-	Include   []LabelCondition
-	Exclude   []LabelCondition
+	// FirstBatchSize, when non-zero, caps only batch 1; every later batch is
+	// capped by BatchSize. It must be a positive integer no larger than
+	// BatchSize. Zero means the option is unset and batch 1 uses BatchSize
+	// exactly as before.
+	FirstBatchSize int
+	Clusters       []Cluster
+	Include        []LabelCondition
+	Exclude        []LabelCondition
 	// SpreadBy, when non-empty, names a cluster tag whose value identifies a
 	// fault domain; each batch then contains at most one cluster per domain.
 	SpreadBy string
@@ -371,6 +376,13 @@ func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {
 	if err != nil {
 		return ReleasePlanInput{}, err
 	}
+	firstBatchSize, err := optionalPositiveInt(doc, "firstBatchSize")
+	if err != nil {
+		return ReleasePlanInput{}, err
+	}
+	if firstBatchSize > batchSize {
+		return ReleasePlanInput{}, fmt.Errorf(`字段 "firstBatchSize" 不能大于 "batchSize"`)
+	}
 	spreadBy, err := optionalSpreadBy(doc)
 	if err != nil {
 		return ReleasePlanInput{}, err
@@ -389,15 +401,47 @@ func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {
 	}
 
 	return ReleasePlanInput{
-		App:       app,
-		Revision:  revision,
-		Image:     image,
-		BatchSize: batchSize,
-		Clusters:  clusters,
-		Include:   include,
-		Exclude:   exclude,
-		SpreadBy:  spreadBy,
+		App:            app,
+		Revision:       revision,
+		Image:          image,
+		BatchSize:      batchSize,
+		FirstBatchSize: firstBatchSize,
+		Clusters:       clusters,
+		Include:        include,
+		Exclude:        exclude,
+		SpreadBy:       spreadBy,
 	}, nil
+}
+
+// optionalPositiveInt reads an optional field under the same positive-integer
+// rule as positiveInt: when the member is absent the option is unset (0, nil);
+// when present it must be an integral JSON number no smaller than 1 and fully
+// representable by the running environment's int — an explicit zero, a
+// negative, a fraction, a non-number or an out-of-range literal is a
+// configuration error naming the field, never a value to ignore, round or
+// truncate.
+func optionalPositiveInt(doc map[string]any, field string) (int, error) {
+	if _, ok := doc[field]; !ok {
+		return 0, nil
+	}
+	return positiveInt(doc, field)
+}
+
+// checkFirstBatchSize enforces the relation between the two capacities for a
+// directly constructed config: zero means the first-batch cap is unset, a
+// negative value can never be a capacity, and a set value must not exceed the
+// regular per-batch cap. PositiveInt format itself is checked alongside
+// BatchSize.
+func checkFirstBatchSize(batchSize, firstBatchSize int) error {
+	switch {
+	case firstBatchSize == 0:
+		return nil
+	case firstBatchSize < 0:
+		return errors.New(`字段 "firstBatchSize" 必须是正整数`)
+	case firstBatchSize > batchSize:
+		return fmt.Errorf(`字段 "firstBatchSize" 不能大于 "batchSize"`)
+	}
+	return nil
 }
 
 // optionalSpreadBy reads the optional "spreadBy" field: absent or an empty
@@ -438,14 +482,15 @@ func checkSpreadBy(s string) error {
 // and condition positions from zero, then keys in ascending order), so the
 // one problem it reports never depends on map iteration. Business
 // validation then runs as before: app/revision/image are non-empty,
-// batchSize is a positive integer, spreadBy is empty or a usable tag key
-// (not whitespace-only), cluster IDs are unique across every candidate
-// (including disabled and filtered-out clusters), and tag/condition keys
-// are non-empty. Errors name the field and the position in its list; within
-// a cluster the ID is checked before its tags, and tag keys are examined in
-// ascending order so repeated calls report the same error. The input is
-// never mutated. MakeReleasePlan calls this automatically; library callers
-// may use it to validate without planning.
+// batchSize is a positive integer, firstBatchSize is unset (zero) or a
+// positive integer no larger than batchSize, spreadBy is empty or a usable
+// tag key (not whitespace-only), cluster IDs are unique across every
+// candidate (including disabled and filtered-out clusters), and tag/
+// condition keys are non-empty. Errors name the field and the position in
+// its list; within a cluster the ID is checked before its tags, and tag
+// keys are examined in ascending order so repeated calls report the same
+// error. The input is never mutated. MakeReleasePlan calls this
+// automatically; library callers may use it to validate without planning.
 func ValidateReleaseInput(in ReleasePlanInput) error {
 	if err := validateStrictText(in); err != nil {
 		return err
@@ -461,6 +506,9 @@ func ValidateReleaseInput(in ReleasePlanInput) error {
 	}
 	if in.BatchSize <= 0 {
 		return errors.New(`字段 "batchSize" 必须是正整数`)
+	}
+	if err := checkFirstBatchSize(in.BatchSize, in.FirstBatchSize); err != nil {
+		return err
 	}
 	if err := checkSpreadBy(in.SpreadBy); err != nil {
 		return err
@@ -648,7 +696,9 @@ func parseConditions(doc map[string]any, field string) ([]LabelCondition, error)
 // MakeReleasePlan selects available clusters, orders them by ID, and splits
 // them into batches. When SpreadBy names a tag, each batch holds at most one
 // cluster per value of that tag (its fault domain) and every selected cluster
-// must carry the tag. It validates the input first and never mutates it.
+// must carry the tag. When FirstBatchSize is positive, only batch 1 is capped
+// by it; every later batch is capped by BatchSize. It validates the input
+// first and never mutates it.
 //
 // When every candidate is filtered out, the returned error lists each
 // candidate's rejection reason on its own line, ascending by the original
@@ -697,13 +747,13 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 
 	var batches []Batch
 	if in.SpreadBy == "" {
-		batches = chunkBatches(selected, in.BatchSize)
+		batches = chunkBatches(selected, in.BatchSize, in.FirstBatchSize)
 	} else {
 		domains, err := faultDomains(in.Clusters, selected, in.SpreadBy)
 		if err != nil {
 			return ReleasePlan{}, err
 		}
-		batches = spreadBatches(selected, domains, in.BatchSize)
+		batches = spreadBatches(selected, domains, in.BatchSize, in.FirstBatchSize)
 	}
 
 	return ReleasePlan{
@@ -714,19 +764,26 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 }
 
 // chunkBatches splits the ascending IDs into batches of at most batchSize.
-// Each batch's Clusters gets its own backing array: a subslice of selected
-// would leave spare capacity pointing at the next batch's IDs, so a caller
-// appending to one batch's list would overwrite the following batch.
-func chunkBatches(selected []string, batchSize int) []Batch {
+// A positive firstBatchSize caps only batch 1; every later batch uses
+// batchSize again. Each batch's Clusters gets its own backing array: a
+// subslice of selected would leave spare capacity pointing at the next
+// batch's IDs, so a caller appending to one batch's list would overwrite
+// the following batch.
+func chunkBatches(selected []string, batchSize, firstBatchSize int) []Batch {
 	batches := []Batch{}
-	for i := 0; i < len(selected); i += batchSize {
-		end := i + batchSize
+	for i := 0; i < len(selected); {
+		size := batchSize
+		if len(batches) == 0 && firstBatchSize > 0 {
+			size = firstBatchSize
+		}
+		end := i + size
 		if end > len(selected) {
 			end = len(selected)
 		}
 		clusters := make([]string, end-i)
 		copy(clusters, selected[i:end])
 		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: clusters})
+		i = end
 	}
 	return batches
 }
@@ -757,19 +814,29 @@ func faultDomains(clusters []Cluster, selected []string, spreadBy string) (map[s
 // batch; conflicting clusters are deferred to later batches, so a batch may
 // be short only when no non-conflicting cluster remains. Every ID appears in
 // exactly one batch and IDs stay ascending within a batch.
-func spreadBatches(selected []string, domains map[string]string, batchSize int) []Batch {
+//
+// A positive firstBatchSize narrows only batch 1: the first pass over the
+// remaining IDs closes at that capacity (domain conflicts still defer
+// clusters as usual, and later non-conflicting domains still fill the
+// smaller first batch), after which every subsequent batch uses batchSize
+// again. Zero firstBatchSize leaves all batches capped by batchSize.
+func spreadBatches(selected []string, domains map[string]string, batchSize, firstBatchSize int) []Batch {
 	remaining := append([]string(nil), selected...)
 	batches := []Batch{}
 	for len(remaining) > 0 {
+		size := batchSize
+		if len(batches) == 0 && firstBatchSize > 0 {
+			size = firstBatchSize
+		}
 		// The map never holds more entries than there are remaining clusters,
-		// so size it by them — never by batchSize, which is only an upper
+		// so size it by them — never by the capacity, which is only an upper
 		// bound and may be a huge legal value (e.g. 1e9 meaning "no limit").
-		used := make(map[string]struct{}, min(batchSize, len(remaining)))
+		used := make(map[string]struct{}, min(size, len(remaining)))
 		batch := []string{}
 		deferred := []string{}
 		for _, id := range remaining {
 			d := domains[id]
-			if _, conflict := used[d]; len(batch) < batchSize && !conflict {
+			if _, conflict := used[d]; len(batch) < size && !conflict {
 				used[d] = struct{}{}
 				batch = append(batch, id)
 			} else {

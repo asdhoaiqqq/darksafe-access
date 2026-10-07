@@ -48,6 +48,7 @@ summary: 2 of 3 subjects allowed
 | `revision` | 是 | 待发布修订号，非空字符串（不能只含空白） |
 | `image` | 是 | 容器镜像引用，非空字符串（不能只含空白） |
 | `batchSize` | 是 | 每批集群数量的**上限**，正整数 |
+| `firstBatchSize` | 否 | **仅首批（编号 1）**集群数量的上限，正整数且不能大于 `batchSize`；省略、或设为与 `batchSize` 相同的值时，计划与只设 `batchSize` 完全一致 |
 | `clusters` | 是 | 候选集群数组，至少一项；每项含唯一的 `id`、可选的 `disabled`（布尔值）、可选的 `tags`（字符串到字符串的映射） |
 | `include` | 否 | 包含条件数组；省略时允许所有未停用、未排除的集群 |
 | `exclude` | 否 | 排除条件数组；省略时不排除任何集群 |
@@ -181,6 +182,66 @@ go run ./cmd/darksafe plan plan.json
 - **空值可以代表一个故障域**：两个带 `"zone": ""` 的集群属于同一个空字符串故障域，不能同批，但可以与其他故障域的集群同批。
 - 省略 `spreadBy` 或显式写成 `"spreadBy": ""` 时保持**普通分批**：仅按 `batchSize` 容量切分，同故障域集群允许同批，两种写法输出完全一致。只含空白的 `spreadBy` 会被直接判为配置错误。
 
+**首批缩小：`firstBatchSize`（可选）**
+
+- `firstBatchSize` 只作用于**编号为 1 的批次**：首批以它为数量上限，首批结束后立即恢复 `batchSize`，后续批次不会继续按首批容量拆分。省略该字段时首批与其他批次一样使用 `batchSize`。
+- 首批同样从最小标识开始依次考察；启用 `spreadBy` 时仍严格遵守「同域每批最多一个」：同域冲突的集群延后，排在其后的其他故障域集群照常进入首批。被延后的集群继续参加后续分批，每个入选集群恰好出现在一个批次中。
+- 首批容量同样只是**上限**：入选集群不足、或故障域冲突导致无人可入时允许不足额，但不会生成空批次，也不会为了凑满首批而放宽故障域限制。只有一个入选集群时只返回一批。
+- 停用、包含和排除条件仍先决定入选集群，首批容量不改变这些判断：所有候选都被筛掉、或入选集群缺少 `spreadBy` 指定标签时，仍按既有规则失败——不会因为首批只选少量集群而漏掉后续集群的问题。
+- 该字段与 `batchSize` 适用同样的正整数规则，且**不能大于 `batchSize`**：显式写 `0`、负数、小数、非数字类型或超出本机 int 范围的字面量都会被拒绝，错误指出字段和原因，不会忽略、取整或截断。Go 内存配置中对应的 `FirstBatchSize` 零值表示未设置，其他非法值在规划前拒绝并返回错误和零值计划。
+
+完整示例：`batchSize: 3`、`firstBatchSize: 2`、`spreadBy: "zone"`，`a`、`b` 属于东区，`c`、`e` 属于西区，`d` 属于北区：
+
+```json
+{
+  "app": "demo",
+  "revision": "r1",
+  "image": "registry.example.net/demo:r1",
+  "batchSize": 3,
+  "firstBatchSize": 2,
+  "spreadBy": "zone",
+  "clusters": [
+    {"id": "a", "tags": {"zone": "east"}},
+    {"id": "b", "tags": {"zone": "east"}},
+    {"id": "c", "tags": {"zone": "west"}},
+    {"id": "d", "tags": {"zone": "north"}},
+    {"id": "e", "tags": {"zone": "west"}}
+  ]
+}
+```
+
+分批结果为 `[a,c]`、`[b,d,e]`：首批容量 2，`a` 占用东区后 `b` 因同域延后，`c`（西区）作为下一个不冲突的集群进入首批并凑满 2；首批结束后恢复容量 3，第二批以容量 3 处理延后的 `b`（东）以及继续考察到的 `d`（北）、`e`（西），三个故障域互不冲突，全部进入第二批。
+
+```json
+{
+  "app": {
+    "name": "demo",
+    "revision": "r1",
+    "image": "registry.example.net/demo:r1"
+  },
+  "batches": [
+    {
+      "index": 1,
+      "clusters": [
+        "a",
+        "c"
+      ]
+    },
+    {
+      "index": 2,
+      "clusters": [
+        "b",
+        "d",
+        "e"
+      ]
+    }
+  ],
+  "excluded": []
+}
+```
+
+省略 `firstBatchSize`（或显式设为 `3`）时，同一配置恢复为 `[a,c,d]`、`[b,e]`——与引入该字段之前的计划逐项一致，包括批次编号、集群顺序和未入选原因。
+
 ### 6. 两种失败结果
 
 **失败一：入选集群缺少指定的故障域标签 —— 整个计划失败**
@@ -216,7 +277,7 @@ go run ./cmd/darksafe plan plan.json
 
 如果调用方已经在 Go 程序里持有应用与集群信息，就不必先写 JSON 文件再调命令行：`darksafe` 包把规划能力作为公开 API 提供，**直接用内存中的 `darksafe.ReleasePlanInput` 计算计划**。计算仍然全部在本机进程内完成，不连接集群、不执行实际发布，也不需要任何外部服务。
 
-- `darksafe.ReleasePlanInput`：一份发布配置，字段与 JSON 配置一一对应——`App`、`Revision`、`Image`、`BatchSize`、`Clusters`、`Include`、`Exclude`、`SpreadBy`；候选集群是 `darksafe.Cluster{ID, Disabled, Tags}`，条件是 `darksafe.LabelCondition`（一个 `map[string]string`，键值需全部匹配）。
+- `darksafe.ReleasePlanInput`：一份发布配置，字段与 JSON 配置一一对应——`App`、`Revision`、`Image`、`BatchSize`、`FirstBatchSize`（可选）、`Clusters`、`Include`、`Exclude`、`SpreadBy`；候选集群是 `darksafe.Cluster{ID, Disabled, Tags}`，条件是 `darksafe.LabelCondition`（一个 `map[string]string`，键值需全部匹配）。`FirstBatchSize` 为零值表示不设置首批上限；设置时必须是正整数且不大于 `BatchSize`，首批（编号 1）以它为容量上限，后续批次恢复 `BatchSize`，规则与 JSON 字段 `firstBatchSize` 完全相同。
 - `darksafe.MakeReleasePlan(in)`：校验配置并计算计划，成功返回 `darksafe.ReleasePlan`（含 `App`、`Batches`、`Excluded`）和 `nil` 错误；失败返回**零值计划**和非空错误。它不会修改传入的 `in`。
 - `darksafe.ValidateReleaseInput(in)`：只检查配置是否合法，不做规划；`MakeReleasePlan` 在计算前会自动调用它，库调用方也可以单独调用（例如提前校验表单输入）。
 

@@ -591,26 +591,41 @@ func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID 
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	st, ok := s.orgs[cp.Org]
-	if !ok {
-		// No organization state: the only valid checkpoint is an empty one.
-		g := genesisFingerprint(cp.Org)
-		if cp.EndSeq == 0 && cp.Fingerprint == g && nextSeq == 0 {
-			return &AuditPage{Org: cp.Org, BeginSeq: 0, EndSeq: 0, Checkpoint: cp}, nil
+	st, orgSeen := s.orgs[cp.Org]
+	head := 0
+	if orgSeen {
+		head = len(st.audit)
+	}
+	// A checkpoint pinned at end sequence 0 is the root of an empty range:
+	// the organization held no records when the range was pinned, and its
+	// fingerprint must be that organization's genesis root. This is decided
+	// purely from the submitted checkpoint material — whether the store has
+	// ever visited the organization, or has since grown records, is
+	// irrelevant: a read-only page request must not depend on prior queries
+	// and never reopens or re-stamps a range the caller pinned as empty.
+	if cp.EndSeq == 0 {
+		if cp.Fingerprint != genesisFingerprint(cp.Org) {
+			return nil, fmt.Errorf("%w: checkpoint fingerprint does not match the empty chain root at sequence 0", ErrInvalidRange)
 		}
+		if nextSeq > 1 {
+			return nil, fmt.Errorf("%w: next sequence %d beyond the empty range ending at 0", ErrInvalidRange, nextSeq)
+		}
+		// Both legal cursors close the empty range the same way: cursor 0
+		// reports the already-finished walk and cursor 1 is the one position
+		// past the pinned end — exactly the end-page meaning a non-empty
+		// range gives its EndSeq+1 cursor, never a restart at sequence 1.
+		return emptyRootPage(cp), nil
+	}
+	// A positive end sequence names real records, so the organization must
+	// actually hold them: a store that has never seen the organization (or
+	// still has an empty chain) cannot back a checkpoint claiming records.
+	if !orgSeen || head == 0 {
 		return nil, fmt.Errorf("%w: checkpoint organization has no records", ErrInvalidRange)
 	}
-	head := len(st.audit)
 	if cp.EndSeq < 0 || cp.EndSeq > head {
 		return nil, fmt.Errorf("%w: end sequence %d beyond %d", ErrInvalidRange, cp.EndSeq, head)
 	}
-	wantFP := genesisFingerprint(cp.Org)
-	if cp.EndSeq > 0 {
-		if cp.EndSeq > len(st.audit) {
-			return nil, fmt.Errorf("%w: end sequence %d beyond %d", ErrInvalidRange, cp.EndSeq, head)
-		}
-		wantFP = st.audit[cp.EndSeq-1].Fingerprint
-	}
+	wantFP := st.audit[cp.EndSeq-1].Fingerprint
 	if cp.Fingerprint != wantFP {
 		return nil, fmt.Errorf("%w: checkpoint fingerprint does not match the chain at sequence %d", ErrInvalidRange, cp.EndSeq)
 	}
@@ -624,6 +639,17 @@ func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID 
 		return &AuditPage{Org: cp.Org, BeginSeq: nextSeq, EndSeq: cp.EndSeq, Checkpoint: cp}, nil
 	}
 	return s.auditPageLocked(cp.Org, nextSeq, cp.EndSeq, wantFP, pageSize, kind, subjectID, resource), nil
+}
+
+// emptyRootPage builds the terminal page of an empty range pinned at end
+// sequence 0. The range is closed from either legal cursor — cursor 0 (the
+// already-finished walk) or cursor 1 (the one-past-end position) — so the
+// page carries no records and Next stays 0, states BeginSeq 1 / EndSeq 0,
+// and echoes the caller's checkpoint byte-for-byte. An empty page thus
+// still rests on its verified root fingerprint and is never re-stamped
+// against a later chain tail.
+func emptyRootPage(cp Checkpoint) *AuditPage {
+	return &AuditPage{Org: cp.Org, BeginSeq: 1, EndSeq: 0, Next: 0, Checkpoint: cp}
 }
 
 // auditPageLocked scans forward collecting up to pageSize matching records

@@ -1,7 +1,6 @@
 package darksafe
 
 import (
-	"fmt"
 	"strings"
 	"unicode"
 )
@@ -18,10 +17,13 @@ import (
 //
 // The rule is display-only: an ID that contains a double quote, a
 // backslash, a Unicode control character, or the U+2028/U+2029 separators
-// is rendered as a double-quoted JSON string in which every such character
-// is escaped, so the report never gains a real line break, tab or other
-// control effect and decoding the quoted text restores the original ID
-// byte for byte. Every other ID keeps the existing plain two-space-indent
+// is rendered as a double-quoted JSON string under the shared escaping rule
+// (jsonstring.go), so the report never gains a real line break, tab or
+// other control effect and decoding the quoted text restores the original
+// ID byte for byte. This display keeps the report's own convention on the
+// one choice the shared rule leaves open: the visible characters '<', '>'
+// and '&' stay as themselves, even in an ID that needs quoting for other
+// characters. Every other ID keeps the existing plain two-space-indent
 // spelling, so ordinary IDs — including Chinese and other visible text —
 // stay directly readable. The original ID is never trimmed, replaced or
 // rejected, and the escaped text is never used for identity comparison:
@@ -37,37 +39,7 @@ func reportClusterID(id string) string {
 	}
 	var b strings.Builder
 	b.Grow(len(id) + 2)
-	b.WriteByte('"')
-	for _, r := range id {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		case '\b':
-			b.WriteString(`\b`)
-		case '\f':
-			b.WriteString(`\f`)
-		case '\u2028', '\u2029':
-			// U+2028/U+2029 are legal in JSON strings but are line
-			// separators to many renderers; escape them so the report
-			// can never gain a real line break.
-			fmt.Fprintf(&b, `\u%04x`, r)
-		default:
-			if unicode.IsControl(r) {
-				fmt.Fprintf(&b, `\u%04x`, r)
-			} else {
-				b.WriteRune(r)
-			}
-		}
-	}
-	b.WriteByte('"')
+	escapeJSONString(&b, id, false)
 	return b.String()
 }
 

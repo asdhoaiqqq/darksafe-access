@@ -603,69 +603,9 @@ func isSimpleMemberName(key string) bool {
 // identifier names keep the existing dot spelling ("$.clusters[0].tags");
 // every other name is rendered as brackets around a JSON-encoded string, so
 // the text decodes back to exactly the real member name and none of its
-// characters can be mistaken for a path separator or array index.
+// characters can be mistaken for a path separator or array index. The
+// JSON-string encoding itself — and the location display's HTML-safe
+// '<'/'>'/'&' spelling — is the shared display rule in jsonstring.go.
 func joinMemberPath(path, key string) string {
 	return path + memberSegment(key)
-}
-
-// jsonEncodePathString renders key as a legal JSON string (including the
-// surrounding quotes); decoding the result restores key exactly, including
-// empty names and names containing quotes, backslashes, newlines or other
-// control characters.
-//
-// Every code point with a control effect is written as an escape, never as a
-// raw character: the JSON short escapes keep their established spellings
-// (", \, \b, \f, \n, \r, \t), U+2028/U+2029 stay their \u2028/\u2029 spellings, and —
-// unlike encoding/json, which leaves them in place — DEL (U+007F) and every
-// C1 control character (U+0080–U+009F) are written as \uXXXX as well, so a
-// location printed to a terminal can neither act on the reader nor hide a
-// name fragment. The \uXXXX spelling is a real JSON escape: it decodes back
-// to the control character and is distinct from the ordinary text of a
-// backslash followed by "u007f". No \xNN form is ever produced, since JSON
-// cannot decode one. The key is a Go string built from decoded member names,
-// so it is always valid UTF-8; rune-range iteration therefore visits exactly
-// its code points.
-func jsonEncodePathString(key string) string {
-	var b strings.Builder
-	b.Grow(len(key) + 2)
-	b.WriteByte('"')
-	for _, r := range key {
-		switch r {
-		case '"':
-			b.WriteString(`\"`)
-		case '\\':
-			b.WriteString(`\\`)
-		case '\b':
-			b.WriteString(`\b`)
-		case '\f':
-			b.WriteString(`\f`)
-		case '\n':
-			b.WriteString(`\n`)
-		case '\r':
-			b.WriteString(`\r`)
-		case '\t':
-			b.WriteString(`\t`)
-		default:
-			switch {
-			case r == '<' || r == '>' || r == '&':
-				// Preserve encoding/json's HTML-safe spelling so the segment
-				// stays identical to the old rendering.
-				fallthrough
-			case r < 0x20, r == 0x7f, 0x80 <= r && r <= 0x9f,
-				r == 0x2028, r == 0x2029:
-				// Every code point with a control effect is written as a real
-				// \uXXXX JSON escape — including DEL and the C1 controls,
-				// which encoding/json leaves raw — so the location can neither
-				// act on the terminal nor hide part of a member name. The
-				// spelling decodes back to the character itself and is
-				// distinct from ordinary text containing "\u007f"; no
-				// JSON-illegal \xNN form is ever emitted.
-				fmt.Fprintf(&b, `\u%04x`, r)
-			default:
-				b.WriteRune(r)
-			}
-		}
-	}
-	b.WriteByte('"')
-	return b.String()
 }

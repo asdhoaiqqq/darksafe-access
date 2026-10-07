@@ -513,6 +513,36 @@ func optionalResourceCondition(conds []string) (string, error) {
 	}
 }
 
+// validateAuditPageInput applies the input rules shared by a first
+// AuditQuery and a checkpoint-continuation AuditPage: the optional resource
+// condition (at most one), the organization (required), the record category
+// (empty or one of the known ones) and the page size (positive). The two
+// entry points used to carry identical copies of these checks; this is the
+// single place the common rules and their order live, so the same inputs can
+// never be accepted by one operation and rejected by the other. The checks
+// run in the historical first-reported order — resource count, organization,
+// category, page size — and return the exact historical errors. What stays
+// entry-point-specific is the position argument each one then checks on its
+// own: AuditQuery requires a first-query start sequence >= 1, while
+// AuditPage requires a continuation cursor >= 0 and a non-negative
+// checkpoint end.
+func validateAuditPageInput(org, kind string, pageSize int, conds []string) (resource string, err error) {
+	resource, err = optionalResourceCondition(conds)
+	if err != nil {
+		return "", err
+	}
+	if org == "" {
+		return "", ErrMissingOrganization
+	}
+	if kind != "" && kind != AuditPolicyChange && kind != AuditDecision {
+		return "", fmt.Errorf("%w: unknown category %q", ErrInvalidPage, kind)
+	}
+	if pageSize <= 0 {
+		return "", fmt.Errorf("%w: page size must be positive, got %d", ErrInvalidPage, pageSize)
+	}
+	return resource, nil
+}
+
 // AuditQuery pins the first page of an audit query. startSeq is the first
 // sequence considered (1 from the beginning); endSeq <= 0 means "everything
 // currently stored". The returned checkpoint must be passed to AuditPage
@@ -531,19 +561,12 @@ func optionalResourceCondition(conds []string) (string, error) {
 // are returned: paging, checkpoints and detached copies behave exactly as
 // without it, and omitting it preserves the historical call and its results.
 func (s *Store) AuditQuery(org string, startSeq, pageSize int, kind, subjectID string, resourceID ...string) (*AuditPage, error) {
-	resource, err := optionalResourceCondition(resourceID)
+	resource, err := validateAuditPageInput(org, kind, pageSize, resourceID)
 	if err != nil {
 		return nil, err
 	}
-	if org == "" {
-		return nil, ErrMissingOrganization
-	}
-	if kind != "" && kind != AuditPolicyChange && kind != AuditDecision {
-		return nil, fmt.Errorf("%w: unknown category %q", ErrInvalidPage, kind)
-	}
-	if pageSize <= 0 {
-		return nil, fmt.Errorf("%w: page size must be positive, got %d", ErrInvalidPage, pageSize)
-	}
+	// Only the first query carries a start sequence: the first considered
+	// position must be at least 1.
 	if startSeq < 1 {
 		return nil, fmt.Errorf("%w: start sequence must be >= 1, got %d", ErrInvalidPage, startSeq)
 	}
@@ -583,19 +606,12 @@ func (s *Store) AuditQuery(org string, startSeq, pageSize int, kind, subjectID s
 // resource IDs and excludes policy-change records, exactly as on the first
 // page; omitting it keeps the historical call and result shape.
 func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID string, resourceID ...string) (*AuditPage, error) {
-	resource, err := optionalResourceCondition(resourceID)
+	resource, err := validateAuditPageInput(cp.Org, kind, pageSize, resourceID)
 	if err != nil {
 		return nil, err
 	}
-	if cp.Org == "" {
-		return nil, ErrMissingOrganization
-	}
-	if kind != "" && kind != AuditPolicyChange && kind != AuditDecision {
-		return nil, fmt.Errorf("%w: unknown category %q", ErrInvalidPage, kind)
-	}
-	if pageSize <= 0 {
-		return nil, fmt.Errorf("%w: page size must be positive, got %d", ErrInvalidPage, pageSize)
-	}
+	// Only a continuation carries a cursor and checkpoint: the cursor must
+	// not be negative, and a negative checkpoint end can never be a range.
 	if nextSeq < 0 {
 		return nil, fmt.Errorf("%w: next sequence must be >= 0, got %d", ErrInvalidPage, nextSeq)
 	}

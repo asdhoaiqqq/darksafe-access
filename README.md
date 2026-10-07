@@ -51,6 +51,71 @@ decide  (subject org mismatch)     : allowed=false reason="organization mismatch
 
 这两条边界（第 4、5 行）说明：组织级请求先过信封检查再谈策略，版本 0 的拒绝与"策略评估后拒绝"是两类情况。示例中的四次 `Decide` 都指定了非空决策组织，因此无论允许还是拒绝，都会在 `acme factory` 的审计链各留下一条决策记录（加上发布记录共 5 条）；而第 1 行的 `Access` 不产生任何审计记录。
 
+### 接入边界：请求资料由谁确认
+
+上一个示例直接在代码里构造主体与资源，展示了组织一致性与停用检查，却没有交代**这些资料由谁确认**。接入真实业务系统时，必须先划清下面这条边界：
+
+- **`Store.Decide` 只判断传入的内容。** 它对 `OrgRequest` 的字段做信封检查、再按已发布策略匹配，但**不验证登录身份**：不检查凭据或会话、不解析令牌、不确认调用者是不是请求里填写的那个主体。
+- **平台内没有主体登记表或资源登记表。** `Store` 只保存各组织已发布的策略版本与审计链，无法核对某个主体 ID 是否真实存在、是否属于所填组织、当前是否停用，也无法核对资源 ID 的归属组织与作用域。请求里怎么填，检查就怎么算。
+- **三个组织字符串相同，只证明提交的资料一致。** 主体组织、资源组织与决策组织三者相等，只能说明**这次提交的信封内部一致**，不能证明请求者属于该组织；把伪造资料填成三组织一致的信封，引擎也会照此继续评估。组织一致性检查是租户隔离的**判定规则**，不是身份证明。
+- 因此，**当前主体身份、主体当前所属组织与停用状态、资源归属组织与作用域**，必须由外围业务系统在调用 `Decide` 之前，用自己的可信来源确认后填入——认证后的会话解析出规范主体标识，身份生命周期给出当前组织与停用状态，资源清单给出资源归属与作用域。**身份确认是接入方已经完成的前置条件，不是本包的现有功能**；本包不为决策接口增加身份认证，下面的示例也不联系任何外部服务，其中的"已确认资料"是内存中的固定事实。
+- **资料冲突时，请求者自报的内容不能被当作已核实事实。** 请求者可以表达读取意图（想以什么动作访问哪份资源；动作 `Action` 可以来自请求者，是否允许由已发布策略裁决），但请求者**自报的主体标识、组织或启用状态**都不能直接进信封；与可信资料矛盾时，做法是把自报说法排除在信封之外，而不是让它覆盖可信资料。
+
+#### 完整示例：同一主体读取一份资源，输入来源决定检查结果
+
+[`examples/trusted_intake/main.go`](examples/trusted_intake/main.go) 可在本机离线运行，只依赖本项目公开 API 与 Go 标准库。程序把两类数据明确分开：`readIntent` 是请求者提交的读取意图（声称的主体、组织、启用状态、资源归属、动作，全部按不可信输入对待），`confirmedSubject`/`confirmedResource` 是业务系统**已经确认**的主体资料与资源资料；信封构造函数 `orgRequestFromConfirmedFacts` 只接收已确认资料与动作，自报字段在类型层面就无法进入决策。
+
+```bash
+go run ./examples/trusted_intake
+```
+
+围绕同一个已认证主体 `svc-audit-reader` 读取账本展开，连续三次尝试，发布的允许策略始终不变：
+
+1. **资料一致**：已确认主体属于 `acme factory` 且启用，资源 `ledger-2026` 归属 `acme factory`、作用域 `acme/factory/ledger`。发布匹配的允许策略 `p-ledger-read-2026`（版本 1）后，用可信资料构造信封，得到允许，理由 `matched allow policy`、命中 `p-ledger-read-2026`、实际版本 1。
+2. **请求者声称仍启用，可信主体资料已停用**：身份生命周期给出的停用状态覆盖口头主张。交给 `Decide` 的信封里 `Disabled=true`，自报的"启用"不进入请求；信封检查先于策略拒绝，理由 `subject is disabled`、实际版本 0、命中列表为空——版本 1 的允许策略根本没有被评估。
+3. **请求者把另一组织的资源声称为本组织资源**：资源清单确认 `globex-ledger-9` 属于 `globex holdings`（作用域 `globex/holdings/ledger`）。信封按可信归属提交，资源组织与决策组织不一致，理由 `organization mismatch`、版本 0、命中列表为空，同样**不评估任何策略**。
+
+预期输出（确定性，重复运行逐字节一致；对照 "requester claims" 与 "confirmed facts" 两行即可看到信封字段实际取自哪里）：
+
+```text
+trusted intake example: who confirms the facts behind an organization-level request
+decision organization: "acme factory"
+(claims below are requester input; the decision envelope is built only from confirmed profiles)
+
+attempt 1: confirmed facts agree — enabled home-org subject reads the home-org ledger
+  requester claims : subject="svc-audit-reader" subject-org="acme factory" enabled=true resource="ledger-2026" resource-org="acme factory" action="read"
+  confirmed facts  : subject="svc-audit-reader" subject-org="acme factory" disabled=false resource="ledger-2026" resource-org="acme factory" scope="acme/factory/ledger"
+published allow policy "p-ledger-read-2026" as version 1
+  decide: allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+
+attempt 2: requester claims to still be enabled, but the confirmed subject profile is disabled
+  requester claims : subject="svc-audit-reader" subject-org="acme factory" enabled=true resource="ledger-2026" resource-org="acme factory" action="read"
+  confirmed facts  : subject="svc-audit-reader" subject-org="acme factory" disabled=true resource="ledger-2026" resource-org="acme factory" scope="acme/factory/ledger"
+envelope built from confirmed facts only: disabled=true; the self-claimed enabled state is discarded
+  decide: allowed=false reason="subject is disabled" matched=[] version=0
+
+attempt 3: requester presents another organization's ledger as a home-org resource
+  requester claims : subject="svc-audit-reader" subject-org="acme factory" enabled=true resource="globex-ledger-9" resource-org="acme factory" action="read"
+  confirmed facts  : subject="svc-audit-reader" subject-org="acme factory" disabled=false resource="globex-ledger-9" resource-org="globex holdings" scope="globex/holdings/ledger"
+envelope built from confirmed facts only: resource-org="globex holdings"; the claimed ownership is discarded
+  decide: allowed=false reason="organization mismatch" matched=[] version=0
+
+audit boundary: the chain keeps the submitted envelopes; it does not authenticate them
+records=4 (1 policy change + 3 decisions)
+    seq=1 policy_change version=1
+    seq=2 decision: subject="svc-audit-reader" disabled=false resource-org="acme factory" allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+    seq=3 decision: subject="svc-audit-reader" disabled=true resource-org="acme factory" allowed=false reason="subject is disabled" matched=[] version=0
+    seq=4 decision: subject="svc-audit-reader" disabled=false resource-org="globex holdings" allowed=false reason="organization mismatch" matched=[] version=0
+VerifyAudit(exported chain): valid
+verification proves the recorded bytes are intact and ordered; it cannot prove the caller really was "svc-audit-reader"
+```
+
+三次尝试的策略存储完全相同，差异只来自**信封字段取自哪里**：第 2 次若按自报启用状态构造，就会错误地走到策略评估；第 3 次若把资源组织写成声称的 `acme factory`，引擎看到的只是一个"三组织一致"的信封，无法识别真实归属。策略引擎不能识别任意伪造资料——它只对实际提交的资料负责。
+
+**审计链的边界同样要分清。** 审计保存的是**实际提交的请求及决策**：序号 3 的记录里就是 `disabled=true` 的信封，序号 4 的记录里资源组织就是 `globex holdings`，理由、命中列表与实际版本一并原样保存（输出末尾逐行列出了四条记录）。`VerifyAudit` 校验通过，只能证明链上字节完整、连续、未被改写或拼入其他组织记录；**它不能替这些资料证明身份真实性**——序号 2 记录的请求自称 `svc-audit-reader`，不等于审计链确认了调用者确实是该主体。身份证明只来自调用前外围系统完成的认证，审计链证明的是"这次确实以这份资料做过这个决策"。
+
+本次交付只增加说明与示例：`Decide` 的入口、授权规则与既有示例均保持不变，也没有在决策接口内增加身份认证；身份确认始终是接入方一侧的职责。
+
 ## 按组织的策略发布、回滚与复核
 
 `darksafe.NewStore()` 提供组织级策略管理（纯内存，随服务实例结束而销毁）：

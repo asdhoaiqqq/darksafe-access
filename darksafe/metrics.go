@@ -261,55 +261,52 @@ func (s *MetricStore) IngestLine(line string) (*BatchResult, *LineError) {
 // QueryLine 解析并执行一行 op 为 "query" 的区间均值查询对象。成功返回 QueryResult；
 // 查询只读，不改变存储。op 为 "query_points" 的采样明细查询由 QueryPointsLine
 // 执行，op 为 "query_windows" 的固定窗口均值查询由 QueryWindowsLine 执行。
+// 请求识别、字段/区间校验与操作匹配统一走 runDedicatedQuery，三个入口不各自维护。
 func (s *MetricStore) QueryLine(line string) (*QueryResult, *LineError) {
-	top, ok, lerr := decodeTopValue(line)
+	res, lerr := s.runDedicatedQuery(line, "query")
 	if lerr != nil {
 		return nil, lerr
 	}
-	if ok != '{' {
-		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a query object"}
-	}
-	res, lerr := s.queryFromObject(top)
-	if lerr != nil {
-		return nil, lerr
-	}
-	qr, isQuery := res.(*QueryResult)
-	if !isQuery {
-		if _, isPoints := res.(*QueryPointsResult); isPoints {
-			return nil, &LineError{Status: "error", Error: `op "query_points" lists sample points; use QueryPointsLine`}
-		}
-		return nil, &LineError{Status: "error", Error: `op "query_windows" lists fixed-window averages; use QueryWindowsLine`}
-	}
-	return qr, nil
+	return res.(*QueryResult), nil
 }
 
 // QueryWindowsLine 解析并执行一行 op 为 "query_windows" 的固定时间窗口均值查询
-// 对象。成功返回 QueryWindowsResult；查询只读，不改变存储。
+// 对象。成功返回 QueryWindowsResult；查询只读，不改变存储。请求识别、字段/区间
+// 校验与操作匹配统一走 runDedicatedQuery，与另两个入口共用同一套规则。
 func (s *MetricStore) QueryWindowsLine(line string) (*QueryWindowsResult, *LineError) {
-	top, ok, lerr := decodeTopValue(line)
+	res, lerr := s.runDedicatedQuery(line, "query_windows")
 	if lerr != nil {
 		return nil, lerr
 	}
-	if ok != '{' {
-		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a query object"}
-	}
-	res, lerr := s.queryFromObject(top)
-	if lerr != nil {
-		return nil, lerr
-	}
-	qw, isWindows := res.(*QueryWindowsResult)
-	if !isWindows {
-		if _, isPoints := res.(*QueryPointsResult); isPoints {
-			return nil, &LineError{Status: "error", Error: `op "query_points" lists sample points; use QueryPointsLine`}
-		}
-		return nil, &LineError{Status: "error", Error: `op "query" computes range statistics; use QueryLine`}
-	}
-	return qw, nil
+	return res.(*QueryWindowsResult), nil
 }
 
 // QueryPointsLine 解析并执行一行 op 为 "query_points" 的区间采样明细查询对象。
-// 成功返回 QueryPointsResult；查询只读，不改变存储。
+// 成功返回 QueryPointsResult；查询只读，不改变存储。请求识别、字段/区间校验与
+// 操作匹配统一走 runDedicatedQuery，与另两个入口共用同一套规则。
 func (s *MetricStore) QueryPointsLine(line string) (*QueryPointsResult, *LineError) {
+	res, lerr := s.runDedicatedQuery(line, "query_points")
+	if lerr != nil {
+		return nil, lerr
+	}
+	return res.(*QueryPointsResult), nil
+}
+
+// runDedicatedQuery 是 QueryLine/QueryPointsLine/QueryWindowsLine 三个专用入口
+// 共用的请求识别与操作不匹配处理，同一条规则只在这里维护一次：
+//
+// 整行必须是唯一完整的 JSON 值且顶层为查询对象——写入数组等非对象值一律按
+// “需要查询对象”拒绝，绝不写入数组中的点；整行不是完整单个 JSON 值时仍先报
+// 整行解析失败。随后经 prepareValidatedQuery 做与统一入口完全一致的完整字段、
+// 缺项与区间校验：请求即使写了另一个已知操作，只要自身还有字段错误、缺项或
+// 倒置区间，仍先返回该请求本身已有的原因；只有请求全部合法后，才按
+// queryMismatchReason 报告入口不匹配——只返回错误，说明该操作提供什么结果、
+// 应改用哪个公开入口，不执行另一种查询、不返回另一类结果，也不把不匹配当作
+// 无命中的成功。op 与入口相符时才经 runQueryByOp 执行该操作并返回其原有结果。
+//
+// 任何失败都返回真正的 nil 结果与只含原因的 *LineError（不带 index、conflict，
+// 可直接与 nil 比较）；查询只读，成功或失败都不改变已存数据。
+func (s *MetricStore) runDedicatedQuery(line, wantOp string) (any, *LineError) {
 	top, ok, lerr := decodeTopValue(line)
 	if lerr != nil {
 		return nil, lerr
@@ -317,18 +314,29 @@ func (s *MetricStore) QueryPointsLine(line string) (*QueryPointsResult, *LineErr
 	if ok != '{' {
 		return nil, &LineError{Status: "error", Error: "invalid JSON: input must be a query object"}
 	}
-	res, lerr := s.queryFromObject(top)
+	q, lerr := prepareValidatedQuery(top)
 	if lerr != nil {
 		return nil, lerr
 	}
-	qp, isPoints := res.(*QueryPointsResult)
-	if !isPoints {
-		if _, isWindows := res.(*QueryWindowsResult); isWindows {
-			return nil, &LineError{Status: "error", Error: `op "query_windows" lists fixed-window averages; use QueryWindowsLine`}
-		}
-		return nil, &LineError{Status: "error", Error: `op "query" computes range statistics; use QueryLine`}
+	if q.op != wantOp {
+		return nil, &LineError{Status: "error", Error: queryMismatchReason(q.op)}
 	}
-	return qp, nil
+	return s.runQueryByOp(q), nil
+}
+
+// queryMismatchReason 返回“请求完整合法但操作与专用入口不匹配”时的统一引导
+// 原因：说明该操作提供什么结果、应改用哪个公开入口。每个已知操作只在此维护
+// 一条，三个专用入口共用，不再各自重复同一规则。调用前请求已通过全部校验，
+// op 必为三个受支持操作之一。
+func queryMismatchReason(op string) string {
+	switch op {
+	case "query_points":
+		return `op "query_points" lists sample points; use QueryPointsLine`
+	case "query_windows":
+		return `op "query_windows" lists fixed-window averages; use QueryWindowsLine`
+	default: // "query"
+		return `op "query" computes range statistics; use QueryLine`
+	}
 }
 
 // validateLineText 在 JSON 解析之前强制整行文本合法：原始字节必须是合法
@@ -784,30 +792,55 @@ type parsedQuery struct {
 	basicGiven map[string]bool
 }
 
-// queryFromObject 严格解析查询对象并执行对应的只读操作：op 为 "query" 时
-// 统计区间内点数与均值，为 "query_points" 时列出区间内采样明细，为
-// "query_windows" 时按固定宽度时间窗口分别统计点数与均值。
+// queryFromObject 严格解析查询对象并执行对应的只读操作（ProcessLine 的对象
+// 分支）：op 为 "query" 时统计区间内点数与均值，为 "query_points" 时列出区间内
+// 采样明细，为 "query_windows" 时按固定宽度时间窗口分别统计点数与均值。
+// 字段/缺项/区间校验与三个专用入口共用 prepareValidatedQuery，操作选择共用
+// runQueryByOp——请求识别、校验次序与分派规则只维护一次。
 // 成功返回非 nil 的 *QueryResult、*QueryPointsResult 或 *QueryWindowsResult；
 // 失败返回 nil 与 *LineError。
 func (s *MetricStore) queryFromObject(raw json.RawMessage) (any, *LineError) {
+	q, lerr := prepareValidatedQuery(raw)
+	if lerr != nil {
+		return nil, lerr
+	}
+	return s.runQueryByOp(q), nil
+}
+
+// prepareValidatedQuery 对一个已确认是顶层 JSON 对象的查询请求做统一校验，
+// ProcessLine 与三个专用入口共用，错误次序因此只有一份：parseQuery 按字段
+// 书写顺序暴露结构、未知字段、重复字段与字段类型问题，并在已出现字段全部合法
+// 后按 op、name、start、end 的顺序报缺项；以上全部通过后，query_windows 缺
+// step 先报缺 step，再检查 start 不大于 end 的区间规则。任何一条不满足都返回
+// 只含原因的 *LineError（不带 index、conflict）。操作不匹配不在此判定——调用
+// 方在拿到全部合法的请求后自行按入口处理。
+func prepareValidatedQuery(raw json.RawMessage) (parsedQuery, *LineError) {
 	q, err := parseQuery(raw)
 	if err != nil {
-		return nil, &LineError{Status: "error", Error: err.Error()}
+		return q, &LineError{Status: "error", Error: err.Error()}
 	}
 	if q.op == "query_windows" && !q.stepGiven {
-		return nil, &LineError{Status: "error", Error: `missing required field "step"`}
+		return q, &LineError{Status: "error", Error: `missing required field "step"`}
 	}
 	if q.start > q.end {
-		return nil, &LineError{Status: "error", Error: fmt.Sprintf(
+		return q, &LineError{Status: "error", Error: fmt.Sprintf(
 			`invalid range: "start" must not be greater than "end" (%d > %d)`, q.start, q.end)}
 	}
+	return q, nil
+}
+
+// runQueryByOp 按请求中的 op 选择并执行查询功能，ProcessLine 与三个专用入口
+// （操作相符时）共用。调用方保证请求已通过 prepareValidatedQuery 的全部校验，
+// 因此这里只做只读分派，返回该操作原有的具体结果类型；无命中时各操作照常返回
+// 空的 series 数组，不是失败。
+func (s *MetricStore) runQueryByOp(q parsedQuery) any {
 	switch q.op {
 	case "query_points":
-		return s.runQueryPoints(q), nil
+		return s.runQueryPoints(q)
 	case "query_windows":
-		return s.runQueryWindows(q), nil
+		return s.runQueryWindows(q)
 	default:
-		return s.runQuery(q), nil
+		return s.runQuery(q)
 	}
 }
 
@@ -819,7 +852,7 @@ func (s *MetricStore) queryFromObject(raw json.RawMessage) (any, *LineError) {
 //
 // 错误选择沿用既有次序：结构完整的对象按字段书写顺序暴露问题，已出现字段全部
 // 合法后才按 op、name、start、end 的顺序报告缺失的必填字段（step 是否必填要
-// 等 op 确定，其缺失由 queryFromObject 在四项必填齐全后判定）。step 是否合法
+// 等 op 确定，其缺失由 prepareValidatedQuery 在四项必填齐全后判定）。step 是否合法
 // 由操作本身决定，与 op 的书写位置无关：先用 decidedQueryOp 预扫对象，op 恰好
 // 出现一次且为受支持操作时即已确定——query 与 query_points 携带 step 一律是
 // 未知字段，无论 step 写在 op 前后、值是正整数、零、字符串还是对象，都在 step

@@ -779,18 +779,25 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 // gets its own backing array: a subslice of selected would leave spare
 // capacity pointing at the next batch's IDs, so a caller appending to one
 // batch's list would overwrite the following batch.
+//
+// The batch length is derived from the count that remains (the smaller of the
+// capacity and the remainder), never by adding the offset to the capacity:
+// the capacity is only an upper bound and may be a huge legal value such as
+// math.MaxInt, and i + capacity would then wrap into a negative slice length
+// after a small first batch.
 func chunkBatches(selected []string, batchSize, firstBatchSize int) []Batch {
 	batches := []Batch{}
 	for i := 0; i < len(selected); {
-		size := batchSize
+		capacity := batchSize
 		if len(batches) == 0 {
-			size = firstBatchSize
+			capacity = firstBatchSize
+		}
+		size := len(selected) - i
+		if capacity < size {
+			size = capacity
 		}
 		end := i + size
-		if end > len(selected) {
-			end = len(selected)
-		}
-		clusters := make([]string, end-i)
+		clusters := make([]string, size)
 		copy(clusters, selected[i:end])
 		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: clusters})
 		i = end

@@ -786,10 +786,14 @@ func chunkBatches(selected []string, batchSize, firstBatchSize int) []Batch {
 		if len(batches) == 0 {
 			size = firstBatchSize
 		}
-		end := i + size
-		if end > len(selected) {
-			end = len(selected)
+		// Clamp the capacity to the clusters actually left before adding it
+		// to the offset: a capacity at the native int ceiling (a legal way to
+		// say "no limit") would otherwise overflow i+size past the first
+		// batch and panic on the slice allocation below.
+		if size > len(selected)-i {
+			size = len(selected) - i
 		}
+		end := i + size
 		clusters := make([]string, end-i)
 		copy(clusters, selected[i:end])
 		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: clusters})

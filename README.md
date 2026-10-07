@@ -51,6 +51,112 @@ decide  (subject org mismatch)     : allowed=false reason="organization mismatch
 
 这两条边界（第 4、5 行）说明：组织级请求先过信封检查再谈策略，版本 0 的拒绝与"策略评估后拒绝"是两类情况。示例中的四次 `Decide` 都指定了非空决策组织，因此无论允许还是拒绝，都会在 `acme factory` 的审计链各留下一条决策记录（加上发布记录共 5 条）；而第 1 行的 `Access` 不产生任何审计记录。
 
+这个示例直接构造主体和资源，展示了组织一致性与停用检查，却没有交代**这些资料由谁确认**。接入时这是必须先回答的问题，见下一节[组织级请求的接入：请求资料的可信来源](#组织级请求的接入请求资料的可信来源)。
+
+## 组织级请求的接入：请求资料的可信来源
+
+### 决策引擎不核实身份，只评估传入内容
+
+`Store.Decide(org, req)` 的全部依据就是调用方传入的 `org` 与 `OrgRequest`，它是一个**按提交资料判断**的决策功能：
+
+- 它**不验证登录身份**：包内没有会话、凭据或登录流程，调用方传什么主体标识，它就评估什么主体标识。
+- 它**没有主体登记表或资源登记表**可供回查：`Subject.ID`、`Subject.Disabled`、`SubjectOrg`、`ResourceOrg`、`Resource.Scope` 都是请求包里的普通字段，引擎不会拿任何"底账"核对请求里的说法（策略中的资源限定也不要求资源预先登记）。
+- 因此，决策组织、主体组织、资源组织三个字符串相同，只表示**提交的这份包自洽**，并不能证明请求者确实属于该组织；同理，包里的 `Disabled=false` 也不证明账户仍然启用。一份字段齐全、三组织一致的伪造包与一份真实包，在引擎看来没有区别——下文的只读对照会直接演示这一点。
+
+### 谁来确认：接入方业务系统在调用之前确认
+
+组织一致性与停用检查的意义，取决于包内资料来自可信来源。正确分工是：**业务系统在自己的信任边界内先确认事实，再用确认后的快照构造 `OrgRequest`；请求者只提交"读取意图"**（想对哪个资源标识做什么动作）。
+
+| 请求字段 | 可信来源（接入方负责，引擎不查） | 请求者自报能否直接采信 |
+| --- | --- | --- |
+| 决策组织 `org` | 业务系统当前服务的租户上下文（路由/租户配置），不取请求载荷 | 否 |
+| 主体标识 `Subject.ID` | 已建立登录会话所确认的身份 | 否 |
+| 主体组织 `SubjectOrg` | 主体目录中该身份的当前所属组织 | 否 |
+| 停用状态 `Subject.Disabled` | 主体目录中该身份的当前停用状态 | 否 |
+| 资源组织 `ResourceOrg` | 已确认的资源归属（资源注册表/属主数据） | 否 |
+| 资源作用域 `Resource.Scope` | 该资源登记在案的作用域 | 否 |
+| 资源标识 `Resource.ID`、动作 `Action` | 请求者的读取意图；标识指向哪份资源仍要结合归属数据确认 | 可作为意图提交，不能当事实 |
+
+身份确认是本示例的**已有前提**：示例假设业务系统已经通过自己的登录流程确认了会话主体，随后才调用决策接口。它**不是本平台的现有功能**，平台也不为此依赖任何外部服务——示例中的"主体目录""资源注册表"都是普通 Go 值，代表真实部署里业务系统已经在运行的自有存储，全部在本机离线给出。
+
+资料冲突时的原则：**请求者自报的主体标识、组织或启用状态一律不能当作已核实事实。**安全的做法有两种且等价——直接在业务边界拒绝该请求；或仍按可信快照构造请求交给决策功能，此时信封检查会以 `organization mismatch` / `subject is disabled` 拒绝，策略完全不参与评估。无论采用哪种，都不能用自报值替换可信值去"凑出"一份自洽的包。
+
+### 完整示例：同一主体读取同一资源的三种资料来源
+
+[`examples/trusted_inputs/main.go`](examples/trusted_inputs/main.go) 可在本机离线运行，只依赖本项目公开 API 与 Go 标准库，不写文件、不联系任何服务：
+
+```bash
+go run ./examples/trusted_inputs
+```
+
+程序围绕一个已认证主体 `svc-audit-reader` 对一份账本 `ledger-2026`（作用域 `acme/factory/ledger`）的读取展开，先发布一条匹配的允许策略（版本 1），随后区分**请求者提交的读取意图**与**业务系统已确认的当前事实**（当前组织、主体身份、停用状态、资源归属与作用域），始终用可信快照构造组织级请求：
+
+1. **意图与可信资料一致、主体启用**：读取被允许，理由 `matched allow policy`、命中策略标识 `p-ledger-read-2026`、实际版本 1。
+2. **请求者声称自己仍然启用，但可信主体资料已停用**：主体目录返回停用状态，交给决策功能的是**停用资料**；自报的 `enabled=true` 只被记录为冲突、不予采用。信封检查先拒绝，理由 `subject is disabled`，版本 0，命中列表为空，策略不参与评估。
+3. **请求者把另一组织的资源声称为本组织资源**：资源注册表确认该标识实属 `globex`、作用域 `globex/factory/ledger`；按可信归属提交时资源组织为 `globex`，与决策组织不一致，信封拒绝，理由 `organization mismatch`，版本 0，命中列表为空，同样不评估策略。
+
+第 3 例附带一个**只读 `Review` 对照**（不调用 `Decide`、不产生审计记录）：若完全按请求者的说法构造包——三个组织都填 `acme factory`、主体启用、作用域填成 `acme/factory/ledger`——包是自洽的，引擎没有任何登记表能识破它，于是按版本 1 **允许**。这正说明结论取决于**输入资料的来源**：策略引擎不会识别任意伪造资料。
+
+预期输出（确定性，重复运行逐字节一致；每行 `request submitted` 都可与上面两行的意图/事实对照，看出每个字段最终取自哪里）：
+
+```text
+integration scenario: one authenticated subject requests one ledger read
+trusted boundary (established by the integrating business system, not by the engine):
+  served decision organization : "acme factory" (tenant context, not requester supplied)
+  authenticated identity       : "svc-audit-reader" (login session confirmed upstream)
+  directory of record          : current subject organization and disabled state
+  resource registry            : current owner organization and scope
+  Store.Decide checks none of these itself: it judges the OrgRequest it receives.
+
+published allow policy p-ledger-read-2026 as version 1
+  (subject="svc-audit-reader" action="read" scope="acme/factory/ledger" effect=allow)
+
+case 1: requester intent agrees with confirmed facts, subject enabled
+  requester intent : subject="svc-audit-reader" subject-org="acme factory" enabled=true resource="ledger-2026" resource-org="acme factory" action="read"
+  confirmed facts  : subject="svc-audit-reader" subject-org="acme factory" disabled=false resource="ledger-2026" owner-org="acme factory" scope="acme/factory/ledger"
+  request submitted: decision-org="acme factory" subject-org="acme factory" resource-org="acme factory" subject="svc-audit-reader" kind="service" disabled=false resource="ledger-2026" scope="acme/factory/ledger" action="read"
+  decide: allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+
+case 2: requester claims enabled=true; trusted directory says disabled
+  requester intent : subject="svc-audit-reader" subject-org="acme factory" enabled=true resource="ledger-2026" resource-org="acme factory" action="read"
+  confirmed facts  : subject="svc-audit-reader" subject-org="acme factory" disabled=true resource="ledger-2026" owner-org="acme factory" scope="acme/factory/ledger"
+  conflict: requester claimed enabled=true; directory says disabled=true; submitting the confirmed state
+  request submitted: decision-org="acme factory" subject-org="acme factory" resource-org="acme factory" subject="svc-audit-reader" kind="service" disabled=true resource="ledger-2026" scope="acme/factory/ledger" action="read"
+  decide: allowed=false reason="subject is disabled" matched=[] version=0
+
+case 3: requester claims another organization's ledger belongs to this organization
+  requester intent : subject="svc-audit-reader" subject-org="acme factory" enabled=true resource="ledger-2026" resource-org="acme factory" action="read"
+  confirmed facts  : subject="svc-audit-reader" subject-org="acme factory" disabled=false resource="ledger-2026" owner-org="globex" scope="globex/factory/ledger"
+  conflict: claimed resource owner "acme factory" != registry owner "globex"; submitting the confirmed ownership
+  request submitted: decision-org="acme factory" subject-org="acme factory" resource-org="globex" subject="svc-audit-reader" kind="service" disabled=false resource="ledger-2026" scope="globex/factory/ledger" action="read"
+  decide: allowed=false reason="organization mismatch" matched=[] version=0
+  contrast (read-only Review of the packet claims alone would build; never sent to Decide):
+  review: allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+  the engine sees three identical organization strings and an enabled subject; it has no
+  registry telling it the ledger actually belongs to globex, so it allows the packet.
+
+audit chain of "acme factory" saved by the three Decide calls (4 records):
+  seq=1 policy_change version=1
+  seq=2 decision subject="svc-audit-reader" subject-org="acme factory" disabled=false resource="ledger-2026" resource-org="acme factory" scope="acme/factory/ledger" -> allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+  seq=3 decision subject="svc-audit-reader" subject-org="acme factory" disabled=true resource="ledger-2026" resource-org="acme factory" scope="acme/factory/ledger" -> allowed=false reason="subject is disabled" matched=[] version=0
+  seq=4 decision subject="svc-audit-reader" subject-org="acme factory" disabled=false resource="ledger-2026" resource-org="globex" scope="globex/factory/ledger" -> allowed=false reason="organization mismatch" matched=[] version=0
+  VerifyAudit(faithful export, checkpoint end=4): ok
+  VerifyAudit(after rewriting seq 3 saved request disabled=true -> false): darksafe: invalid audit range: record 3 fingerprint mismatch
+  verification proves the saved request and decision were not altered afterwards;
+  it cannot prove the requester really was the subject named, or really enabled —
+  authenticity comes only from the trusted sources the request was built from.
+```
+
+对照三例可见：第 1 例的允许来自可信资料与版本 1 策略的共同作用；第 2、3 例的拒绝都发生在策略评估之前（版本 0、空命中列表），同一个已发布策略版本下，仅因输入来源不同结论就不同。
+
+### 审计能证明什么、不能证明什么
+
+三次 `Decide` 都指定了非空决策组织，连同发布共在 `acme factory` 审计链留下 4 条记录（输出末尾逐条列出）。决策记录保存的是**实际提交的请求及决策**——包括第 2 例提交的停用状态与第 3 例提交的 `globex` 资源归属。示例随后导出完整链并做两次校验：对原始导出，`VerifyAudit` 通过；把序号 3 保存请求里的 `disabled=true` 改写成 `false` 后再校验，立即报 `record 3 fingerprint mismatch`，不交付任何"通过"结论。
+
+因此审计链校验证明的是**保存下来的请求与决策事后未被篡改、顺序与组织归属无误**；它**不能**替这些资料证明身份真实性——链无法知道序号 2 的主体标识是否真的来自一个已认证会话，也无法知道序号 3 的资源归属是否属实。身份与归属的真实性只能来自构造请求时使用的可信来源（见上表）。
+
+本节交付的是可使用的说明与示例：`Access`、`Store.Decide`/`Publish`/`Rollback`/`Review`、审计与离线复核等现有入口、授权规则及已有示例全部保持原样，决策接口没有也不需要为此增加身份认证。
+
 ## 按组织的策略发布、回滚与复核
 
 `darksafe.NewStore()` 提供组织级策略管理（纯内存，随服务实例结束而销毁）：

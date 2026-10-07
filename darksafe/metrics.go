@@ -1011,13 +1011,6 @@ func (a *pointStats) add(v float64) {
 	a.sum.Add(a.sum, a.tmp.SetFloat64(v))
 }
 
-// reset 清空累计，供下一个互不影响的统计范围（如后一个窗口）复用同一累计器：
-// 前一个范围的点数与数值一律不带入后一个范围。
-func (a *pointStats) reset() {
-	a.count = 0
-	a.sum = new(big.Rat)
-}
-
 // average 返回精确算术平均舍入到最近可表示 float64 的结果（正中取偶；
 // 精确为零时返回 +0）。调用方保证至少 add 过一次。不改动累计状态。
 func (a *pointStats) average() float64 {
@@ -1098,14 +1091,16 @@ func seriesPointsInRange(sr *storedSeries, start, end int64) []Point {
 // 即使区间横跨整个 int64 也不预先物化窗口表。
 //
 // 名称精确、标签子集的序列筛选与 organizeSeries 整理、序列排列次序和另两种
-// 查询完全一致。每条序列独立统计：先取区间内按时间戳升序的采样点，升序点流
-// 中落在同一窗口的点必然连续，据此一次遍历分窗，逐窗口用 pointStats 累计
-// 点数与均值——与区间统计共用同一套计数、精确求和与舍入规则；窗口切换时
-// reset，前一窗口的点数与数值不带入后一窗口。只输出实际有点的窗口，按窗口
-// 起点升序，空窗口不补零，整个区间没有点的序列不列出，无任何命中时 series
-// 为空数组。每个点只归入 floor((ts-start)/step) 唯一窗口；start==end 时所有
-// 点归入唯一窗口。平均值依据实际存储的 float64 值计算，正负大数抵消或总和
-// 超出 float64 范围时仍得有限结果。查询只读，不改变存储。
+// 查询完全一致。窗口统计不经过采样明细的展示过程：不为统计构造或排序完整的
+// 区间点列表，而是对每条序列单次遍历点表，按 floor((ts-start)/step) 把每个
+// 区间内点直接计入所属窗口的 pointStats（与区间统计共用同一套计数、精确求和
+// 与舍入规则）。临时数据围绕实际有点的窗口组织：每个非空窗口一个独立累计器，
+// 大量点落入少数几个窗口时也只保留这几个窗口的累计状态；随后只对非空窗口的
+// 下标排序（下标升序即窗口起点升序），逐窗口构造结果。每个点只归入唯一窗口，
+// 窗口之间不共享计数；start==end 时所有点归入唯一窗口。只输出实际有点的窗口，
+// 空窗口不补零，整个区间没有点的序列不列出，无任何命中时 series 为空数组。
+// 平均值依据实际存储的 float64 值计算，正负大数抵消或总和超出 float64 范围
+// 时仍得有限结果。查询只读，不改变存储。
 func (s *MetricStore) runQueryWindows(q parsedQuery) *QueryWindowsResult {
 	organized := organizeSeries(s.matchSeries(q))
 
@@ -1115,27 +1110,10 @@ func (s *MetricStore) runQueryWindows(q parsedQuery) *QueryWindowsResult {
 
 	out := make([]QueryWindowsSeries, 0, len(organized))
 	for _, entry := range organized {
-		points := seriesPointsInRange(entry.sr, q.start, q.end)
-		if len(points) == 0 {
+		windows := windowStats(entry.sr, q.start, q.end, q.step, diff)
+		if len(windows) == 0 {
 			continue
 		}
-		windows := make([]Window, 0)
-		var curIdx uint64
-		stats := newPointStats()
-		flush := func() {
-			windows = append(windows, buildWindow(q.start, q.end, q.step, diff, curIdx, stats))
-		}
-		for i, p := range points {
-			// 无符号偏移除以 step 得窗口下标；升序点流下标单调不减。
-			idx := (uint64(p.Timestamp) - uint64(q.start)) / uint64(q.step)
-			if i > 0 && idx != curIdx {
-				flush()
-				stats.reset()
-			}
-			curIdx = idx
-			stats.add(p.Value)
-		}
-		flush()
 		out = append(out, QueryWindowsSeries{
 			Name:    entry.ref.Name,
 			Labels:  entry.ref.Labels,
@@ -1143,6 +1121,42 @@ func (s *MetricStore) runQueryWindows(q parsedQuery) *QueryWindowsResult {
 		})
 	}
 	return &QueryWindowsResult{Status: "ok", Op: "query_windows", Series: out}
+}
+
+// windowStats 返回一条已存序列在 [start,end] 闭区间内的非空窗口统计，按窗口
+// 起点升序。单次遍历点表：区间外的点跳过，区间内的点按无符号偏移除以 step
+// 得到唯一窗口下标，直接累计进该窗口自己的 pointStats——不构造、不排序中间
+// 采样点列表，每个点只计入所属窗口一次，与点的存储与写入次序无关。随后只对
+// 实际有点的窗口下标排序并逐个构造窗口；没有任何区间内点时返回 nil。
+func windowStats(sr *storedSeries, start, end, step int64, diff uint64) []Window {
+	byWindow := make(map[uint64]*pointStats)
+	for ts, v := range sr.points {
+		if ts < start || ts > end {
+			continue
+		}
+		idx := (uint64(ts) - uint64(start)) / uint64(step)
+		stats := byWindow[idx]
+		if stats == nil {
+			stats = newPointStats()
+			byWindow[idx] = stats
+		}
+		stats.add(v)
+	}
+	if len(byWindow) == 0 {
+		return nil
+	}
+	// 只排序非空窗口的下标（数量以实际有点的窗口为界，与点数无关）；
+	// 窗口起点 start+idx*step 随 idx 单调递增，下标升序即起点升序。
+	idxs := make([]uint64, 0, len(byWindow))
+	for idx := range byWindow {
+		idxs = append(idxs, idx)
+	}
+	sort.Slice(idxs, func(i, j int) bool { return idxs[i] < idxs[j] })
+	windows := make([]Window, 0, len(idxs))
+	for _, idx := range idxs {
+		windows = append(windows, buildWindow(start, end, step, diff, idx, byWindow[idx]))
+	}
+	return windows
 }
 
 // buildWindow 构造一个非空窗口的统计：窗口起点是 start + idx*step，终点是
@@ -1333,8 +1347,8 @@ func seriesLess(a, b organizedSeries) bool {
 // 的反复比较直接复用同一份结果，不会因一条序列参与多次比较而反复整理同一
 // 套标签。整理结果不复制采样点；写入快照的采样点选取与升序排列由
 // allSeriesPoints 完成，均值查询只在点表上计数与求和，采样明细查询由
-// seriesPointsInRange 按区间选取并升序排列，固定窗口查询在区间升序点流上
-// 按窗口累计计数与精确求和。
+// seriesPointsInRange 按区间选取并升序排列，固定窗口查询在点表上按窗口
+// 下标直接累计计数与精确求和（见 windowStats）。
 func organizeSeries(selected []*storedSeries) []organizedSeries {
 	out := make([]organizedSeries, 0, len(selected))
 	for _, sr := range selected {
@@ -1364,7 +1378,8 @@ func allSeriesPoints(sr *storedSeries) []Point {
 // 列表、不重配对值；int64 比较保留整数精度，float64 原样取出，负零保持负零）。
 // 返回的是新建切片与新建 Point，不持有点表的任何引用：调用方对结果的修改不
 // 影响存储，也不影响此前或此后取得的其他成功结果；取得结果后再写入新点，该份
-// 结果也不跟随存储变化。均值查询不构造这样的明细列表，只在点表上计数与求和。
+// 结果也不跟随存储变化。均值查询与固定窗口查询都不构造这样的明细列表，只在
+// 点表上计数与求和。
 func seriesPoints(sr *storedSeries, keep func(ts int64) bool) []Point {
 	tsList := make([]int64, 0, len(sr.points))
 	for ts := range sr.points {

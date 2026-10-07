@@ -199,6 +199,101 @@ step 5: submit legal content against a stale expected version
 
 对照审计序号看这次过程（五步结束后共 5 条记录）：序号 1 是版本 1 的策略变更；序号 2 是第 1 步的允许决策；序号 3 是第 3 步观察决策——它与序号 2 的结论完全相同（同为版本 1 下的允许），但它是失败发布**之后**一次独立 `Decide` 留下的新记录；序号 4 是版本 2 的策略变更，记录里是完整新策略集；序号 5 是版本 2 下的拒绝决策。第 2 步的失败发布在 2 与 3 之间没有留下任何序号，第 5 步的过期提交在 5 之后也没有——两次失败后 `head-seq` 与指纹都保持不变，正是"失败提交不改变已有授权、也不改变审计链"的直接证据。
 
+### 完整示例：回滚到曾经发布过的空策略版本
+
+本节把上面分开描述的两件事连起来：**回滚总是产生一个复制历史内容的新版本**，而**已发布的空策略集默认拒绝**。因此，一个曾经发布过的空集合本身就是合法的回滚目标——回滚到它等于"恢复当时的内容"，也就是撤销当前授权；被复制的是该历史版本的完整内容，历史版本一个都不会被删除或改写。完整程序是 [`examples/rollback_empty_set/main.go`](examples/rollback_empty_set/main.go)，只依赖本项目公开 API 与 Go 标准库，自行建立内存存储与请求，本机离线即可复现：
+
+```bash
+go run ./examples/rollback_empty_set
+```
+
+场景固定为**同一组织、一个启用主体对同一资源的读取**：组织 `acme factory`，主体 `svc-billing`（启用、不带任何角色），资源 `billing-2026`，作用域 `acme/factory/billing`。决策组织、主体组织、资源组织三者一致，请求字段完整、作用域合法，结论完全由该组织当前已发布策略按默认拒绝规则决定。程序连续展示：
+
+1. **发布空策略集，成为版本 1**。它是真实存在的已发布版本，只不过内容是零条策略的空集合；`Policies(org, 1)` 返回 0 条策略。
+2. **发布允许该读取的策略集，成为版本 2**；同一读取被允许，理由 `matched allow policy`、命中 `p-billing-read-allow`、实际版本 2。
+3. **用现有回滚功能恢复空集合**：`Rollback(org, expectedVersion=2, targetVersion=1)`——以**当前版本 2 作为预期版本**、以**版本 1 作为目标**。返回的是**新版本 3**（绝不会返回目标版本号 1），`CurrentVersion` 变为 3，查询版本 3 得到从版本 1 复制来的空策略集。
+4. **再次提交完全相同的读取**：拒绝，理由 `no matching allow policy`、命中列表为空 `[]`、实际策略版本 3。请求与第 2 步逐字段相同，差别只来自当前策略集——空集合里没有任何允许策略可命中。
+
+**审计记录**要和策略版本分开看。回滚结束并完成第 4 步读取后，该组织链上共 5 条记录：序号 1 是空集的版本 1 发布；序号 2 是允许集的版本 2 发布；序号 3 是版本 2 下的允许决策；**序号 4 才是这次回滚的策略变更记录**——新版本为 3、`source=1`（来源版本 1）、`rolled-back=true`（标明是回滚而非普通发布）、保存的完整策略集为空；**序号 5 是第 4 步读取产生的拒绝决策，是另一条独立记录**。不能把审计序号当成策略版本：序号 4 的记录讲的是版本 3，序号 5 的记录里实际版本也是 3。
+
+回滚不改写历史：版本 1 仍能查到空集合、版本 2 仍能查到那条允许策略，`Review(org, 1, req)` 在版本 1 下拒绝、`Review(org, 2, req)` 在版本 2 下允许，结论与回滚前完全一致。
+
+随后演示**两个直接影响该操作的失败用法**，失败原因必须区分：
+
+- **目标填版本 0**（`Rollback(expected=3, target=0)`）：返回 `ErrVersionNotFound`。版本 0 从来不是已发布的历史版本——空集合是版本 1，不是版本 0。
+- **目标版本 1 存在、但预期当前版本过期**（当前已是 3，仍以 `expected=2` 回滚到 1）：返回 `ErrVersionConflict`。空目标不豁免预期版本检查。
+
+两种失败都返回版本 0、不推进版本号、不改变当前策略（当前仍是 3、版本 3 仍是空集），也不新增任何回滚记录：失败前后审计链的 `head-seq` 与指纹逐字节相同。
+
+最后区分**已发布的空集合与"从未发布"的版本 0**：在 `acme factory` 里即使已经有版本 1–3，`Policies(org, 0)` 仍返回 `ErrVersionNotFound`；另取一个从未发布过策略的组织 `acme greenfield`，其 `CurrentVersion` 为 0，对合法请求 `Decide` 的拒绝理由是 `organization has no published version`、实际版本 0，`Review(org, 0, req)` 也只能得到 `version 0 not found`。空集合（版本 1/3）下的拒绝理由是 `no matching allow policy` 且带具体已发布版本号——"存在一个含零条策略的已发布版本"与"不存在任何已发布版本"是两种状态。
+
+预期输出（确定性，重复运行逐字节一致；指纹由记录内容决定，两次失败前后可直接对照）：
+
+```text
+step 1: publish an empty policy set as version 1
+  Publish(0 policies, expected=0) -> new version 1
+  Policies(org, 1) -> 0 policies []
+  version 1 is a real published version whose content is the empty set
+
+step 2: publish the allow-read policy set as version 2
+    policy id="p-billing-read-allow" subject="svc-billing" action="read" scope="acme/factory/billing" effect="allow" recursive=false resource-id=""
+  Publish(1 policy, expected=1) -> new version 2
+  Decide  -> allowed=true reason="matched allow policy" matched=["p-billing-read-allow"] applied-version=2
+
+step 3: roll back: current version 2, target historical version 1
+  Rollback(expected=2, target=1) -> new version 3
+  CurrentVersion -> 3
+  Policies(org, 3) -> 0 policies []
+  the rollback restored version 1's content (the empty set) as a NEW version
+
+step 4: submit the same read again after the rollback
+  Decide  -> allowed=false reason="no matching allow policy" matched=[] applied-version=3
+
+audit chain after the rollback (audit sequence is NOT a policy version):
+  seq=1 policy_change  version=1 source=0 rolled-back=false policies=[]
+  seq=2 policy_change  version=2 source=0 rolled-back=false policies=["p-billing-read-allow"]
+  seq=3 decision       allowed=true  reason="matched allow policy" matched=["p-billing-read-allow"] applied-version=2
+  seq=4 policy_change  version=3 source=1 rolled-back=true  policies=[]
+  seq=5 decision       allowed=false reason="no matching allow policy" matched=[] applied-version=3
+  [audit] after rollback + denial            records=5 head-seq=5 head-fingerprint=ec39799f49c36e29978a9aee3dea09c1473db92203011932004dd786abd2dbbb
+  seq 4 is the rollback record (new version 3, copied from version 1);
+  seq 5 is the separate denial decision produced by the step-4 read
+
+history was not deleted or rewritten by the rollback:
+  Policies(org, 1) -> 0 policies []
+  Policies(org, 2) -> 1 policies ["p-billing-read-allow"]
+  Review(org, 1) -> allowed=false reason="no matching allow policy" matched=[] version=1
+  Review(org, 2) -> allowed=true reason="matched allow policy" matched=["p-billing-read-allow"] version=2
+
+step 5: failure A - target version 0 was never published
+  Rollback(expected=3, target=0) -> returned version=0 err=darksafe: version not found: organization "acme factory" has no version 0
+  ErrVersionNotFound: 0 is not a published historical version (the empty set is version 1, not 0)
+
+step 6: failure B - target version 1 exists, but the expected current version is stale
+  Rollback(expected=2, target=1) -> returned version=0 err=darksafe: version conflict: expected 2, current is 3
+  ErrVersionConflict: the current version is already 3; re-read it before retrying
+
+both failures leave everything in place:
+  CurrentVersion -> 3
+  Policies(org, 3) -> 0 policies []
+  [audit] immediately after both failures    records=5 head-seq=5 head-fingerprint=ec39799f49c36e29978a9aee3dea09c1473db92203011932004dd786abd2dbbb
+  [audit] checkpoint unchanged: head-seq=5 fingerprint=ec39799f49c36e29978a9aee3dea09c1473db92203011932004dd786abd2dbbb
+
+contrast: the empty published version 1 vs never-published version 0
+  Policies("acme factory", 0) -> err=darksafe: version not found: organization "acme factory" has no version 0
+    (versions 1-3 are published, but no version 0 ever existed)
+  separate never-published organization "acme greenfield":
+    CurrentVersion -> 0
+  Decide  -> allowed=false reason="organization has no published version" matched=[] applied-version=0
+  Review(org, 0) -> allowed=false reason="version 0 not found" matched=[] version=0
+    the denial reason differs from the empty-set case:
+      never published : "organization has no published version" at version 0 (no published set exists)
+      empty set v1/v3 : "no matching allow policy" at the published version (a set with zero policies exists)
+    that denial is seq 1 of "acme greenfield"'s own chain, not a record of "acme factory"
+```
+
+输出里三个数字各有含义：`Rollback(...) -> new version 3` 是回滚成功产生的**新版本号**（失败时为 0）；决策行的 `applied-version` 是这次读取**实际评估的策略版本**（回滚前是 2，回滚后是 3）；`seq=` 是**审计链记录序号**，每个成功发布/回滚和每次决策各占一个连续序号，与策略版本号没有数值对应关系（如版本 3 的回滚记录是序号 4）。
+
 ### 跨作用域示例：上级递归拒绝为什么压过下级精确允许
 
 `Decide` 的冲突规则不是"更具体者胜"，而是**拒绝优先（deny-overrides）**：先按主体、动作、作用域（含 `Recursive` 子作用域）与可选资源限定找出**全部**命中策略；只要其中有一条拒绝，结果就是拒绝（理由 `matched deny policy`），作用域更精确的允许不会把它"覆盖"掉。命中列表保留**所有**命中策略的标识并按标识升序排列——包括被压过的那条允许，它是冲突可复核的证据，而不是被最终决定抹掉。完整跨层级示例是 [`examples/scope_deny_override/main.go`](examples/scope_deny_override/main.go)，只依赖本项目公开 API 与 Go 标准库，自行创建内存存储并真实发布策略：

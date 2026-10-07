@@ -195,11 +195,67 @@ case 3: recursive deny on org/a cannot reach the sibling scope org/ab
 - `AuditQuery(org, startSeq, pageSize, kind, subject, resourceID...)`：按序号升序分页，可按类别、决策主体筛选（指定主体时只返回其决策记录），并可在末尾可选地传入**一个**资源标识条件（按决策记录中请求的资源标识筛选，见下节）；不传或传空字符串表示不设资源筛选，与旧调用完全一致。首次查询固定“截至序号 + 指纹”检查点，后续用 `AuditPage(checkpoint, nextSeq, ..., resourceID...)` 翻页（后续页须传入相同条件）；查询期间新增的记录不会混入。无记录组织返回空页与序号 0 的根指纹。页大小非正、起始序号非法、范围倒置、截至序号超出当前记录或指纹不符均返回明确错误；传入两个及以上资源条件返回 `ErrInvalidPage`。
 - `AuditExport(org, endSeq)`：导出截至序号内的完整记录（空组织导出空集与根检查点），返回的副本与内部状态完全脱离。
 - `VerifyAudit(org, records, checkpoint)`：纯函数，不依赖 Store，可离线校验。修改字段、删除中间或尾部记录、交换顺序、拼入其他组织记录都会验证失败。
-- `RecheckDecision(org, seq)`：按决策记录里保存的请求与其实际使用的策略版本恢复结论，后续发布/回滚不影响结果；非决策记录返回 `ErrAuditNotADecision`，序号不存在返回 `ErrAuditNotFound`。
+- `RecheckDecision(org, seq)`：按决策记录里保存的请求与其实际使用的策略版本恢复结论，后续发布/回滚不影响结果；非决策记录返回 `ErrAuditNotADecision`，序号不存在返回 `ErrAuditNotFound`。完整在线用法见下文"完整示例：在线按审计记录复核已有决策"。
 - `RecheckDecisionOffline(org, records, checkpoint, seq)`：纯函数，不创建或恢复 Store，服务实例结束后仅凭完整导出、单独保存的检查点和目标序号离线复核一条决策。整份输入先通过 `VerifyAudit` 链校验（目标之后的记录损坏、按主体筛选的记录、缺少开头的片段均失败），再以目标之前同组织策略变更记录携带的完整内容重放该请求实际使用的版本；版本缺失或只在目标之后出现返回 `ErrVersionNotFound`，绝不改用较新版本。返回原决策、重算决策及是否一致（允许与否、理由、命中策略、实际版本全字段比较，nil 与空命中列表视为一致）；链合法但两决策不同时明确标为不一致。该入口只读，不修改输入材料也不追加审计记录。
 - 审计材料无损归档：`EncodeAuditArchive(org, records, checkpoint)` 把一次完整导出（截至某历史序号的前缀亦可，只要与检查点对应；无记录组织用序号 0 的根检查点）序列化为可保存到文件的字节；`DecodeAuditArchive(archive, org, checkpoint)` 在原服务实例结束后重新读取，返回可直接交给 `RecheckDecisionOffline` 的记录。格式为手写的长度前缀二进制编码（魔数 + 载荷长度 + 载荷 + SHA-256），所有字符串按原始字节还原——组织名、策略/资源标识、角色、命中列表与理由中的中文、控制字符、空格及非 UTF-8 字节均不替换不规整，单字节 0xFF、0xFE 与真正的 U+FFFD 仍可区分；nil 与非 nil 空列表、不存在的记录载荷均保留原有形态，因此重新读取不会改变指纹。编码与读取都先做整份材料校验：缺组织返回 `ErrMissingOrganization`，记录缺失、乱序、混入其他组织、内容改动、检查点不符返回 `ErrInvalidRange`；无法识别、截断、尾部拼接另一份材料或校验和失败返回 `ErrInvalidArchive`，失败不交付任何记录或字节。即使只复核较早决策，后续记录损坏也整份失败。归档内携带的检查点仅供参考，校验一律以调用方另行保留的检查点为准；读取成功只表示材料与检查点一致，原决策与重算决策的差异仍由离线复核报告。两个入口均只读、结果与输入相互脱离，不改变服务状态、不追加审计记录，仅用 Go 标准库且可离线使用。
 - 单次校验的读取加复核组合：从归档出发一次性复核时使用 `DecodeVerifiedAuditArchive(archive, org, checkpoint)` 与 `RecheckVerifiedDecisionOffline(material, seq)`。前者在读取阶段对整份归档完成唯一一次完整链校验并返回已校验材料，后者直接按该材料复核目标决策、不再重复走链，因此一次命令调用只校验一次完整审计链。组合的失败原因、错误类型、报告字段、只读与脱离保证与两个独立入口完全一致；但 `VerifiedAuditMaterial` 只能由包内的校验入口产生，外部程序无法凭空构造，且不跨调用缓存——修改过材料或换过检查点后必须重新经 `DecodeVerifiedAuditArchive` 校验。单独使用 `DecodeAuditArchive` 或 `RecheckDecisionOffline` 的其他程序无需改动，二者仍各自独立完成完整校验，不要求先调用另一个入口。
 - 新的查询、导出与复核入口缺少组织时一律返回 `ErrMissingOrganization` 且不改变状态。
+
+## 完整示例：在线按审计记录复核已有决策
+
+服务仍在运行时，复核一条已有访问决策不需要重新提交访问，也不需要导出材料：`RecheckDecision(org, seq)` 直接读取该组织审计链中序号为 `seq` 的决策记录，用**记录里保存的请求**和**该决策当时实际使用的策略版本**重新判定。它与 `Review` 是两类入口：`RecheckDecision` 的请求与版本都来自记录本身，调用者只给序号；`Review(org, version, req)` 则由调用者提供请求和一个**已存在的历史版本**。完整程序是 [`examples/recheck_decision/main.go`](examples/recheck_decision/main.go)，只依赖本项目公开 API 与 Go 标准库，自行建立内存 Store，在本机离线即可运行：
+
+```bash
+go run ./examples/recheck_decision
+```
+
+场景固定为**同一组织、同一启用主体读取同一资源**：组织 `acme factory`，主体 `svc-audit-reader`（启用），账本 `ledger-2026`，作用域 `acme/factory/ledger`，动作 `read`。决策组织、主体组织、资源组织三者一致，请求完整、作用域合法，因此每条记录的结论完全由当时的策略状态决定。程序连续七步：
+
+1. **组织尚未发布策略时读取一次**：信封合法但没有已发布版本，默认拒绝，理由 `organization has no published version`，版本 0。这次 `Decide` 留下链上第一条记录（决策记录，序号 1）。
+2. **发布允许读取的策略（版本 1）后再次读取**：命中 `p-ledger-read-2026`，允许。发布记录占序号 2，允许决策记录占序号 3。
+3. **把当前策略整套替换为拒绝读取（版本 2）**：此后同一请求按当前策略被拒绝（用只读的 `Review(org, 2, req)` 观察，不追加记录）。发布记录占序号 4。
+4. **按序号复核先前的两条决策记录**：序号 1 的未发布记录复核后**仍是拒绝**，理由仍是 `organization has no published version`，版本仍是 0；序号 3 的允许记录复核后**仍是允许**，理由 `matched allow policy`、命中 `p-ledger-read-2026`、版本 1——全部来自当时，当前的拒绝策略（版本 2）完全不参与。输出中每条记录并排给出原决策与复核结果，两份决策都包含允许与否、理由、命中列表和实际版本。
+5. **为什么版本 0 的记录仍能复核**：版本 0 不是"没有可复核的版本"，而是记录表明**当时没有使用任何已发布策略**。按记录复核时，请求信封合法即重放"组织尚未发布版本"的拒绝本身，正常返回。而 `Review` 要求调用者指定一个已存在的历史版本，版本 0 从来不是已发布版本，因此 `Review(org, 0, req)` 对合法请求返回理由为 `version 0 not found` 的拒绝——两个入口对版本 0 的不同反应正来自"版本来自记录"与"版本由调用者指定"的区别。
+6. **两类选取记录失败不是访问拒绝**：序号指向策略变更记录（本例序号 2）返回 `ErrAuditNotADecision`，序号超出链尾（本例序号 5）返回 `ErrAuditNotFound`。二者表示**没有找到可复核的决策记录**，不能解释成一次普通的允许/拒绝结论。注意发布记录同样占用审计序号（版本 1 在序号 2、版本 2 在序号 4），序号与策略版本号没有数值对应关系，**不能拿策略版本号定位访问记录**。
+7. **复核是只读的**：全部复核结束后当前版本仍是 2，审计链仍是 4 条记录——复核成功或失败都不改变当前策略、不追加审计记录。
+
+预期输出（确定性，重复运行逐字节一致）：
+
+```text
+step 1: no policy published yet; the read is denied and recorded
+  Decide  -> allowed=false reason="organization has no published version" matched=[] version=0
+  [audit] the denial is decision record seq=1 (version 0: no published policy was used)
+step 2: publish the allow-read policy, then read again
+  Publish -> new version 1 (policy change record, seq=2)
+  Decide  -> allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+  [audit] the allow is decision record seq=3 (version 1)
+step 3: replace the current set with a deny-read policy
+  Publish -> new version 2 (policy change record, seq=4)
+  Review(org, 2, same request) -> allowed=false reason="matched deny policy" matched=["p-ledger-read-deny"] version=2
+  the current policy now denies this read
+step 4: recheck the two earlier decision records by their audit sequences
+  seq=1 original : allowed=false reason="organization has no published version" matched=[] version=0
+  seq=1 rechecked: allowed=false reason="organization has no published version" matched=[] version=0
+  seq=3 original : allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+  seq=3 rechecked: allowed=true reason="matched allow policy" matched=["p-ledger-read-2026"] version=1
+  each recheck used the recorded request and the version that decision
+  actually used — the version-0 denial and the version-1 allow both
+  replay unchanged; the current deny policy was never consulted
+step 5: version 0 is a recorded state, not a reviewable version
+  Review(org, 0, same request) -> allowed=false reason="version 0 not found" matched=[] version=0
+  Review needs a caller-supplied request and an existing version;
+  rechecking seq=1 needs neither — its recorded version 0 denial replays normally
+step 6: sequence selection failures are not access denials
+  RecheckDecision(org, 2) -> err=darksafe: audit record is not a decision: sequence 2 is policy_change (ErrAuditNotADecision)
+  RecheckDecision(org, 5) -> err=darksafe: audit record not found: organization "acme factory" has no audit sequence 5 (ErrAuditNotFound)
+  both are record-selection failures, not ordinary access denials;
+  publish records occupy sequences too (version 1 at seq=2, version 2 at seq=4),
+  so a policy version number cannot locate an access record
+step 7: rechecking is read-only
+  current version still 2, audit chain still 4 records — no recheck changed policy or appended a record
+```
+
+服务实例结束后需要复核时，改用离线路径（`darksafe review` 命令或 `RecheckDecisionOffline`，见下文）；两者共享同一套重放判定，对同一条记录的结论一致。
 
 ## 完整示例：把某个主体的决策逐页取完
 

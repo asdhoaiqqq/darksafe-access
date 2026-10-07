@@ -567,6 +567,16 @@ func (s *Store) AuditQuery(org string, startSeq, pageSize int, kind, subjectID s
 // cursor from the previous page; when it is 0 the range is exhausted. The
 // checkpoint is re-verified against the chain on every call.
 //
+// A root checkpoint (EndSeq 0 with the organization's genesis fingerprint)
+// pins the empty range the organization had when it was issued by a first
+// AuditQuery or AuditExport. That range is finished independently of what
+// the store currently holds for the organization: never seen, only queried
+// empty, or since appended to — the answer is identical. Both terminal
+// cursors, 0 and the one-past-end cursor 1, return the empty end page with
+// BeginSeq 1, EndSeq 0 and Next 0; a cursor above 1 is ErrInvalidRange.
+// Appended records never enter the pinned range; only a fresh AuditQuery
+// pins the new tail.
+//
 // The filters are the same as AuditQuery's and must agree with the pinned
 // query: pass the same kind, subjectID and optional resourceID on every
 // page. The resource condition is an exact raw-byte match over requested
@@ -589,28 +599,43 @@ func (s *Store) AuditPage(cp Checkpoint, nextSeq, pageSize int, kind, subjectID 
 	if nextSeq < 0 {
 		return nil, fmt.Errorf("%w: next sequence must be >= 0, got %d", ErrInvalidPage, nextSeq)
 	}
+	if cp.EndSeq < 0 {
+		return nil, fmt.Errorf("%w: end sequence must be >= 0, got %d", ErrInvalidRange, cp.EndSeq)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	genesis := genesisFingerprint(cp.Org)
+	if cp.EndSeq == 0 {
+		// A root checkpoint pins the empty range the organization had when
+		// it was issued. Read-only paging must never depend on whether this
+		// store happens to have visited the organization since: the chain
+		// state for a never-seen org, an org only queried empty, and an org
+		// that later grew records all answer the same.
+		if cp.Fingerprint != genesis {
+			return nil, fmt.Errorf("%w: checkpoint fingerprint does not match the root at sequence 0", ErrInvalidRange)
+		}
+		// Cursor 0 means exhausted; cursor 1 is the one-past-the-end end
+		// page, exactly like EndSeq+1 on a non-empty range — it never
+		// restarts the walk (which is impossible anyway: the pinned range
+		// contains no records). A larger cursor claims positive records the
+		// checkpoint says do not exist, whether or not the live chain now
+		// has them.
+		if nextSeq > 1 {
+			return nil, fmt.Errorf("%w: next sequence %d beyond pinned empty range ending at 0", ErrInvalidRange, nextSeq)
+		}
+		return &AuditPage{Org: cp.Org, BeginSeq: 1, EndSeq: 0, Next: 0, Checkpoint: cp}, nil
+	}
 	st, ok := s.orgs[cp.Org]
 	if !ok {
-		// No organization state: the only valid checkpoint is an empty one.
-		g := genesisFingerprint(cp.Org)
-		if cp.EndSeq == 0 && cp.Fingerprint == g && nextSeq == 0 {
-			return &AuditPage{Org: cp.Org, BeginSeq: 0, EndSeq: 0, Checkpoint: cp}, nil
-		}
+		// The checkpoint claims positive records in an organization this
+		// store has never seen; it can never verify.
 		return nil, fmt.Errorf("%w: checkpoint organization has no records", ErrInvalidRange)
 	}
 	head := len(st.audit)
-	if cp.EndSeq < 0 || cp.EndSeq > head {
+	if cp.EndSeq > head {
 		return nil, fmt.Errorf("%w: end sequence %d beyond %d", ErrInvalidRange, cp.EndSeq, head)
 	}
-	wantFP := genesisFingerprint(cp.Org)
-	if cp.EndSeq > 0 {
-		if cp.EndSeq > len(st.audit) {
-			return nil, fmt.Errorf("%w: end sequence %d beyond %d", ErrInvalidRange, cp.EndSeq, head)
-		}
-		wantFP = st.audit[cp.EndSeq-1].Fingerprint
-	}
+	wantFP := st.audit[cp.EndSeq-1].Fingerprint
 	if cp.Fingerprint != wantFP {
 		return nil, fmt.Errorf("%w: checkpoint fingerprint does not match the chain at sequence %d", ErrInvalidRange, cp.EndSeq)
 	}

@@ -994,7 +994,9 @@ func (s *MetricStore) matchSeries(q parsedQuery) []*storedSeries {
 // 点数与均值累计器：逐点累计个数与精确有理数总和。写入侧已保证值有限，
 // SetFloat64 对有限值是精确的，因此求和与点的提交顺序、批次划分无关，
 // 正负大数抵消后的微小余量不会丢失，总和超出 float64 有限范围时均值仍有限。
-// 两种统计只在“哪些点归入哪一组”上不同，点数与均值规则统一由这里维护。
+// 两种统计只在“哪些点归入哪一组”上不同，点数与均值规则统一由这里维护：
+// 区间统计为整条序列使用一个累计器，固定窗口统计为每个实际有点的窗口各建
+// 一个独立累计器，窗口之间天然互不携带点数与数值，不需要在窗口间清空复用。
 type pointStats struct {
 	count int
 	sum   *big.Rat
@@ -1009,13 +1011,6 @@ func newPointStats() *pointStats {
 func (a *pointStats) add(v float64) {
 	a.count++
 	a.sum.Add(a.sum, a.tmp.SetFloat64(v))
-}
-
-// reset 清空累计，供下一个互不影响的统计范围（如后一个窗口）复用同一累计器：
-// 前一个范围的点数与数值一律不带入后一个范围。
-func (a *pointStats) reset() {
-	a.count = 0
-	a.sum = new(big.Rat)
 }
 
 // average 返回精确算术平均舍入到最近可表示 float64 的结果（正中取偶；
@@ -1094,18 +1089,21 @@ func seriesPointsInRange(sr *storedSeries, start, end int64) []Point {
 // runQueryWindows 只读统计固定时间窗口内的点数与均值：窗口把 [start,end]
 // 闭区间按 step 毫秒从 start 起连续划分，第 k 个窗口为
 // [start+k*step, start+(k+1)*step-1]（含首尾毫秒），最后一个截到 end，
-// 各序列共用同一组由 start 与 step 决定的边界——因此不为空窗口构造任何条目，
-// 即使区间横跨整个 int64 也不预先物化窗口表。
+// 各序列共用同一组由 start 与 step 决定的边界——即使区间横跨整个 int64 也不
+// 预先物化窗口表，临时数据只围绕实际有点的窗口组织。
 //
 // 名称精确、标签子集的序列筛选与 organizeSeries 整理、序列排列次序和另两种
-// 查询完全一致。每条序列独立统计：先取区间内按时间戳升序的采样点，升序点流
-// 中落在同一窗口的点必然连续，据此一次遍历分窗，逐窗口用 pointStats 累计
-// 点数与均值——与区间统计共用同一套计数、精确求和与舍入规则；窗口切换时
-// reset，前一窗口的点数与数值不带入后一窗口。只输出实际有点的窗口，按窗口
-// 起点升序，空窗口不补零，整个区间没有点的序列不列出，无任何命中时 series
-// 为空数组。每个点只归入 floor((ts-start)/step) 唯一窗口；start==end 时所有
-// 点归入唯一窗口。平均值依据实际存储的 float64 值计算，正负大数抵消或总和
-// 超出 float64 范围时仍得有限结果。查询只读，不改变存储。
+// 查询完全一致。每条序列独立统计：窗口统计不依赖采样明细展示——既不为统计
+// 构造区间内的完整采样点切片，也不对全部区间时间戳排序；直接遍历点表，按
+// floor((ts-start)/step) 把每个点归入它唯一所属的窗口，只在某窗口第一次
+// 落有点时为它登记下标并建立独立的 pointStats（与区间统计共用同一套计数、
+// 精确求和与舍入规则）。大量点落入少数几个窗口时，累计器与窗口下标条目只
+// 有这几个窗口那么多；最后只对实际出现的窗口下标排序（稀疏采样跨越很长区间
+// 时其数量远小于区间内窗口总数），按窗口起点升序输出。空窗口不补零，整个
+// 区间没有点的序列不列出，无任何命中时 series 为空数组。每个点只计入所属
+// 窗口一次，与写入或遍历次序无关；start==end 时所有点归入唯一窗口。平均值
+// 依据实际存储的 float64 值计算，正负大数抵消或总和超出 float64 范围时仍得
+// 有限结果。查询只读，不改变存储。
 func (s *MetricStore) runQueryWindows(q parsedQuery) *QueryWindowsResult {
 	organized := organizeSeries(s.matchSeries(q))
 
@@ -1115,27 +1113,35 @@ func (s *MetricStore) runQueryWindows(q parsedQuery) *QueryWindowsResult {
 
 	out := make([]QueryWindowsSeries, 0, len(organized))
 	for _, entry := range organized {
-		points := seriesPointsInRange(entry.sr, q.start, q.end)
-		if len(points) == 0 {
+		// 临时数据只围绕实际有点的窗口：stats 每个非空窗口一个独立累计器，
+		// order 记录各窗口第一次落有点的次序；遍历点表前不构造任何窗口或明细。
+		stats := make(map[uint64]*pointStats)
+		order := make([]uint64, 0)
+		for ts, v := range entry.sr.points {
+			if ts < q.start || ts > q.end {
+				continue
+			}
+			// 无符号偏移除以 step 得窗口下标；点表遍历次序任意，下标之间无序，
+			// 因此以 map 归组而不依赖相邻点同属一个窗口。
+			idx := (uint64(ts) - uint64(q.start)) / uint64(q.step)
+			a := stats[idx]
+			if a == nil {
+				a = newPointStats()
+				stats[idx] = a
+				order = append(order, idx)
+			}
+			a.add(v)
+		}
+		if len(order) == 0 {
 			continue
 		}
-		windows := make([]Window, 0)
-		var curIdx uint64
-		stats := newPointStats()
-		flush := func() {
-			windows = append(windows, buildWindow(q.start, q.end, q.step, diff, curIdx, stats))
+		// 只为实际有点的窗口排序：稀疏采样跨越很长区间时，这里排序的下标数
+		// 远小于区间内窗口总数，绝不触及空窗口。
+		sort.Slice(order, func(i, j int) bool { return order[i] < order[j] })
+		windows := make([]Window, 0, len(order))
+		for _, idx := range order {
+			windows = append(windows, buildWindow(q.start, q.end, q.step, diff, idx, stats[idx]))
 		}
-		for i, p := range points {
-			// 无符号偏移除以 step 得窗口下标；升序点流下标单调不减。
-			idx := (uint64(p.Timestamp) - uint64(q.start)) / uint64(q.step)
-			if i > 0 && idx != curIdx {
-				flush()
-				stats.reset()
-			}
-			curIdx = idx
-			stats.add(p.Value)
-		}
-		flush()
 		out = append(out, QueryWindowsSeries{
 			Name:    entry.ref.Name,
 			Labels:  entry.ref.Labels,
@@ -1333,8 +1339,8 @@ func seriesLess(a, b organizedSeries) bool {
 // 的反复比较直接复用同一份结果，不会因一条序列参与多次比较而反复整理同一
 // 套标签。整理结果不复制采样点；写入快照的采样点选取与升序排列由
 // allSeriesPoints 完成，均值查询只在点表上计数与求和，采样明细查询由
-// seriesPointsInRange 按区间选取并升序排列，固定窗口查询在区间升序点流上
-// 按窗口累计计数与精确求和。
+// seriesPointsInRange 按区间选取并升序排列，固定窗口查询直接在点表上按窗口
+// 下标归组、只围绕实际有点的窗口累计计数与精确求和。
 func organizeSeries(selected []*storedSeries) []organizedSeries {
 	out := make([]organizedSeries, 0, len(selected))
 	for _, sr := range selected {

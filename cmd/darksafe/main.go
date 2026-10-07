@@ -38,7 +38,7 @@ func usage() {
 	fmt.Println("  plan <JSON路径>  离线读取发布配置并输出发布计划（JSON），不连接集群、不执行发布")
 	fmt.Println("  help             显示本帮助")
 	fmt.Println()
-	fmt.Println("plan 输入字段：app, revision, image, batchSize, clusters[], include[], exclude[], spreadBy（可选）, firstBatchSize（可选）")
+	fmt.Println("plan 输入字段：app, revision, image, batchSize, clusters[], include[], exclude[], spreadBy（可选）, firstBatchSize（可选）, firstCluster（可选）")
 	fmt.Println("plan 成功时向标准输出写入完整发布计划；失败时以非零状态退出，并在标准错误说明具体问题。")
 }
 

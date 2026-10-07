@@ -51,9 +51,10 @@ func (e *invalidConfigTextError) Error() string {
 
 // validateStrictText rejects invalid UTF-8 anywhere in a Go-constructed
 // config, in a fixed order independent of map iteration: app, revision,
-// image, spreadBy, then every candidate (ID before its tags, tags in
-// ascending key order), then every include and exclude condition in list
-// order (entries likewise in ascending key order). The input is only read.
+// image, spreadBy, firstCluster, then every candidate (ID before its tags,
+// tags in ascending key order), then every include and exclude condition in
+// list order (entries likewise in ascending key order). The input is only
+// read.
 func validateStrictText(in ReleasePlanInput) error {
 	if !utf8.ValidString(in.App) {
 		return &invalidConfigTextError{where: `字段 "app"`}
@@ -66,6 +67,9 @@ func validateStrictText(in ReleasePlanInput) error {
 	}
 	if !utf8.ValidString(in.SpreadBy) {
 		return &invalidConfigTextError{where: `字段 "spreadBy"`}
+	}
+	if !utf8.ValidString(in.FirstCluster) {
+		return &invalidConfigTextError{where: `字段 "firstCluster"`}
 	}
 	for i, c := range in.Clusters {
 		if !utf8.ValidString(c.ID) {

@@ -45,6 +45,14 @@ type ReleasePlanInput struct {
 	// SpreadBy, when non-empty, names a cluster tag whose value identifies a
 	// fault domain; each batch then contains at most one cluster per domain.
 	SpreadBy string
+	// FirstCluster, when non-empty, names a candidate by its exact original
+	// ID — no case folding, no trimming — that must be a selected cluster and
+	// must enter batch 1. The remaining first-batch seats go to the smallest
+	// selected IDs that still fit; the anchor is not required to be first,
+	// batch 1 stays ascending, and a fault-domain conflict with the anchor is
+	// never relaxed (a same-domain cluster is deferred like any other).
+	// Empty means unset; a whitespace-only string is a configuration error.
+	FirstCluster string
 }
 
 // AppInfo identifies the application being released.
@@ -392,6 +400,10 @@ func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {
 	if err != nil {
 		return ReleasePlanInput{}, err
 	}
+	firstCluster, err := optionalFirstCluster(doc)
+	if err != nil {
+		return ReleasePlanInput{}, err
+	}
 	clusters, err := parseClusters(doc["clusters"])
 	if err != nil {
 		return ReleasePlanInput{}, err
@@ -415,6 +427,7 @@ func buildReleaseInput(doc map[string]any) (ReleasePlanInput, error) {
 		Include:        include,
 		Exclude:        exclude,
 		SpreadBy:       spreadBy,
+		FirstCluster:   firstCluster,
 	}, nil
 }
 
@@ -441,6 +454,39 @@ func optionalSpreadBy(doc map[string]any) (string, error) {
 func checkSpreadBy(s string) error {
 	if s != "" && strings.TrimSpace(s) == "" {
 		return fmt.Errorf("字段 %q 不能只含空白", "spreadBy")
+	}
+	return nil
+}
+
+// optionalFirstCluster reads the optional "firstCluster" field: absent or an
+// empty string leaves batching exactly as without the field; a non-string
+// value or a string of only whitespace is rejected. A set value is kept and
+// later compared byte-for-byte — case and surrounding whitespace are never
+// normalized, matching the cluster-identity rule.
+func optionalFirstCluster(doc map[string]any) (string, error) {
+	v, ok := doc["firstCluster"]
+	if !ok {
+		return "", nil
+	}
+	s, ok := v.(string)
+	if !ok {
+		return "", fmt.Errorf("字段 %q 必须是字符串", "firstCluster")
+	}
+	if err := checkFirstCluster(s); err != nil {
+		return "", err
+	}
+	return s, nil
+}
+
+// checkFirstCluster applies the firstCluster rule shared by the JSON entry
+// and a directly constructed Go config: empty means "not set" and is always
+// legal; a set value must name a candidate, so a string of only whitespace —
+// which can never equal a legal cluster ID — is a configuration error rather
+// than a silent no-op. Whether the value names an existing, selected cluster
+// is decided later, during planning.
+func checkFirstCluster(s string) error {
+	if s != "" && strings.TrimSpace(s) == "" {
+		return fmt.Errorf("字段 %q 不能只含空白", "firstCluster")
 	}
 	return nil
 }
@@ -474,7 +520,9 @@ func checkFirstBatchSize(firstBatchSize, batchSize int) error {
 // batchSize is a positive integer, firstBatchSize is zero (unset) or a
 // positive integer no larger than batchSize, spreadBy is empty or a usable
 // tag key
-// (not whitespace-only), cluster IDs are unique across every candidate
+// (not whitespace-only), firstCluster is empty (unset) or a non-whitespace
+// candidate ID (whether it names a selected cluster is decided during
+// planning), cluster IDs are unique across every candidate
 // (including disabled and filtered-out clusters), and tag/condition keys
 // are non-empty. Errors name the field and the position in its list; within
 // a cluster the ID is checked before its tags, and tag keys are examined in
@@ -501,6 +549,9 @@ func ValidateReleaseInput(in ReleasePlanInput) error {
 		return err
 	}
 	if err := checkSpreadBy(in.SpreadBy); err != nil {
+		return err
+	}
+	if err := checkFirstCluster(in.FirstCluster); err != nil {
 		return err
 	}
 	ids := newClusterIDSet(len(in.Clusters))
@@ -711,6 +762,14 @@ func parseConditions(doc map[string]any, field string) ([]LabelCondition, error)
 // conflict, and no empty batch is ever emitted. It validates the input first
 // and never mutates it.
 //
+// When FirstCluster names a candidate, that exact ID must survive the
+// disabled/include/exclude selection and must enter batch 1; the other
+// first-batch seats go to the smallest selected IDs that fit the batch's
+// rules (so the anchor need not be the smallest ID, though batch 1 still
+// reads ascending). A name no candidate carries, or one that selection
+// rejects, fails the whole plan with the ID and its established rejection
+// reason — no substitute cluster is ever picked.
+//
 // When every candidate is filtered out, the returned error lists each
 // candidate's rejection reason on its own line, ascending by the original
 // ID. An ID containing a double quote, backslash, control character or
@@ -744,6 +803,12 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 	sort.Strings(selected)
 	sort.Slice(excluded, func(i, j int) bool { return excluded[i].ID < excluded[j].ID })
 
+	if in.FirstCluster != "" {
+		if err := checkFirstClusterSelection(in.FirstCluster, in.Clusters, in.Include, in.Exclude); err != nil {
+			return ReleasePlan{}, err
+		}
+	}
+
 	if len(selected) == 0 {
 		var b strings.Builder
 		b.WriteString("没有符合规则的可用集群，各候选集群未入选原因：")
@@ -762,13 +827,13 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 		firstCap = in.FirstBatchSize
 	}
 	if in.SpreadBy == "" {
-		batches = chunkBatches(selected, in.BatchSize, firstCap)
+		batches = chunkBatches(selected, in.BatchSize, firstCap, in.FirstCluster)
 	} else {
 		domains, err := faultDomains(in.Clusters, selected, in.SpreadBy)
 		if err != nil {
 			return ReleasePlan{}, err
 		}
-		batches = spreadBatches(selected, domains, in.BatchSize, firstCap)
+		batches = spreadBatches(selected, domains, in.BatchSize, firstCap, in.FirstCluster)
 	}
 
 	return ReleasePlan{
@@ -778,6 +843,32 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 	}, nil
 }
 
+// checkFirstClusterSelection enforces the FirstCluster requirement against
+// the selection result: the exact ID must identify one candidate (IDs are
+// unique, so at most one can match), and that candidate must survive the
+// fixed disabled → exclude → include priority. A missing ID fails with a
+// "not among the candidates" error; a rejected candidate fails with that
+// same established reason. In either case the caller fails the whole plan
+// instead of substituting another cluster.
+func checkFirstClusterSelection(id string, clusters []Cluster, include, exclude []LabelCondition) error {
+	for _, c := range clusters {
+		if c.ID != id {
+			continue
+		}
+		switch {
+		case c.Disabled:
+			return fmt.Errorf("指定的首批集群 %q 未入选：%s", id, ReasonDisabled)
+		case matchesAny(c.Tags, exclude):
+			return fmt.Errorf("指定的首批集群 %q 未入选：%s", id, ReasonExcludeMatched)
+		case len(include) > 0 && !matchesAny(c.Tags, include):
+			return fmt.Errorf("指定的首批集群 %q 未入选：%s", id, ReasonIncludeNotMatched)
+		default:
+			return nil
+		}
+	}
+	return fmt.Errorf("指定的首批集群 %q 不在候选列表中", id)
+}
+
 // chunkBatches splits the ascending IDs into batches of at most batchSize,
 // except batch 1 which is capped at firstBatchSize instead (callers pass
 // batchSize when no separate first-batch cap is set). Each batch's Clusters
@@ -785,25 +876,49 @@ func MakeReleasePlan(in ReleasePlanInput) (ReleasePlan, error) {
 // capacity pointing at the next batch's IDs, so a caller appending to one
 // batch's list would overwrite the following batch.
 //
+// When firstCluster is set it is pre-seated in batch 1 regardless of its
+// position among the ascending IDs; the remaining first-batch seats take the
+// smallest other IDs (so batch 1 is re-sorted), and every cluster not seated
+// there is then chunked at the ordinary batchSize cap.
+//
 // The batch length is derived from the count that remains (the smaller of the
 // capacity and the remainder), never by adding the offset to the capacity:
 // the capacity is only an upper bound and may be a huge legal value such as
 // math.MaxInt, and i + capacity would then wrap into a negative slice length
 // after a small first batch.
-func chunkBatches(selected []string, batchSize, firstBatchSize int) []Batch {
+func chunkBatches(selected []string, batchSize, firstBatchSize int, firstCluster string) []Batch {
 	batches := []Batch{}
-	for i := 0; i < len(selected); {
+	remaining := selected
+	if firstCluster != "" {
+		first := make([]string, 0, min(firstBatchSize, len(selected)))
+		first = append(first, firstCluster)
+		rest := make([]string, 0, len(selected))
+		for _, id := range selected {
+			if id == firstCluster {
+				continue
+			}
+			if len(first) < firstBatchSize {
+				first = append(first, id)
+			} else {
+				rest = append(rest, id)
+			}
+		}
+		sort.Strings(first)
+		batches = append(batches, Batch{Index: 1, Clusters: first})
+		remaining = rest
+	}
+	for i := 0; i < len(remaining); {
 		capacity := batchSize
 		if len(batches) == 0 {
 			capacity = firstBatchSize
 		}
-		size := len(selected) - i
+		size := len(remaining) - i
 		if capacity < size {
 			size = capacity
 		}
 		end := i + size
 		clusters := make([]string, size)
-		copy(clusters, selected[i:end])
+		copy(clusters, remaining[i:end])
 		batches = append(batches, Batch{Index: len(batches) + 1, Clusters: clusters})
 		i = end
 	}
@@ -838,9 +953,41 @@ func faultDomains(clusters []Cluster, selected []string, spreadBy string) (map[s
 // deferred to later batches, so a batch may be short only when no
 // non-conflicting cluster remains. Every ID appears in exactly one batch and
 // IDs stay ascending within a batch.
-func spreadBatches(selected []string, domains map[string]string, batchSize, firstBatchSize int) []Batch {
-	remaining := append([]string(nil), selected...)
+//
+// When firstCluster is set it is pre-seated in batch 1: its domain is
+// occupied there from the start, and the remaining seats take the smallest
+// IDs of other domains exactly as in an ordinary first batch — a same-domain
+// cluster is deferred by the anchor just like any domain conflict, and the
+// limit is never relaxed to seat the anchor or fill the batch. Later batches
+// run by the ordinary rules, so a cluster deferred out of batch 1 (the
+// anchor's same-domain peers included) is scheduled normally from batch 2 on.
+func spreadBatches(selected []string, domains map[string]string, batchSize, firstBatchSize int, firstCluster string) []Batch {
 	batches := []Batch{}
+	var remaining []string
+	if firstCluster != "" {
+		capacity := firstBatchSize
+		used := make(map[string]struct{}, min(capacity, len(selected)))
+		used[domains[firstCluster]] = struct{}{}
+		batch := []string{firstCluster}
+		deferred := []string{}
+		for _, id := range selected {
+			if id == firstCluster {
+				continue
+			}
+			d := domains[id]
+			if _, conflict := used[d]; len(batch) < capacity && !conflict {
+				used[d] = struct{}{}
+				batch = append(batch, id)
+			} else {
+				deferred = append(deferred, id)
+			}
+		}
+		sort.Strings(batch)
+		batches = append(batches, Batch{Index: 1, Clusters: batch})
+		remaining = deferred
+	} else {
+		remaining = append([]string(nil), selected...)
+	}
 	for len(remaining) > 0 {
 		capacity := batchSize
 		if len(batches) == 0 {

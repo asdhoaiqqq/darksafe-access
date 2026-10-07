@@ -612,12 +612,42 @@ func joinMemberPath(path, key string) string {
 // jsonEncodePathString renders key as a legal JSON string (including the
 // surrounding quotes); decoding the result restores key exactly, including
 // empty names and names containing quotes, backslashes, newlines or other
-// control characters.
+// control characters. encoding/json leaves two ranges of control character
+// unescaped — DEL (U+007F) and the C1 controls (U+0080–U+009F) — which would
+// otherwise reach the rendered location as real control bytes; every such
+// byte is rewritten to its \uXXXX spelling by escapePathControls, so the
+// location is always readable, has no control effect, and still decodes back
+// to the exact member name.
 func jsonEncodePathString(key string) string {
 	bs, err := json.Marshal(key)
 	if err != nil {
 		// json.Marshal cannot fail for a Go string.
 		panic(fmt.Sprintf("json.Marshal(%q): %v", key, err))
 	}
-	return string(bs)
+	return string(escapePathControls(bs))
+}
+
+// escapePathControls rewrites, inside an already JSON-marshaled string, the
+// control characters that encoding/json emits literally: a standalone DEL
+// byte (U+007F) and the two-byte UTF-8 spellings of the C1 controls
+// (U+0080–U+009F, bytes C2 80–C2 9F). Each becomes the six-character
+// \uXXXX escape. No other byte is touched: JSON escape spellings are pure
+// ASCII, so these byte patterns can only be the literal controls, and the
+// surrounding quotes (0x22) never match. The output stays legal JSON that
+// unmarshals to the original string.
+func escapePathControls(bs []byte) []byte {
+	b := make([]byte, 0, len(bs))
+	for i := 0; i < len(bs); i++ {
+		c := bs[i]
+		switch {
+		case c == 0x7F:
+			b = append(b, `\u007f`...)
+		case c == 0xC2 && i+1 < len(bs) && bs[i+1] >= 0x80 && bs[i+1] <= 0x9F:
+			b = fmt.Appendf(b, `\u%04x`, bs[i+1])
+			i++ // consume the continuation byte
+		default:
+			b = append(b, c)
+		}
+	}
+	return b
 }

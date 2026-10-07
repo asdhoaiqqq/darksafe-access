@@ -126,7 +126,12 @@ type duplicateMemberError struct {
 }
 
 func (e *duplicateMemberError) Error() string {
-	return fmt.Sprintf("JSON 对象存在重复成员: 字段 %q 重复出现于 %s", e.field, e.path)
+	// The member name is rendered as a JSON string with the same encoding as
+	// the bracketed path segments, never with Go's %q: %q spells DEL and other
+	// controls as "\xNN", which JSON cannot decode back and so would not pin
+	// down the real field. jsonEncodePathString escapes them as \uXXXX.
+	return fmt.Sprintf("JSON 对象存在重复成员: 字段 %s 重复出现于 %s",
+		jsonEncodePathString(e.field), e.path)
 }
 
 // checkDuplicateMembers walks every JSON object in data and rejects objects

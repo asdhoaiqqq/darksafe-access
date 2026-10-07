@@ -119,14 +119,19 @@ func ParseReleaseInput(data []byte) (ReleasePlanInput, error) {
 // member "meta.info" is at $["meta.info"] (distinct from the nested object
 // $.meta.info), "zone[0]" stays one whole name at $["zone[0]"], and names
 // that are empty or contain quotes, backslashes or control characters are
-// rendered as decodable JSON strings such as $[""] or $["a\nb"].
+// rendered as decodable JSON strings such as $[""] or $["a\nb"]. DEL
+// (U+007F) and the C1 controls (U+0080–U+009F) are \uXXXX escapes inside the
+// JSON string rather than raw control characters, so the location stays
+// readable and decodable; field names the duplicated member with the same
+// JSON-string spelling.
 type duplicateMemberError struct {
 	field string
 	path  string
 }
 
 func (e *duplicateMemberError) Error() string {
-	return fmt.Sprintf("JSON 对象存在重复成员: 字段 %q 重复出现于 %s", e.field, e.path)
+	return fmt.Sprintf("JSON 对象存在重复成员: 字段 %s 重复出现于 %s",
+		jsonEncodePathString(e.field), e.path)
 }
 
 // checkDuplicateMembers walks every JSON object in data and rejects objects
